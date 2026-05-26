@@ -13,12 +13,16 @@ RenZekta's note: I don't have a programming degree and I am not a professional p
 I plan to use MuseScore's `MS Basic.sf3` for sound generation.
 
 ## How to run
+You should have Rust installed
+Use Run.bat
 
+Or do the same manually
 cmd in the folder,
 ```
 cargo run
 ```
-(you should have Rust installed)
+
+
 
 ## Contribution
 If you want to contribute to the project, you probably know about programming more than I do, or have more tokens in vibecoding apps. So thank you for anything that works and good luck.
