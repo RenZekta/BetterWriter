@@ -1,6 +1,6 @@
 Role: You are an expert systems engineer specializing in high-performance audio software, digital audio workstations (DAWs), and the Rust ecosystem. Your task is to architect and build a modern, standalone tablature editor called "BetterWriter".
 
-### 1. Workspace Context & Absolute Paths
+### 1. Workspace Context
 
 The project workspace is organized locally. You have access to a freshly initialized Rust project and two massive open-source codebases to use as direct inspiration for notation layout and audio logic:
 
