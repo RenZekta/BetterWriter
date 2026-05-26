@@ -20,5 +20,5 @@ cargo run
 ```
 
 ## Contribution
-If you want to contribute to the project, you're probably you probably know about programming more than I, or have more tokens in vibecoding apps. So thank you for anything that works and good luck.
+If you want to contribute to the project, you probably know about programming more than I do, or have more tokens in vibecoding apps. So thank you for anything that works and good luck.
 I include my prompt as BetterWriterPrompt.md that I used originally for you to clearly understand my goals with this project.
