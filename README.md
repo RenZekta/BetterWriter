@@ -18,6 +18,7 @@ cmd in the folder,
 ```
 cargo run
 ```
+(you should have Rust installed)
 
 ## Contribution
 If you want to contribute to the project, you probably know about programming more than I do, or have more tokens in vibecoding apps. So thank you for anything that works and good luck.
