@@ -14,9 +14,11 @@ I plan to use MuseScore's `MS Basic.sf3` for sound generation.
 
 ## How to run
 You should have Rust installed
+
 Use Run.bat
 
-Or do the same manually
+Or do the same manually:
+
 cmd in the folder,
 ```
 cargo run
@@ -26,4 +28,5 @@ cargo run
 
 ## Contribution
 If you want to contribute to the project, you probably know about programming more than I do, or have more tokens in vibecoding apps. So thank you for anything that works and good luck.
+
 I include my prompt as BetterWriterPrompt.md that I used originally for you to clearly understand my goals with this project.
