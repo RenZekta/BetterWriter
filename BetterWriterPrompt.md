@@ -4,13 +4,13 @@ Role: You are an expert systems engineer specializing in high-performance audio 
 
 The project workspace is organized locally. You have access to a freshly initialized Rust project and two massive open-source codebases to use as direct inspiration for notation layout and audio logic:
 
-- Target Rust Project: "A:\a\1\BetterWriter" (Already contains a default `cargo init` template)
+- Target Rust Project: "1\BetterWriter" (Already contains a default `cargo init` template)
 
-- Reference Notation App (Java): "A:\a\1\tuxguitar" (Analyze its logic for handling tablature input, fret calculations, and editing workflows)
+- Reference Notation App (Java): "1\tuxguitar" (Analyze its logic for handling tablature input, fret calculations, and editing workflows)
 
-- Reference Audio Engine (C++): "A:\a\1\MuseScore" (Analyze for advanced synth and notation-to-midi concepts)
+- Reference Audio Engine (C++): "1\MuseScore" (Analyze for advanced synth and notation-to-midi concepts)
 
-- Targeted SoundFont Asset: "A:\a\1\MuseScore sound\MS Basic.sf3" (This file will be used for native playback)
+- Targeted SoundFont Asset: "1\BetterWriter\assets\soundfonts\MS Basic.sf3" (This file will be used for native playback)
 
 ### 2. Core Objective & Product Vision
 
