@@ -58,12 +58,17 @@ Here is how your standalone Rust tablature editor—codenamed **`.bwx` Engine**�
          [ Core Engine & State Machine (Rust) ]
           Manages .bwx data, shifts bars, maps time
                              │
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-   [ Audio Host (VST3) ]         [ SoundFont Synth (oxisynth) ]
-   Loads VST3 Instrument/Amps      Processes MS Basic.sf3 samples
-            │                                 │
-            └────────────────┬────────────────┘
+                             ▼
+     ================= AUDIO PIPELINE =================
+                             │
+                             ▼
+         [ SoundFont Synth (oxisynth) ]  <─── Switchable (On/Off)
+          Processes MS Basic.sf3 samples
+                             │
+                             ▼
+         [ VST3 / VSTi3 Instrument Plugins (1..N) ] <─── Optional and infinite FX Chain
+          Generates or processes audio. Serial processing.
+                             │
                              ▼
                [ Audio I/O Engine (cpal) ]
                Low-latency Stream to Speakers
