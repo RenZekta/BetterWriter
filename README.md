@@ -1,5 +1,5 @@
 # BetterWriter
-This will be a tablature writer that's better than Guiatar Pro, TuxGuitar and MuseScore. Powered by Rust, it's better by design.
+This will be a tablature writer that's better than Guitar Pro, TuxGuitar and MuseScore. Powered by Rust, it's better by design.
 
 Key features that others don't care to implement: 
 1. Native polyrhythms support with unrestricted time signatures. All notes saved on a buffer for replay without bars. Visible bars in playback timeline are visibly scaled in width from a square based on a smallest time signature size.
