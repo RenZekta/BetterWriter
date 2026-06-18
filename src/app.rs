@@ -12,6 +12,34 @@ use crate::{
     theme::EditorTheme,
 };
 
+/// The keyboard-driven write cursor. It points at a `(tick, string)` cell on
+/// the active track's tab staff — exactly the cell the next typed fret will
+/// land in. Mirrors TuxGuitar's "edit caret" model: moving right advances by
+/// the currently selected note duration, not by a fixed pixel grid.
+#[derive(Clone, Copy, Debug)]
+pub struct EditCursor {
+    pub tick: Tick,
+    pub string_index: usize,
+    /// Multi-digit fret being typed (e.g. user presses `1` then `2` -> fret 12).
+    /// Cleared on commit, cursor advance, or string change.
+    pub pending_fret: Option<u8>,
+    /// Instant the pending fret buffer was last touched, so a stale half-typed
+    /// number clears itself after a short timeout instead of leaking into the
+    /// next edit.
+    pub pending_at: Option<std::time::Instant>,
+}
+
+impl EditCursor {
+    pub fn new(tick: Tick, string_index: usize) -> Self {
+        Self {
+            tick,
+            string_index,
+            pending_fret: None,
+            pending_at: None,
+        }
+    }
+}
+
 pub struct BetterWriterApp {
     project: BwxProject,
     theme: EditorTheme,
@@ -28,6 +56,7 @@ pub struct BetterWriterApp {
     pixels_per_tick: f32,
     status: String,
     compatibility: CompatibilityReport,
+    cursor: EditCursor,
 }
 
 impl BetterWriterApp {
@@ -36,6 +65,11 @@ impl BetterWriterApp {
         let shadow_timeline = ShadowTimeline::default();
         shadow_timeline.rebuild_all(&project);
         let compatibility = CompatibilityReport::analyze(&project, horizon_tick(&project));
+        let first_string = project
+            .tracks
+            .first()
+            .map(|track| track.tuning.len().saturating_sub(1))
+            .unwrap_or(0);
 
         Self {
             selected_track_id: project.tracks.first().map(|track| track.id).unwrap_or(1),
@@ -51,9 +85,11 @@ impl BetterWriterApp {
             active_velocity: 108,
             fret_to_insert: 3,
             pixels_per_tick: 0.07,
-            status: "Ready. Open .bwx/.tg files from File > Open, or click the page to write tab."
+            status: "Type 0-9 to enter a fret, arrows to move, Enter to advance. \
+                See Help > Keyboard for all shortcuts."
                 .to_owned(),
             compatibility,
+            cursor: EditCursor::new(0, first_string),
         }
     }
 
@@ -88,6 +124,7 @@ impl BetterWriterApp {
             .map(|track| track.id)
             .unwrap_or(1);
         self.selected_note_id = None;
+        self.reset_cursor_for_track(self.selected_track_id);
         self.shadow_timeline.rebuild_all(&self.project);
         self.compatibility =
             CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
@@ -115,6 +152,7 @@ impl BetterWriterApp {
                     .map(|track| track.id)
                     .unwrap_or(1);
                 self.selected_note_id = None;
+                self.reset_cursor_for_track(self.selected_track_id);
                 self.shadow_timeline.rebuild_all(&self.project);
                 self.compatibility =
                     CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
@@ -186,10 +224,319 @@ impl BetterWriterApp {
         let note_id = self.selected_note_id?;
         Some((self.selected_track_id, note_id))
     }
+
+    /// Drop the cursor onto the lowest string of a freshly selected track.
+    fn reset_cursor_for_track(&mut self, track_id: u64) {
+        self.cursor.tick = 0;
+        self.cursor.string_index = self
+            .project
+            .track(track_id)
+            .map(|track| track.tuning.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.cursor.pending_fret = None;
+        self.cursor.pending_at = None;
+    }
+
+    /// If the pending fret buffer has gone stale (~1.2s without input), drop it
+    /// so a stray `1` doesn't quietly prepend to the next number.
+    fn expire_pending_fret(&mut self) {
+        let stale = self
+            .cursor
+            .pending_at
+            .is_some_and(|at| at.elapsed() > std::time::Duration::from_millis(1200));
+        if stale {
+            self.cursor.pending_fret = None;
+            self.cursor.pending_at = None;
+        }
+    }
+
+    /// Advance the cursor by the currently selected note duration. If the
+    /// cursor would cross into a new measure whose time signature differs,
+    /// `measure_bounds_at` keeps it inside the same bar so writing stays sane.
+    fn advance_cursor(&mut self) {
+        let step = self.selected_duration.ticks();
+        let Some(track) = self.project.track(self.selected_track_id) else {
+            self.cursor.tick += step;
+            return;
+        };
+        let (measure_start, measure_end) = track.measure_bounds_at(self.cursor.tick);
+        let next = self.cursor.tick + step;
+        // Wrap to the next measure rather than drifting past the bar line.
+        self.cursor.tick = if next >= measure_end {
+            measure_end
+        } else {
+            next.max(measure_start)
+        };
+    }
+
+    fn move_cursor_string(&mut self, delta: i32) {
+        let Some(track) = self.project.track(self.selected_track_id) else {
+            return;
+        };
+        let count = track.tuning.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let raw = self.cursor.string_index as i32 + delta;
+        self.cursor.string_index = raw.clamp(0, count - 1) as usize;
+        // Changing strings abandons any half-typed fret.
+        self.cursor.pending_fret = None;
+    }
+
+    /// Push a typed digit into the pending fret buffer. A second digit inside
+    /// ~1.2s of the first is treated as the ones column (so `1` then `2` = 12).
+    fn push_fret_digit(&mut self, digit: u8) {
+        self.expire_pending_fret();
+        let Some(track) = self.project.track(self.selected_track_id) else {
+            return;
+        };
+        let max_fret = track.fret_count;
+        let candidate = match self.cursor.pending_fret {
+            Some(existing) => existing * 10 + digit,
+            None => digit,
+        };
+        let now = std::time::Instant::now();
+        if candidate <= max_fret {
+            self.cursor.pending_fret = Some(candidate);
+            self.cursor.pending_at = Some(now);
+            self.status = format!(
+                "Fret buffer: {}  (Enter to place, Esc to clear)",
+                candidate
+            );
+        } else {
+            // Too large for this instrument: start fresh from the new digit.
+            self.cursor.pending_fret = Some(digit);
+            self.cursor.pending_at = Some(now);
+            self.status = format!(
+                "Fret {candidate} exceeds {} frets; starting fresh with {digit}.",
+                max_fret
+            );
+        }
+    }
+
+    /// Commit the pending fret (or the toolbar default) as a note at the cursor.
+    fn commit_fret_at_cursor(&mut self) {
+        let track_id = self.selected_track_id;
+        let Some(track) = self.project.track(track_id) else {
+            return;
+        };
+        let string_index = self
+            .cursor
+            .string_index
+            .min(track.tuning.len().saturating_sub(1));
+        let tick = self.cursor.tick.max(0);
+        let fret = self.cursor.pending_fret.unwrap_or(self.fret_to_insert);
+        let duration = self.selected_duration.ticks();
+
+        // If a note already sits on this string at this tick, overwrite its
+        // fret instead of stacking a duplicate.
+        let existing = self.project.track(track_id).and_then(|t| {
+            t.notes
+                .iter()
+                .find(|n| n.abs_tick == tick && n.string_index == string_index)
+                .map(|n| n.id)
+        });
+
+        if let Some(id) = existing {
+            if let Some(track) = self.project.track_mut(track_id)
+                && let Some(note) = track.notes.iter_mut().find(|n| n.id == id)
+            {
+                note.fret = fret;
+                note.velocity = self.active_velocity;
+                note.effects = self.active_effects.clone();
+                self.selected_note_id = Some(id);
+                self.status = format!("Replaced note {id} with fret {fret}.");
+            }
+        } else if let Some(id) = self.project.insert_note(
+            track_id,
+            tick,
+            duration,
+            string_index,
+            fret,
+        ) {
+            if let Some(track) = self.project.track_mut(track_id)
+                && let Some(note) = track.notes.iter_mut().find(|n| n.id == id)
+            {
+                note.velocity = self.active_velocity;
+                note.effects = self.active_effects.clone();
+            }
+            self.selected_note_id = Some(id);
+            self.status = format!(
+                "Wrote fret {fret} at tick {tick} on string {}.",
+                string_index + 1
+            );
+        }
+
+        self.cursor.pending_fret = None;
+        self.refresh_after_edit(track_id);
+        self.advance_cursor();
+    }
+
+    /// Delete the note sitting under the cursor (if any) and pull the caret
+    /// back to that tick so the next entry fills the gap.
+    fn delete_at_cursor(&mut self) {
+        let track_id = self.selected_track_id;
+        let Some(track) = self.project.track(track_id) else {
+            return;
+        };
+        let tick = self.cursor.tick;
+        let string_index = self.cursor.string_index;
+        let target = track
+            .notes
+            .iter()
+            .find(|n| n.abs_tick == tick && n.string_index == string_index)
+            .map(|n| n.id);
+        if let Some(id) = target
+            && self.project.delete_note(track_id, id)
+        {
+            self.selected_note_id = None;
+            self.refresh_after_edit(track_id);
+            self.status = format!("Deleted note {id} at tick {tick}.");
+        }
+    }
+
+    fn cycle_duration(&mut self, steps: i32) {
+        let idx = DurationChoice::ALL
+            .iter()
+            .position(|d| *d == self.selected_duration)
+            .unwrap_or(2) as i32;
+        let len = DurationChoice::ALL.len() as i32;
+        let next = ((idx + steps).rem_euclid(len)) as usize;
+        self.selected_duration = DurationChoice::ALL[next];
+        self.status = format!("Note duration: {}", self.selected_duration.label());
+    }
+
+    /// Central keyboard controller. Drives the entire write workflow so the
+    /// mouse is optional. Returns `true` if any key was consumed so the caller
+    /// can request a repaint when the score changes.
+    ///
+    /// Bindings (mirrors TuxGuitar's tab-entry feel):
+    ///   - Digits 0-9: build the fret number (multi-digit allowed)
+    ///   - Enter / Space: place the buffered (or default) fret at the cursor
+    ///   - Backspace / Delete: remove the note under the cursor
+    ///   - Left / Right: move by the selected duration (or one grid cell)
+    ///   - Up / Down: change the active string
+    ///   - + / -: cycle note duration shorter/longer
+    ///   - 1-6 (with Ctrl held): jump to a specific duration slot
+    ///   - Esc: clear the pending fret buffer
+    ///   - Home: snap cursor to tick 0
+    fn handle_keyboard(&mut self, ctx: &egui::Context) -> bool {
+        self.expire_pending_fret();
+        let mut changed = false;
+
+        ctx.input(|i| {
+            // Fret digits — always available so the user can start typing
+            // immediately. We read raw events to also catch numpad keys.
+            // Skip when a modifier is held so Ctrl+digit can drive duration.
+            if !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.mac_cmd {
+                for event in &i.events {
+                    if let egui::Event::Text(text) = event
+                        && let Some(ch) = text.chars().next()
+                        && let Some(digit) = ch.to_digit(10)
+                    {
+                        self.push_fret_digit(digit as u8);
+                        changed = true;
+                    }
+                }
+            }
+
+            // Arrow navigation
+            if i.key_pressed(egui::Key::ArrowRight) {
+                self.advance_cursor();
+                self.selected_note_id = None;
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                let step = self.selected_duration.ticks();
+                self.cursor.tick = (self.cursor.tick - step).max(0);
+                self.cursor.pending_fret = None;
+                self.cursor.pending_at = None;
+                self.selected_note_id = None;
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                self.move_cursor_string(1);
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                self.move_cursor_string(-1);
+                changed = true;
+            }
+
+            // Commit / delete
+            if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space) {
+                self.commit_fret_at_cursor();
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete) {
+                if self.cursor.pending_fret.is_some() {
+                    self.cursor.pending_fret = None;
+                    self.cursor.pending_at = None;
+                    self.status = "Cleared pending fret.".to_owned();
+                } else {
+                    self.delete_at_cursor();
+                }
+                changed = true;
+            }
+
+            // Duration cycling
+            if i.key_pressed(egui::Key::Minus) {
+                self.cycle_duration(-1);
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::Plus) {
+                self.cycle_duration(1);
+                changed = true;
+            }
+
+            // Ctrl+digit jumps to a duration slot
+            for (slot, key) in [
+                (0, egui::Key::Num1),
+                (1, egui::Key::Num2),
+                (2, egui::Key::Num3),
+                (3, egui::Key::Num4),
+                (4, egui::Key::Num5),
+                (5, egui::Key::Num6),
+            ] {
+                if i.modifiers.ctrl
+                    && i.key_pressed(key)
+                    && let Some(&d) = DurationChoice::ALL.get(slot)
+                {
+                    self.selected_duration = d;
+                    self.status = format!("Note duration: {}", d.label());
+                    changed = true;
+                }
+            }
+
+            // Clear pending fret
+            if i.key_pressed(egui::Key::Escape) {
+                self.cursor.pending_fret = None;
+                self.cursor.pending_at = None;
+                self.selected_note_id = None;
+                self.status = "Selection cleared.".to_owned();
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::Home) {
+                self.cursor.tick = 0;
+                self.cursor.pending_fret = None;
+                self.cursor.pending_at = None;
+                changed = true;
+            }
+        });
+
+        if changed {
+            ctx.request_repaint();
+        }
+        changed
+    }
 }
 
 impl eframe::App for BetterWriterApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Pump keyboard input before any panel owns focus, so the canvas acts
+        // like a DAW piano-roll: keys write notes even while a menu is closed.
+        self.handle_keyboard(root.ctx());
+
         egui::Panel::top("menu")
             .exact_size(26.0)
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(238, 238, 238)))
@@ -263,13 +610,30 @@ impl BetterWriterApp {
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Export .tg Bundle").clicked() {
-                    self.export_bundle(StandardExportFormat::TuxGuitar);
-                    ui.close();
-                }
-                if ui.button("Export .gp Bundle").clicked() {
-                    self.export_bundle(StandardExportFormat::GuitarPro);
-                    ui.close();
+                let compatible = self.compatibility.standard_exports_enabled;
+                let hint = self
+                    .compatibility
+                    .warning
+                    .clone()
+                    .unwrap_or_else(|| "Export each track as a standard tab bundle.".to_owned());
+                ui.add_enabled_ui(compatible, |ui| {
+                    if ui.button("Export .tg Bundle").clicked() {
+                        self.export_bundle(StandardExportFormat::TuxGuitar);
+                        ui.close();
+                    }
+                    if ui.button("Export .gp Bundle").clicked() {
+                        self.export_bundle(StandardExportFormat::GuitarPro);
+                        ui.close();
+                    }
+                })
+                .response
+                .on_disabled_hover_text(&hint);
+                if !compatible {
+                    ui.label(
+                        egui::RichText::new(&hint)
+                            .small()
+                            .color(egui::Color32::from_rgb(170, 90, 60)),
+                    );
                 }
             });
             for name in [
@@ -282,12 +646,28 @@ impl BetterWriterApp {
                 "Marker",
                 "Player",
                 "Tools",
-                "Help",
             ] {
                 ui.menu_button(name, |ui| {
                     ui.label("BetterWriter native tools are being mapped here.");
                 });
             }
+            ui.menu_button("Help", |ui| {
+                ui.label(egui::RichText::new("Keyboard — Tab Writing").strong());
+                ui.separator();
+                ui.label("0-9 ............ type fret (multi-digit, e.g. 1 then 2 = 12)");
+                ui.label("Enter / Space ... place the buffered fret at the cursor");
+                ui.label("Backspace / Del . delete note under cursor (or clear buffer)");
+                ui.label("Left / Right .... move cursor by the selected duration");
+                ui.label("Up / Down ....... change active string");
+                ui.label("+ / - ........... cycle note duration longer / shorter");
+                ui.label("Ctrl+1..6 ....... jump to duration slot (1/1, 1/2, ... 1/32)");
+                ui.label("Esc ............. clear pending fret / selection");
+                ui.label("Home ............ move cursor to tick 0");
+                ui.separator();
+                ui.label(
+                    "Tip: click the staff to reposition the cursor, then type a fret.",
+                );
+            });
         });
     }
 
@@ -328,6 +708,9 @@ impl BetterWriterApp {
             ui.label("tempo");
             ui.add(egui::DragValue::new(&mut self.project.tempo_bpm).range(20.0..=320.0));
             ui.label("duration");
+            if small_tool_button(ui, "-", "Shorter note (−)").clicked() {
+                self.cycle_duration(-1);
+            }
             egui::ComboBox::from_id_salt("duration")
                 .selected_text(self.selected_duration.label())
                 .show_ui(ui, |ui| {
@@ -339,11 +722,15 @@ impl BetterWriterApp {
                         );
                     }
                 });
+            if small_tool_button(ui, "+", "Longer note (+)").clicked() {
+                self.cycle_duration(1);
+            }
             ui.add(
                 egui::DragValue::new(&mut self.fret_to_insert)
                     .range(0..=36)
-                    .prefix("fret "),
-            );
+                    .prefix("default fret "),
+            )
+            .on_hover_text("Fret used when you press Enter without typing a number first");
             ui.add(egui::Slider::new(&mut self.pixels_per_tick, 0.035..=0.14).text("scale"));
             ui.separator();
             if small_tool_button(ui, "VST3", "Load VST3 plug-in").clicked() {
@@ -492,6 +879,7 @@ impl BetterWriterApp {
                     if let Some(track_id) = selected_after {
                         self.selected_track_id = track_id;
                         self.selected_note_id = None;
+                        self.reset_cursor_for_track(track_id);
                     }
                 });
         });
@@ -674,6 +1062,8 @@ impl BetterWriterApp {
                 bar_tick += sig.measure_ticks().max(TICKS_PER_QUARTER / 4);
             }
 
+            self.paint_cursor_cell(painter, left, tab_y, system_origin_tick, system_ticks);
+
             for note in track.notes.iter().filter(|note| {
                 note.abs_tick >= system_origin_tick
                     && note.abs_tick < system_origin_tick + system_ticks
@@ -698,10 +1088,19 @@ impl BetterWriterApp {
                     ],
                     Stroke::new(1.4, egui::Color32::from_rgb(45, 45, 45)),
                 );
-                let width = (note.duration_ticks as f32 * self.pixels_per_tick).max(18.0);
+                // Note brick width is strictly proportional to the note's
+                // duration in ticks, so a 1/32 reads narrower than a 1/16.
+                // We only floor it wide enough to keep the fret digit legible
+                // (two-digit frets need a touch more room than one-digit ones).
+                let proportional = note.duration_ticks as f32 * self.pixels_per_tick;
+                let min_for_digits = if note.fret >= 10 { 13.0 } else { 8.0 };
+                let width = proportional.max(min_for_digits);
+                // Slightly shorter bricks for very brief notes so the visual
+                // rhythm matches the musical one, without squashing legible ones.
+                let height = if proportional < 10.0 { 9.0 } else { 12.0 };
                 let note_rect = Rect::from_center_size(
                     Pos2::new(x + width * 0.5, tab_line_y),
-                    Vec2::new(width, 12.0),
+                    Vec2::new(width, height),
                 );
                 painter.rect(
                     note_rect,
@@ -714,11 +1113,13 @@ impl BetterWriterApp {
                     self.theme.note_stroke(),
                     StrokeKind::Middle,
                 );
+                // Shrink the font for cramped bricks so the number still fits.
+                let font_size = if width < 11.0 { 7.0 } else { 9.0 };
                 painter.text(
                     note_rect.center(),
                     Align2::CENTER_CENTER,
                     note.fret.to_string(),
-                    FontId::monospace(9.0),
+                    FontId::monospace(font_size),
                     if selected {
                         egui::Color32::WHITE
                     } else {
@@ -756,6 +1157,66 @@ impl BetterWriterApp {
         }
 
         page
+    }
+
+    /// Draw the keyboard write-cursor: a soft accent box over the active
+    /// `(tick, string)` cell, plus the half-typed fret as ghost text so the
+    /// user sees what they're composing before committing.
+    fn paint_cursor_cell(
+        &self,
+        painter: &egui::Painter,
+        left: f32,
+        tab_y: f32,
+        system_origin_tick: Tick,
+        system_ticks: Tick,
+    ) {
+        // Only render if the cursor is inside this system's tick window.
+        if self.cursor.tick < system_origin_tick
+            || self.cursor.tick >= system_origin_tick + system_ticks
+        {
+            return;
+        }
+        let string_gap = 9.0;
+        // Mirror the note-brick sizing: the cursor preview should show exactly
+        // the width of the brick that will land there, so a 1/32 cursor looks
+        // narrower than a 1/16 cursor. Keep a small floor so the caret box
+        // stays visible/targetable even at the shortest durations.
+        let proportional = self.selected_duration.ticks() as f32 * self.pixels_per_tick;
+        let cell_width = proportional.max(7.0);
+        let x = left + (self.cursor.tick - system_origin_tick) as f32 * self.pixels_per_tick;
+        let y = tab_y + self.cursor.string_index as f32 * string_gap;
+
+        // Translucent accent fill derived from the theme's accent color so the
+        // highlight stays readable on light or dark palettes.
+        let [ar, ag, ab, _] = self.theme.accent_color.to_array();
+        let fill = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 70);
+        let ghost = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 160);
+
+        // Filled highlight box.
+        let cell = Rect::from_center_size(
+            Pos2::new(x + cell_width * 0.5, y),
+            Vec2::new(cell_width, string_gap + 2.0),
+        );
+        painter.rect_filled(cell, 2.0, fill);
+        painter.rect_stroke(
+            cell,
+            2.0,
+            Stroke::new(1.5, self.theme.accent_color),
+            StrokeKind::Middle,
+        );
+
+        // Ghost text for the pending fret, or a caret hint when empty.
+        let label = match self.cursor.pending_fret {
+            Some(fret) => fret.to_string(),
+            None => "_".to_owned(),
+        };
+        painter.text(
+            cell.center(),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::monospace(10.0),
+            ghost,
+        );
     }
 
     fn paint_shadow_overview(&self, painter: &egui::Painter, rect: Rect) {
@@ -820,6 +1281,11 @@ impl BetterWriterApp {
             if let Some(note) = track.notes.iter().find(|note| note.id == note_id) {
                 self.active_velocity = note.velocity;
                 self.active_effects = note.effects.clone();
+                // Park the cursor on the clicked note so subsequent typing edits it.
+                self.cursor.tick = note.abs_tick;
+                self.cursor.string_index = note.string_index;
+                self.cursor.pending_fret = None;
+                self.cursor.pending_at = None;
             }
             self.status = format!("Selected note {note_id}.");
             return;
@@ -829,29 +1295,20 @@ impl BetterWriterApp {
             .floor()
             .clamp(0.0, track.tuning.len().saturating_sub(1) as f32)
             as usize;
-        let duration = self.selected_duration.ticks();
-        if let Some(note_id) = self.project.insert_note(
-            track_id,
+
+        // A click on empty space repositions the keyboard cursor so the user
+        // can click-then-type. Inserting a note is now done with the keyboard
+        // (digits + Enter), keeping mouse and keyboard workflows unified.
+        self.cursor.tick = snapped_tick;
+        self.cursor.string_index = string_index;
+        self.cursor.pending_fret = None;
+        self.cursor.pending_at = None;
+        self.selected_note_id = None;
+        self.status = format!(
+            "Cursor at tick {} on string {}. Type a fret and press Enter.",
             snapped_tick,
-            duration,
-            string_index,
-            self.fret_to_insert,
-        ) {
-            if let Some(track) = self.project.track_mut(track_id)
-                && let Some(note) = track.notes.iter_mut().find(|note| note.id == note_id)
-            {
-                note.velocity = self.active_velocity;
-                note.effects = self.active_effects.clone();
-            }
-            self.selected_note_id = Some(note_id);
-            self.refresh_after_edit(track_id);
-            self.status = format!(
-                "Inserted fret {} at tick {} on string {}.",
-                self.fret_to_insert,
-                snapped_tick,
-                string_index + 1
-            );
-        }
+            string_index + 1
+        );
     }
 }
 
