@@ -5,11 +5,9 @@ Built on the architecture described in `BetterWriterPrompt.md`: a pure-Rust
 egui front end, a tick-based core music engine, a SoundFont/audio pipeline, and
 a polymetric `.bwx` format.
 
-Last updated after the **keyboard tab-writing** pass.
-
 ---
 
-## ✅ Implemented / Fixed this pass
+## 19.06.2026 ✅ Implemented / Fixed this pass
 
 ### Keyboard-driven tab writing (Phase 1 — input layer)
 - [x] Added an **edit cursor** (`EditCursor`: `tick` + `string_index` + pending
@@ -31,6 +29,7 @@ Last updated after the **keyboard tab-writing** pass.
 - [x] Mouse and keyboard workflows unified: clicking the staff now
       **repositions the cursor** (and selects the string) instead of silently
       inserting a fixed-fret note.
+- [x] Fixed the lenghth of 1/32 notes for correct visualisation.
 
 ### Visual feedback (Phase 1 — rendering)
 - [x] **Cursor cell** drawn on the tab staff: translucent accent box sized to
@@ -44,12 +43,6 @@ Last updated after the **keyboard tab-writing** pass.
       compatibility report: buttons are **grayed out** with the
       _"Polyrhythms detected, incompatible format."_ tooltip when the project
       is polymetric.
-
-### Build / quality
-- [x] Project compiles cleanly (`cargo build`).
-- [x] All 4 existing unit tests pass (`cargo test`).
-- [x] No new clippy warnings introduced by this pass (3 pre-existing warnings
-      remain in untouched code).
 
 ### Help / discoverability
 - [x] **Help → Keyboard** menu lists the full keymap.
@@ -67,6 +60,9 @@ Last updated after the **keyboard tab-writing** pass.
 - [ ] Ties, grace notes, tuplets, dotted/double-dotted durations.
 - [ ] Real chord detection (multiple notes on one tick drawn as a chord block).
 - [ ] Undo / redo stack for edits.
+- [ ] Instruments adding/deleting
+- [ ] Bar adding/deleting
+- [ ] Bar scrolling
 
 ### Audio / playback (Phase 3)
 - [ ] **Live playback playhead** rendered on the canvas synced to the audio
@@ -79,7 +75,7 @@ Last updated after the **keyboard tab-writing** pass.
 - [ ] Channel/program-per-track: each track's `program` should drive its MIDI
       channel's patch on the synth (currently all channels forced to program 24).
 - [ ] Real **VST3 hosting** via `vst3` crate (the `Vst3HostSlot` is currently a
-      pass-through stub that only records loaded paths).
+      pass-through stub that only records loaded paths). Requires implementation of VST3 folder scanning (C:\Program Files\Common Files\VST3).
 
 ### File formats (Phase 4)
 - [ ] **Native `.bwx` save/load round-trip** tested through the UI (serializer
@@ -98,19 +94,10 @@ Last updated after the **keyboard tab-writing** pass.
       are modeled but not drawn).
 - [ ] Drag-to-move notes; drag-select range.
 - [ ] Fretboard panel is display-only; clicking a fret should enter a note.
+- [ ] Classic notation view above tablature should be toggleable on/off.
+- [ ] Mode switching from brick painting to UI similar to Guitar Pro, TuxGuitar, etc. with fret numbers instead of bricks and intelligend rests filling at the end of bars.
 
 ### Project hygiene
 - [ ] Resolve the 3 pre-existing clippy warnings (collapsible `if` in
       `apply_selected_duration`, clamp pattern in `paint_selected_track_page`,
       unit-value `let` in `format/tuxguitar.rs`).
-
----
-
-## How to run
-
-```
-cd 1\BetterWriter
-cargo run
-```
-
-Then use **Help → Keyboard** in the app for the full keymap.
