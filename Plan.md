@@ -22,19 +22,28 @@ a polymetric `.bwx` format.
       removes the note under the cursor.
 - [x] **Navigation**: `←`/`→` move the cursor by the selected note duration
       (TuxGuitar-style, bar-aware); `↑`/`↓` change the active string.
-- [x] **Duration menu**: `-`/`+` cycle the active duration; `Ctrl+1`–`Ctrl+6`
-      jump to a duration slot; toolbar `−`/`+` buttons and the combo box drive
-      the same state.
+- [x] **Duration menu**: `-`/`+`/`=` cycle the active duration (`+`/`=` → longer note, no shift needed,
+       `-`→ shorter note); `Ctrl+1`–`Ctrl+6` jump to a duration
+      slot; toolbar `+` button and the combo box drive the same state.
 - [x] `Esc` clears the buffer/selection; `Home` snaps the cursor to tick 0.
 - [x] Mouse and keyboard workflows unified: clicking the staff now
       **repositions the cursor** (and selects the string) instead of silently
       inserting a fixed-fret note.
-- [x] Fixed the lenghth of 1/32 notes for correct visualisation.
 
-### Visual feedback (Phase 1 — rendering)
+### Note brick sizing (Phase 1 — rendering)
+- [x] Note bricks are now **strictly proportional** to their duration in ticks
+      (a 1/32 is ~half the width of a 1/16 at default zoom), with a small
+      digit-aware floor only for legibility, instead of all short notes being
+      forced to the same 18 px width.
+- [x] Font size shrinks and brick height reduces for very short notes so the
+      visual rhythm matches the musical rhythm.
 - [x] **Cursor cell** drawn on the tab staff: translucent accent box sized to
       the current duration, with the half-typed fret shown as ghost text.
-- [x] Active duration surfaced in the transport toolbar (combo + `−`/`+`).
+- [x] Duration combo box wrapped in a horizontal `ScrollArea` so the toolbar
+      never overflows when space is tight. (?????)
+- [x] Removed redundant `−` button to the left of the duration dropdown.
+
+### Toolbar / UX polish
 - [x] `default fret` value renamed and given a tooltip clarifying it is only
       used when committing without typing a number first.
 
@@ -78,9 +87,8 @@ a polymetric `.bwx` format.
       pass-through stub that only records loaded paths). Requires implementation of VST3 folder scanning (C:\Program Files\Common Files\VST3).
 
 ### File formats (Phase 4)
-- [ ] **Native `.bwx` save/load round-trip** tested through the UI (serializer
-      + tests exist, but no in-app "Open .bwx" smoke test against a real file).
-- [ ] **`.tg` import/export** beyond the current TuxGuitar subset reader.
+- [x] **Native `.bwx` save/load round-trip** tested through the UI. Works good at the state of 19.06.2026
+- [ ] **`.tg` import/export** beyond the current TuxGuitar subset reader. Export can't be tested, blocked due to inability to delete test instrument with polythithms 
 - [ ] **`.gp` (Guitar Pro)** reader/writer (export path is a placeholder text
       bundle today).
 - [ ] Multi-track bundle export wizard with a per-track checklist (currently

@@ -416,7 +416,7 @@ impl BetterWriterApp {
     ///   - Backspace / Delete: remove the note under the cursor
     ///   - Left / Right: move by the selected duration (or one grid cell)
     ///   - Up / Down: change the active string
-    ///   - + / -: cycle note duration shorter/longer
+    ///   - + / = / -: cycle note duration shorter / longer
     ///   - 1-6 (with Ctrl held): jump to a specific duration slot
     ///   - Esc: clear the pending fret buffer
     ///   - Home: snap cursor to tick 0
@@ -479,13 +479,13 @@ impl BetterWriterApp {
                 changed = true;
             }
 
-            // Duration cycling
+            // Duration cycling: `-` → longer, `+`/`=` → shorter
             if i.key_pressed(egui::Key::Minus) {
-                self.cycle_duration(-1);
+                self.cycle_duration(1);
                 changed = true;
             }
-            if i.key_pressed(egui::Key::Plus) {
-                self.cycle_duration(1);
+            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                self.cycle_duration(-1);
                 changed = true;
             }
 
@@ -659,7 +659,7 @@ impl BetterWriterApp {
                 ui.label("Backspace / Del . delete note under cursor (or clear buffer)");
                 ui.label("Left / Right .... move cursor by the selected duration");
                 ui.label("Up / Down ....... change active string");
-                ui.label("+ / - ........... cycle note duration longer / shorter");
+                ui.label("+ / = / - ......... cycle note duration shorter / longer");
                 ui.label("Ctrl+1..6 ....... jump to duration slot (1/1, 1/2, ... 1/32)");
                 ui.label("Esc ............. clear pending fret / selection");
                 ui.label("Home ............ move cursor to tick 0");
@@ -708,23 +708,21 @@ impl BetterWriterApp {
             ui.label("tempo");
             ui.add(egui::DragValue::new(&mut self.project.tempo_bpm).range(20.0..=320.0));
             ui.label("duration");
-            if small_tool_button(ui, "-", "Shorter note (−)").clicked() {
-                self.cycle_duration(-1);
-            }
-            egui::ComboBox::from_id_salt("duration")
-                .selected_text(self.selected_duration.label())
-                .show_ui(ui, |ui| {
-                    for duration in DurationChoice::ALL {
-                        ui.selectable_value(
-                            &mut self.selected_duration,
-                            duration,
-                            duration.label(),
-                        );
-                    }
+            egui::ScrollArea::horizontal()
+                .id_salt("duration_scroll")
+                .show(ui, |ui| {
+                    egui::ComboBox::from_id_salt("duration")
+                        .selected_text(self.selected_duration.label())
+                        .show_ui(ui, |ui| {
+                            for duration in DurationChoice::ALL {
+                                ui.selectable_value(
+                                    &mut self.selected_duration,
+                                    duration,
+                                    duration.label(),
+                                );
+                            }
+                        });
                 });
-            if small_tool_button(ui, "+", "Longer note (+)").clicked() {
-                self.cycle_duration(1);
-            }
             ui.add(
                 egui::DragValue::new(&mut self.fret_to_insert)
                     .range(0..=36)
