@@ -71,7 +71,9 @@ a polymetric `.bwx` format.
 - [ ] Undo / redo stack for edits.
 - [ ] Instruments adding/deleting
 - [ ] Bar adding/deleting
-- [ ] Bar scrolling
+- [ ] Some kind of bar scrolling
+- [ ] Vertical bar placement to fill the screen me efficiently
+- [ ] Brick note length manual editing with pulling it left or right as in piano rolls.
 
 ### Audio / playback (Phase 3)
 - [ ] **Live playback playhead** rendered on the canvas synced to the audio
@@ -103,7 +105,7 @@ a polymetric `.bwx` format.
 - [ ] Drag-to-move notes; drag-select range.
 - [ ] Fretboard panel is display-only; clicking a fret should enter a note.
 - [ ] Classic notation view above tablature should be toggleable on/off.
-- [ ] Mode switching from brick painting to UI similar to Guitar Pro, TuxGuitar, etc. with fret numbers instead of bricks and intelligend rests filling at the end of bars.
+- [ ] One-button mode switching from brick painting to UI similar to Guitar Pro, TuxGuitar, etc. with fret numbers instead of bricks and intelligend rests filling at the end of bars. Upon switching, bricks that lay between bars should be calculated as tied notes, with its length naturally spread across bars as tied notes. when switching back to brick mode they such tied notes should be combined into full bricks again. (only ones that were created as bricks. Custom user's tied notes should be considered separate notes but connected with sound.
 
 ### Project hygiene
 - [ ] Resolve the 3 pre-existing clippy warnings (collapsible `if` in
