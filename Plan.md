@@ -91,7 +91,8 @@ Important: edit this file with its formatting in mind, don't change the formatti
 - [ ] Special Paste... (`Ctrl+Shift+V`)
 - [x] Bar
     
-    - [ ] Insert Bar (`Ctrl+Ins`)
+    - [ ] Insert Bar (to the left of selected bar) (`Ctrl+Ins` and `Ctrl+Shift+B`)
+    - [ ] Add a Bar (to the right of selected bar) (`Ctrl+B`)
     - [ ] Delete Bar (`Ctrl+Del`)
     - [ ] Clef... (`K`)
     - [ ] Key Signature... (`Ctrl+K`)
@@ -202,6 +203,7 @@ Important: edit this file with its formatting in mind, don't change the formatti
 - [ ] Making Virtual guitar neck/Fretboard panel: 1. usable for note input 2. tuning changable. 3. Hideable (Togglable on/off). 4. Guitar nut area isn't displayed properly, there should be area between the note and the nut (E---|(nut)---|(1 fret)---..., --- is clickable area for the nut/fret to its right)
 - [ ] In timeline instead of diamonds for each note display a row of blocks with a block for each existing bar, a block with a width of a bar size/time measure (4/4, 3/4, 6/4) relative to all other bar sizes in the project, so 1/4 is 4x smaller than 4/4, but to make them all visible and clickable, the smallest cannot go smaller than some width amount of pixels, and if it gets to that, make everything get bigger. Each instrument has its own row of bar blocks.
 - [ ] Starting menu with recently opened projects kept in a vertical list, double-clicking opens the project to the edit menu we currently have. There should be a button to create new project with options: 1: name ("Untitled" by default, if it already exists add 1 then 2, etc.), 2. First track instrument Currently only Stringed will work, but also add Orchestra, Drums, MIDI. Stringed has options of Acoustic guitar, Electric guitar, Bass, Other. In the future each will have default playback sound that will be modified with VST3s. 3. Amount of strings selection (up to 12, but in the input menu make any value above inputable.) Add there a button for "Demo project" option will open what we currently have as open-on-startup. New projects are fully empty and only have 1 instrument and 1 bar at 4/4 set to default tempo of 120 bpm.
+- [ ] Make instruments selectable to display multiple of their tabs/notations at the same time (current time of each instrument's notes is the key for synchronization here)
 
 ### Audio / playback (Phase 3)
 - [ ] **Live playback playhead** rendered on the canvas synced to the audio
