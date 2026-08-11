@@ -66,6 +66,9 @@ Important: edit this file with its formatting in mind, don't change the formatti
       history covers note entry/replacement, deletion, duration, velocity,
       effects, and tempo. Available through **Edit → Undo/Redo**, `Ctrl+Z` /
       `Ctrl+Y`, and `Cmd+Z` / `Cmd+Shift+Z` on macOS.
+- [x] RMB functionality partially implemented (check below for details).
+- [x] **Per-track polymetric time signatures** in the editor UI: right-click a
+      bar to change its signature for the selected track
 
 ### Project hygiene
 - [x] Resolved the pre-existing clippy warnings; `cargo clippy --all-targets -- -D warnings` now passes.
@@ -78,7 +81,7 @@ Important: edit this file with its formatting in mind, don't change the formatti
 - [ ]
 
 ### Core notation engine (Phase 2)
-- [x] Right mouse click in an area to open context menu with options:
+- [x] Right mouse click (RMB) in an area to open context menu with options:
 
 - [ ] Cut (`Ctrl+X`)
 - [ ] Copy (`Ctrl+C`)
@@ -187,9 +190,6 @@ Important: edit this file with its formatting in mind, don't change the formatti
     - [ ] Wah Close (`Ctrl+Alt+C`)
     
 - [ ] Left mouse drag to select area of notes, both vertically and horizontally, in tab view.
-- [x] **Per-track polymetric time signatures** in the editor UI: right-click a
-      bar to change its signature for the selected track without splitting it
-      at the click location.
 - [ ] **Tempo map** (`tempo_bpm` is project-global today; needs per-tick tempo
       changes for the shadow-timeline playback to be sample-accurate).
 - [ ] Ties, grace notes, tuplets, dotted/double-dotted durations.
