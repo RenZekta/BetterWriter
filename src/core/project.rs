@@ -114,7 +114,7 @@ impl DurationChoice {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InstrumentTrack {
     pub id: u64,
     pub name: String,
@@ -165,10 +165,40 @@ impl InstrumentTrack {
     }
 
     pub fn measure_bounds_at(&self, tick: Tick) -> (Tick, Tick) {
-        let signature = self.signature_at(tick);
+        // A signature change starts a fresh bar grid at its own tick. This is
+        // important for polymetric tracks: using the active signature to
+        // divide from tick zero would put bars on the wrong side of a later
+        // signature change. A change that falls mid-bar deliberately closes
+        // that bar early and begins a new one.
+        let tick = tick.max(0);
+        let current_change_index = self
+            .time_signature_changes
+            .iter()
+            .rposition(|change| change.at_tick <= tick);
+        let (segment_start, signature, next_change_tick) = match current_change_index {
+            Some(index) => (
+                self.time_signature_changes[index].at_tick.max(0),
+                self.time_signature_changes[index].signature,
+                self.time_signature_changes
+                    .get(index + 1)
+                    .map(|change| change.at_tick),
+            ),
+            None => (
+                0,
+                TimeSignature::new(4, 4),
+                self.time_signature_changes
+                    .first()
+                    .map(|change| change.at_tick),
+            ),
+        };
         let measure_ticks = signature.measure_ticks().max(TICKS_PER_QUARTER / 4);
-        let start = tick.div_euclid(measure_ticks) * measure_ticks;
-        (start, start + measure_ticks)
+        let start =
+            segment_start + (tick - segment_start).div_euclid(measure_ticks) * measure_ticks;
+        let nominal_end = start + measure_ticks;
+        let end = next_change_tick
+            .filter(|change_tick| *change_tick > start && *change_tick < nominal_end)
+            .unwrap_or(nominal_end);
+        (start, end)
     }
 
     pub fn midi_key_for(&self, note: &TabNote) -> u8 {
@@ -193,7 +223,7 @@ impl InstrumentTrack {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BwxProject {
     pub schema_version: u16,
     pub title: String,

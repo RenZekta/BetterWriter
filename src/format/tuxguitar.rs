@@ -171,7 +171,7 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             let _ = reader.read_u8()?;
         }
         if flags & MEASURE_HEADER_MARKER != 0 {
-            let _ = reader.read_marker()?;
+            reader.read_marker()?;
         }
         if flags & MEASURE_HEADER_TRIPLET_FEEL != 0 {
             let _ = reader.read_u8()?;

@@ -1,4 +1,6 @@
-use super::project::{BwxProject, NoteEffects, RestNode, TICKS_PER_QUARTER, TabNote, Tick};
+use super::project::{
+    BwxProject, NoteEffects, RestNode, TICKS_PER_QUARTER, TabNote, Tick, TimeSignature,
+};
 
 impl BwxProject {
     pub fn insert_note(
@@ -32,6 +34,42 @@ impl BwxProject {
         let before = track.notes.len();
         track.notes.retain(|note| note.id != note_id);
         before != track.notes.len()
+    }
+
+    /// Insert or replace a time signature change on one track. Each change
+    /// begins a fresh bar grid at `at_tick`, allowing genuinely independent
+    /// (polymetric) track timelines.
+    pub fn set_track_time_signature(
+        &mut self,
+        track_id: u64,
+        at_tick: Tick,
+        signature: TimeSignature,
+    ) -> bool {
+        if signature.numerator == 0 || signature.denominator == 0 {
+            return false;
+        }
+        let Some(track) = self.track_mut(track_id) else {
+            return false;
+        };
+        let at_tick = at_tick.max(0);
+        if let Some(change) = track
+            .time_signature_changes
+            .iter_mut()
+            .find(|change| change.at_tick == at_tick)
+        {
+            if change.signature == signature {
+                return false;
+            }
+            change.signature = signature;
+        } else {
+            track
+                .time_signature_changes
+                .push(super::project::TimeSignatureChange { at_tick, signature });
+            track
+                .time_signature_changes
+                .sort_by_key(|change| change.at_tick);
+        }
+        true
     }
 
     pub fn set_note_duration_fluid(
@@ -151,5 +189,18 @@ mod tests {
         assert_eq!(rests.len(), 2);
         assert_eq!(rests[0].duration_ticks, TICKS_PER_QUARTER * 2);
         assert_eq!(rests[1].duration_ticks, TICKS_PER_QUARTER);
+    }
+
+    #[test]
+    fn time_signature_change_restarts_the_measure_grid() {
+        let mut project = BwxProject::demo();
+        assert!(project.set_track_time_signature(1, 2_500, TimeSignature::new(3, 4)));
+        let track = project.track(1).unwrap();
+
+        // The 4/4 measure is clipped at the new signature tick, then 3/4
+        // measures begin exactly there instead of on the global tick-zero grid.
+        assert_eq!(track.measure_bounds_at(2_400), (0, 2_500));
+        assert_eq!(track.measure_bounds_at(2_500), (2_500, 5_380));
+        assert_eq!(track.measure_bounds_at(5_380), (5_380, 8_260));
     }
 }

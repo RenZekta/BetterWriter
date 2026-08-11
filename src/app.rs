@@ -6,7 +6,7 @@ use crate::{
     audio::{AudioRuntime, Vst3HostSlot, VstHost},
     core::{
         BwxProject, CompatibilityReport, DurationChoice, MidiEventKind, MidiPlaybackEvent,
-        NoteEffects, ShadowTimeline, StandardExportFormat, TICKS_PER_QUARTER, Tick,
+        NoteEffects, ShadowTimeline, StandardExportFormat, TICKS_PER_QUARTER, Tick, TimeSignature,
     },
     format,
     theme::EditorTheme,
@@ -57,6 +57,13 @@ pub struct BetterWriterApp {
     status: String,
     compatibility: CompatibilityReport,
     cursor: EditCursor,
+    /// Whole-project snapshots make every editor operation reversible without
+    /// coupling the UI to individual edit command types. The score is small
+    /// enough at this stage that this is both simple and responsive.
+    undo_stack: Vec<BwxProject>,
+    redo_stack: Vec<BwxProject>,
+    time_signature_numerator: u8,
+    time_signature_denominator: u8,
 }
 
 impl BetterWriterApp {
@@ -90,6 +97,10 @@ impl BetterWriterApp {
                 .to_owned(),
             compatibility,
             cursor: EditCursor::new(0, first_string),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
         }
     }
 
@@ -97,6 +108,70 @@ impl BetterWriterApp {
         self.shadow_timeline.replace_track(&self.project, track_id);
         self.compatibility =
             CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
+    }
+
+    /// Save a previous project state only when an operation actually changed
+    /// the score. A new edit always starts a new undo branch, so redo history
+    /// is then no longer meaningful.
+    fn record_project_edit(&mut self, before: BwxProject) {
+        if before == self.project {
+            return;
+        }
+
+        const HISTORY_LIMIT: usize = 100;
+        self.undo_stack.push(before);
+        if self.undo_stack.len() > HISTORY_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn restore_history_state(&mut self, project: BwxProject, action: &str) {
+        self.project = project;
+        if self.project.track(self.selected_track_id).is_none() {
+            self.selected_track_id = self
+                .project
+                .tracks
+                .first()
+                .map(|track| track.id)
+                .unwrap_or(1);
+        }
+        self.selected_note_id = self.selected_note_id.filter(|note_id| {
+            self.project
+                .track(self.selected_track_id)
+                .is_some_and(|track| track.notes.iter().any(|note| note.id == *note_id))
+        });
+        if let Some(track) = self.project.track(self.selected_track_id) {
+            self.cursor.string_index = self
+                .cursor
+                .string_index
+                .min(track.tuning.len().saturating_sub(1));
+        }
+        self.cursor.pending_fret = None;
+        self.cursor.pending_at = None;
+        self.sync_time_signature_picker();
+        self.shadow_timeline.rebuild_all(&self.project);
+        self.compatibility =
+            CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
+        self.status = format!("{action}.");
+    }
+
+    fn undo(&mut self) {
+        let Some(previous) = self.undo_stack.pop() else {
+            self.status = "Nothing to undo.".to_owned();
+            return;
+        };
+        self.redo_stack.push(self.project.clone());
+        self.restore_history_state(previous, "Undid last edit");
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "Nothing to redo.".to_owned();
+            return;
+        };
+        self.undo_stack.push(self.project.clone());
+        self.restore_history_state(next, "Redid edit");
     }
 
     fn play(&mut self) {
@@ -128,6 +203,8 @@ impl BetterWriterApp {
         self.shadow_timeline.rebuild_all(&self.project);
         self.compatibility =
             CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.status = "Created a new BetterWriter project.".to_owned();
     }
 
@@ -156,6 +233,8 @@ impl BetterWriterApp {
                 self.shadow_timeline.rebuild_all(&self.project);
                 self.compatibility =
                     CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
+                self.undo_stack.clear();
+                self.redo_stack.clear();
                 self.status = format!("Loaded {}", path.display());
             }
             Err(err) => self.status = format!("Open failed: {err}"),
@@ -235,6 +314,126 @@ impl BetterWriterApp {
             .unwrap_or(0);
         self.cursor.pending_fret = None;
         self.cursor.pending_at = None;
+        self.sync_time_signature_picker();
+    }
+
+    fn sync_time_signature_picker(&mut self) {
+        if let Some(track) = self.project.track(self.selected_track_id) {
+            let signature = track.signature_at(self.cursor.tick);
+            self.time_signature_numerator = signature.numerator;
+            self.time_signature_denominator = signature.denominator;
+        }
+    }
+
+    fn apply_time_signature_at_cursor(&mut self) {
+        let signature = TimeSignature::new(
+            self.time_signature_numerator.max(1),
+            self.time_signature_denominator.max(1),
+        );
+        // A bar-level edit applies to the bar containing the click, not to a
+        // new boundary at the click itself. This lets a user right-click in
+        // the middle of a 4/4 bar and turn that entire bar into (say) 3/4.
+        let bar_start = self
+            .project
+            .track(self.selected_track_id)
+            .map(|track| track.measure_bounds_at(self.cursor.tick).0)
+            .unwrap_or(self.cursor.tick);
+        let previous_project = self.project.clone();
+        if self
+            .project
+            .set_track_time_signature(self.selected_track_id, bar_start, signature)
+        {
+            self.record_project_edit(previous_project);
+            self.refresh_after_edit(self.selected_track_id);
+            self.status = format!(
+                "Set this bar to {}/{} from tick {}.",
+                signature.numerator, signature.denominator, bar_start
+            );
+        }
+    }
+
+    fn delete_selected_note(&mut self) -> bool {
+        let Some(note_id) = self.selected_note_id else {
+            return false;
+        };
+        let previous_project = self.project.clone();
+        if self.project.delete_note(self.selected_track_id, note_id) {
+            self.record_project_edit(previous_project);
+            self.selected_note_id = None;
+            self.refresh_after_edit(self.selected_track_id);
+            self.status = format!("Deleted note {note_id}.");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn adjust_selected_fret(&mut self, delta: i16) -> bool {
+        let Some(note_id) = self.selected_note_id else {
+            return false;
+        };
+        let previous_project = self.project.clone();
+        let changed = self
+            .project
+            .track_mut(self.selected_track_id)
+            .and_then(|track| {
+                let max_fret = track.fret_count;
+                let note = track.notes.iter_mut().find(|note| note.id == note_id)?;
+                let fret = (note.fret as i16 + delta).clamp(0, max_fret as i16) as u8;
+                (fret != note.fret).then(|| {
+                    note.fret = fret;
+                    fret
+                })
+            });
+        if let Some(fret) = changed {
+            self.record_project_edit(previous_project);
+            self.refresh_after_edit(self.selected_track_id);
+            self.status = format!("Changed selected note to fret {fret}.");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn step_selected_note_duration(&mut self, steps: i32) -> bool {
+        let Some(note_id) = self.selected_note_id else {
+            return false;
+        };
+        let Some(current_ticks) = self
+            .project
+            .track(self.selected_track_id)
+            .and_then(|track| track.notes.iter().find(|note| note.id == note_id))
+            .map(|note| note.duration_ticks)
+        else {
+            return false;
+        };
+        let current_index = DurationChoice::ALL
+            .iter()
+            .position(|duration| duration.ticks() == current_ticks)
+            .unwrap_or_else(|| {
+                DurationChoice::ALL
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, duration)| (duration.ticks() - current_ticks).abs())
+                    .map(|(index, _)| index)
+                    .unwrap_or(2)
+            }) as i32;
+        let new_index =
+            (current_index + steps).clamp(0, DurationChoice::ALL.len() as i32 - 1) as usize;
+        let duration = DurationChoice::ALL[new_index];
+        let previous_project = self.project.clone();
+        if self
+            .project
+            .set_note_duration_fluid(self.selected_track_id, note_id, duration.ticks())
+        {
+            self.selected_duration = duration;
+            self.record_project_edit(previous_project);
+            self.refresh_after_edit(self.selected_track_id);
+            self.status = format!("Changed selected note length to {}.", duration.label());
+            true
+        } else {
+            false
+        }
     }
 
     /// If the pending fret buffer has gone stale (~1.2s without input), drop it
@@ -299,10 +498,7 @@ impl BetterWriterApp {
         if candidate <= max_fret {
             self.cursor.pending_fret = Some(candidate);
             self.cursor.pending_at = Some(now);
-            self.status = format!(
-                "Fret buffer: {}  (Enter to place, Esc to clear)",
-                candidate
-            );
+            self.status = format!("Fret buffer: {}  (Enter to place, Esc to clear)", candidate);
         } else {
             // Too large for this instrument: start fresh from the new digit.
             self.cursor.pending_fret = Some(digit);
@@ -327,6 +523,7 @@ impl BetterWriterApp {
         let tick = self.cursor.tick.max(0);
         let fret = self.cursor.pending_fret.unwrap_or(self.fret_to_insert);
         let duration = self.selected_duration.ticks();
+        let previous_project = self.project.clone();
 
         // If a note already sits on this string at this tick, overwrite its
         // fret instead of stacking a duplicate.
@@ -347,13 +544,10 @@ impl BetterWriterApp {
                 self.selected_note_id = Some(id);
                 self.status = format!("Replaced note {id} with fret {fret}.");
             }
-        } else if let Some(id) = self.project.insert_note(
-            track_id,
-            tick,
-            duration,
-            string_index,
-            fret,
-        ) {
+        } else if let Some(id) =
+            self.project
+                .insert_note(track_id, tick, duration, string_index, fret)
+        {
             if let Some(track) = self.project.track_mut(track_id)
                 && let Some(note) = track.notes.iter_mut().find(|n| n.id == id)
             {
@@ -368,6 +562,7 @@ impl BetterWriterApp {
         }
 
         self.cursor.pending_fret = None;
+        self.record_project_edit(previous_project);
         self.refresh_after_edit(track_id);
         self.advance_cursor();
     }
@@ -386,9 +581,11 @@ impl BetterWriterApp {
             .iter()
             .find(|n| n.abs_tick == tick && n.string_index == string_index)
             .map(|n| n.id);
+        let previous_project = self.project.clone();
         if let Some(id) = target
             && self.project.delete_note(track_id, id)
         {
+            self.record_project_edit(previous_project);
             self.selected_note_id = None;
             self.refresh_after_edit(track_id);
             self.status = format!("Deleted note {id} at tick {tick}.");
@@ -418,6 +615,7 @@ impl BetterWriterApp {
     ///   - Up / Down: change the active string
     ///   - + / = / -: cycle note duration shorter / longer
     ///   - 1-6 (with Ctrl held): jump to a specific duration slot
+    ///   - Ctrl+Z / Ctrl+Y (or Cmd+Z / Cmd+Shift+Z): undo / redo
     ///   - Esc: clear the pending fret buffer
     ///   - Home: snap cursor to tick 0
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> bool {
@@ -425,6 +623,21 @@ impl BetterWriterApp {
         let mut changed = false;
 
         ctx.input(|i| {
+            // Use egui's platform-aware `command` modifier: Ctrl on Windows
+            // and Linux, Command on macOS.
+            if i.modifiers.command && i.key_pressed(egui::Key::Z) {
+                if i.modifiers.shift {
+                    self.redo();
+                } else {
+                    self.undo();
+                }
+                changed = true;
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::Y) {
+                self.redo();
+                changed = true;
+            }
+
             // Fret digits — always available so the user can start typing
             // immediately. We read raw events to also catch numpad keys.
             // Skip when a modifier is held so Ctrl+digit can drive duration.
@@ -440,13 +653,19 @@ impl BetterWriterApp {
                 }
             }
 
-            // Arrow navigation
-            if i.key_pressed(egui::Key::ArrowRight) {
+            // Shift+arrows adjust the selected brick. Plain arrows retain the
+            // TuxGuitar-style cursor navigation behaviour.
+            let adjust_selected_note = i.modifiers.shift && self.selected_note_id.is_some();
+            if adjust_selected_note && i.key_pressed(egui::Key::ArrowRight) {
+                changed |= self.step_selected_note_duration(-1);
+            } else if i.key_pressed(egui::Key::ArrowRight) {
                 self.advance_cursor();
                 self.selected_note_id = None;
                 changed = true;
             }
-            if i.key_pressed(egui::Key::ArrowLeft) {
+            if adjust_selected_note && i.key_pressed(egui::Key::ArrowLeft) {
+                changed |= self.step_selected_note_duration(1);
+            } else if i.key_pressed(egui::Key::ArrowLeft) {
                 let step = self.selected_duration.ticks();
                 self.cursor.tick = (self.cursor.tick - step).max(0);
                 self.cursor.pending_fret = None;
@@ -454,11 +673,15 @@ impl BetterWriterApp {
                 self.selected_note_id = None;
                 changed = true;
             }
-            if i.key_pressed(egui::Key::ArrowUp) {
+            if adjust_selected_note && i.key_pressed(egui::Key::ArrowUp) {
+                changed |= self.adjust_selected_fret(1);
+            } else if i.key_pressed(egui::Key::ArrowUp) {
                 self.move_cursor_string(1);
                 changed = true;
             }
-            if i.key_pressed(egui::Key::ArrowDown) {
+            if adjust_selected_note && i.key_pressed(egui::Key::ArrowDown) {
+                changed |= self.adjust_selected_fret(-1);
+            } else if i.key_pressed(egui::Key::ArrowDown) {
                 self.move_cursor_string(-1);
                 changed = true;
             }
@@ -611,11 +834,10 @@ impl BetterWriterApp {
                 }
                 ui.separator();
                 let compatible = self.compatibility.standard_exports_enabled;
-                let hint = self
-                    .compatibility
-                    .warning
-                    .clone()
-                    .unwrap_or_else(|| "Export each track as a standard tab bundle.".to_owned());
+                let hint =
+                    self.compatibility.warning.clone().unwrap_or_else(|| {
+                        "Export each track as a standard tab bundle.".to_owned()
+                    });
                 ui.add_enabled_ui(compatible, |ui| {
                     if ui.button("Export .tg Bundle").clicked() {
                         self.export_bundle(StandardExportFormat::TuxGuitar);
@@ -636,8 +858,25 @@ impl BetterWriterApp {
                     );
                 }
             });
+            ui.menu_button("Edit", |ui| {
+                let can_undo = !self.undo_stack.is_empty();
+                let can_redo = !self.redo_stack.is_empty();
+                if ui
+                    .add_enabled(can_undo, egui::Button::new("Undo\tCtrl+Z"))
+                    .clicked()
+                {
+                    self.undo();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(can_redo, egui::Button::new("Redo\tCtrl+Y"))
+                    .clicked()
+                {
+                    self.redo();
+                    ui.close();
+                }
+            });
             for name in [
-                "Edit",
                 "View",
                 "Composition",
                 "Track",
@@ -661,12 +900,14 @@ impl BetterWriterApp {
                 ui.label("Up / Down ....... change active string");
                 ui.label("+ / = / - ......... cycle note duration shorter / longer");
                 ui.label("Ctrl+1..6 ....... jump to duration slot (1/1, 1/2, ... 1/32)");
+                ui.label("Ctrl+Z / Ctrl+Y ... undo / redo (Cmd+Z / Cmd+Shift+Z on macOS)");
+                ui.label(
+                    "Shift+arrows ..... adjust selected note: up/down fret, left/right length",
+                );
                 ui.label("Esc ............. clear pending fret / selection");
                 ui.label("Home ............ move cursor to tick 0");
                 ui.separator();
-                ui.label(
-                    "Tip: click the staff to reposition the cursor, then type a fret.",
-                );
+                ui.label("Tip: click the staff to reposition the cursor, then type a fret.");
             });
         });
     }
@@ -706,7 +947,13 @@ impl BetterWriterApp {
             }
             ui.separator();
             ui.label("tempo");
-            ui.add(egui::DragValue::new(&mut self.project.tempo_bpm).range(20.0..=320.0));
+            let project_before_tempo = self.project.clone();
+            if ui
+                .add(egui::DragValue::new(&mut self.project.tempo_bpm).range(20.0..=320.0))
+                .changed()
+            {
+                self.record_project_edit(project_before_tempo);
+            }
             ui.label("duration");
             egui::ScrollArea::horizontal()
                 .id_salt("duration_scroll")
@@ -734,15 +981,12 @@ impl BetterWriterApp {
             if small_tool_button(ui, "VST3", "Load VST3 plug-in").clicked() {
                 self.load_vst3();
             }
-            if let Some((track_id, note_id)) = self.selected_note_mut() {
+            if self.selected_note_mut().is_some() {
                 if small_tool_button(ui, "Dur", "Apply selected duration to note").clicked() {
                     self.apply_selected_duration();
                 }
-                if small_tool_button(ui, "Del", "Delete selected note").clicked()
-                    && self.project.delete_note(track_id, note_id)
-                {
-                    self.selected_note_id = None;
-                    self.refresh_after_edit(track_id);
+                if small_tool_button(ui, "Del", "Delete selected note").clicked() {
+                    self.delete_selected_note();
                 }
             }
         });
@@ -933,11 +1177,13 @@ impl BetterWriterApp {
 
     fn apply_selected_duration(&mut self) {
         if let Some((track_id, note_id)) = self.selected_note_mut() {
+            let previous_project = self.project.clone();
             if self.project.set_note_duration_fluid(
                 track_id,
                 note_id,
                 self.selected_duration.ticks(),
             ) {
+                self.record_project_edit(previous_project);
                 self.refresh_after_edit(track_id);
                 self.status = "Duration changed; later notes in the measure shifted.".to_owned();
             }
@@ -948,10 +1194,12 @@ impl BetterWriterApp {
         let Some(note_id) = self.selected_note_id else {
             return;
         };
+        let previous_project = self.project.clone();
         if let Some(track) = self.project.track_mut(self.selected_track_id)
             && let Some(note) = track.notes.iter_mut().find(|note| note.id == note_id)
         {
             note.velocity = self.active_velocity;
+            self.record_project_edit(previous_project);
             self.refresh_after_edit(self.selected_track_id);
         }
     }
@@ -960,10 +1208,12 @@ impl BetterWriterApp {
         let Some(note_id) = self.selected_note_id else {
             return;
         };
+        let previous_project = self.project.clone();
         if let Some(track) = self.project.track_mut(self.selected_track_id)
             && let Some(note) = track.notes.iter_mut().find(|note| note.id == note_id)
         {
             note.effects = self.active_effects.clone();
+            self.record_project_edit(previous_project);
             self.refresh_after_edit(self.selected_track_id);
         }
     }
@@ -985,6 +1235,260 @@ impl BetterWriterApp {
         {
             self.handle_canvas_click(pos, track_rect);
         }
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            // Right-click uses the same hit testing as a normal click, so the
+            // menu always operates on the exact staff position or selected
+            // note under the pointer.
+            self.handle_canvas_click(pos, track_rect);
+            self.sync_time_signature_picker();
+        }
+        response.context_menu(|ui| self.show_canvas_context_menu(ui));
+    }
+
+    fn show_canvas_context_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Staff context menu").strong());
+        ui.label(format!(
+            "Track: {} · tick {}",
+            self.project
+                .track(self.selected_track_id)
+                .map(|track| track.name.as_str())
+                .unwrap_or("No track"),
+            self.cursor.tick
+        ));
+        ui.separator();
+        planned_menu_item(ui, "Cut  (Ctrl+X)");
+        planned_menu_item(ui, "Copy  (Ctrl+C)");
+        planned_menu_item(ui, "Paste  (Ctrl+V)");
+        planned_menu_item(ui, "All-Track Cut  (Ctrl+Shift+X)");
+        planned_menu_item(ui, "All-Track Copy  (Ctrl+Shift+C)");
+        planned_menu_item(ui, "Special Paste...  (Ctrl+Shift+V)");
+        ui.separator();
+        let has_selection = self.selected_note_id.is_some();
+        ui.menu_button("Bar", |ui| {
+            planned_menu_item(ui, "Insert Bar  (Ctrl+Ins)");
+            planned_menu_item(ui, "Delete Bar  (Ctrl+Del)");
+            planned_menu_item(ui, "Clef...  (K)");
+            planned_menu_item(ui, "Key Signature...  (Ctrl+K)");
+            ui.menu_button("Time Signature...  (Ctrl+T)", |ui| {
+                ui.label("Applies to the whole bar containing the click");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.time_signature_numerator)
+                            .range(1..=32)
+                            .prefix(" "),
+                    );
+                    ui.label("/");
+                    egui::ComboBox::from_id_salt("context_time_signature_denominator")
+                        .selected_text(self.time_signature_denominator.to_string())
+                        .show_ui(ui, |ui| {
+                            for denominator in [1, 2, 4, 8, 16, 32] {
+                                ui.selectable_value(
+                                    &mut self.time_signature_denominator,
+                                    denominator,
+                                    denominator.to_string(),
+                                );
+                            }
+                        });
+                });
+                if ui.button("Apply to this track").clicked() {
+                    self.apply_time_signature_at_cursor();
+                    ui.close();
+                }
+            });
+            for label in [
+                "Triplet Feel...  (Ctrl+/)",
+                "Free Time  (|)",
+                "Double Barline",
+                "Anacrusis (Pickup Bar)",
+                "Repeat Open  ([)",
+                "Alternate Endings...",
+                "Repeat Close...  (])",
+                "Directions...  (D)",
+                "Simile Marks",
+                "Multirest  (Ctrl+R)",
+                "Force Break Line  (Ctrl+Return)",
+                "Prevent Break Line",
+                "System Layout...",
+            ] {
+                planned_menu_item(ui, label);
+            }
+        });
+        let mut note_effects_changed = false;
+        ui.menu_button("Note", |ui| {
+            planned_menu_item(ui, "Insert a Beat  (Ins)");
+            planned_menu_item(ui, "Delete the Beats  (Shift+Del)");
+            planned_menu_item(ui, "Copy Beats at the End  (C)");
+            ui.menu_button("Duration", |ui| {
+                ui.add_enabled_ui(has_selection, |ui| {
+                    for duration in DurationChoice::ALL {
+                        if ui
+                            .selectable_label(self.selected_duration == duration, duration.label())
+                            .clicked()
+                        {
+                            self.selected_duration = duration;
+                            self.apply_selected_duration();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.menu_button("Dynamic", |ui| {
+                ui.add_enabled_ui(has_selection, |ui| {
+                    for (label, velocity) in [
+                        ("ppp", 30),
+                        ("pp", 42),
+                        ("p", 56),
+                        ("mp", 72),
+                        ("mf", 88),
+                        ("f", 104),
+                        ("ff", 116),
+                        ("fff", 127),
+                    ] {
+                        if ui
+                            .selectable_label(self.active_velocity == velocity, label)
+                            .clicked()
+                        {
+                            self.active_velocity = velocity;
+                            self.apply_velocity_to_selected();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.add_enabled_ui(has_selection, |ui| {
+                note_effects_changed |= ui
+                    .checkbox(&mut self.active_effects.ghost, "Ghost Note  (O)")
+                    .changed();
+                note_effects_changed |= ui
+                    .checkbox(&mut self.active_effects.accent, "Accented Note  (;)")
+                    .changed();
+                note_effects_changed |= ui
+                    .checkbox(
+                        &mut self.active_effects.heavy_accent,
+                        "Heavily Accented Note  (:)",
+                    )
+                    .changed();
+                note_effects_changed |= ui
+                    .checkbox(&mut self.active_effects.staccato, "Staccato  (!)")
+                    .changed();
+            });
+            for label in [
+                "Staccatissimo",
+                "Tenuto",
+                "Tie Note  (L)",
+                "Tie Beat  (Shift+L)",
+                "Rest  (R)",
+                "Fermata...  (F)",
+                "Accidentals",
+            ] {
+                planned_menu_item(ui, label);
+            }
+            ui.add_enabled_ui(has_selection, |ui| {
+                if ui.button("One Semitone Down  (Alt+Shift+Down)").clicked() {
+                    self.adjust_selected_fret(-1);
+                    ui.close();
+                }
+                if ui.button("One Semitone Up  (Alt+Shift+Up)").clicked() {
+                    self.adjust_selected_fret(1);
+                    ui.close();
+                }
+            });
+            for label in [
+                "One Octave Down  (Alt+Shift+PgDown)",
+                "One Octave Up  (Alt+Shift+PgUp)",
+                "Left Hand Fingering...",
+                "Right Hand Fingering...",
+                "String Number",
+                "Shift Down  (Alt+Down)",
+                "Shift Up  (Alt+Up)",
+                "Pickstroke Down  (Shift+D)",
+                "Pickstroke Up  (Shift+U)",
+                "Chord...  (A)",
+                "Scale Diagram...  (Shift+S)",
+                "Text...  (T)",
+                "Timer  (@)",
+                "Slash",
+                "Barre...  (Shift+I)",
+                "Octave Sign",
+                "Design",
+                "Audio Note Settings...  (Shift+F)",
+            ] {
+                planned_menu_item(ui, label);
+            }
+            if !has_selection {
+                ui.label(egui::RichText::new("Select a note to edit it.").small());
+            }
+        });
+        if note_effects_changed {
+            self.apply_effects_to_selected();
+        }
+        ui.menu_button("Effects", |ui| {
+            let mut effects_changed = false;
+            ui.add_enabled_ui(has_selection, |ui| {
+                planned_menu_item(ui, "Grace Note");
+                planned_menu_item(ui, "Trill...  (N)");
+                planned_menu_item(ui, "Ornament");
+                planned_menu_item(ui, "Tremolo");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.let_ring, "Let Ring  (I)")
+                    .changed();
+                planned_menu_item(ui, "Sustain Pedal");
+                planned_menu_item(ui, "Legato  (Shift+H)");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.hammer, "Hammer On / Pull Off  (H)")
+                    .changed();
+                planned_menu_item(ui, "Left Hand Tapping  (()");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.tapping, "Tapping  ())")
+                    .changed();
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.slapping, "Slap  (S)")
+                    .changed();
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.popping, "Pop  (Ctrl+S)")
+                    .changed();
+                planned_menu_item(ui, "Dead Slapped");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.dead, "Dead Note  (X)")
+                    .changed();
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.palm_mute, "Palm Mute on Note  (P)")
+                    .changed();
+                planned_menu_item(ui, "Palm Mute on Beat  (Shift+P)");
+                planned_menu_item(ui, "Pick Scrape Out Downwards");
+                planned_menu_item(ui, "Pick Scrape Out Upwards");
+                planned_menu_item(ui, "Bend...  (B)");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.slide, "Slide")
+                    .changed();
+                planned_menu_item(ui, "Tremolo Bar...  (Shift+W)");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.vibrato, "Vibrato")
+                    .changed();
+                planned_menu_item(ui, "Vibrato w/ Trem. Bar");
+                planned_menu_item(ui, "Natural Harmonic  (Y)");
+                planned_menu_item(ui, "Artificial Harmonic...  (Ctrl+Alt+Y)");
+                planned_menu_item(ui, "Brush Downstroke...  (Ctrl+D)");
+                planned_menu_item(ui, "Brush Upstroke...  (Ctrl+U)");
+                planned_menu_item(ui, "Arpeggio Down...  (Ctrl+Shift+D)");
+                planned_menu_item(ui, "Arpeggio Up...  (Ctrl+Shift+U)");
+                planned_menu_item(ui, "Rasgueado...  (Shift+R)");
+                planned_menu_item(ui, "Golpe Finger");
+                planned_menu_item(ui, "Golpe Thumb");
+                effects_changed |= ui
+                    .checkbox(&mut self.active_effects.fade_in, "Fade In  (<)")
+                    .changed();
+                planned_menu_item(ui, "Fade Out  (>)");
+                planned_menu_item(ui, "Volume Swell  (Alt+<)");
+                planned_menu_item(ui, "Wah Open  (Ctrl+Alt+O)");
+                planned_menu_item(ui, "Wah Close  (Ctrl+Alt+C)");
+            });
+            if effects_changed {
+                self.apply_effects_to_selected();
+            }
+        });
     }
 
     fn paint_selected_track_page(&self, painter: &egui::Painter, page: Rect) -> Rect {
@@ -998,8 +1502,7 @@ impl BetterWriterApp {
         let system_height = 168.0;
         let first_top = page.top() + 56.0;
         let systems = ((horizon_tick(&self.project) as f32 / system_ticks as f32).ceil() as usize)
-            .max(1)
-            .min(8);
+            .clamp(1, 8);
 
         painter.text(
             Pos2::new(page.left() + 16.0, page.top() + 12.0),
@@ -1057,7 +1560,12 @@ impl BetterWriterApp {
                     FontId::monospace(14.0),
                     egui::Color32::BLACK,
                 );
-                bar_tick += sig.measure_ticks().max(TICKS_PER_QUARTER / 4);
+                // `measure_bounds_at` knows about signature-change segment
+                // boundaries, including a change made part-way through the
+                // preceding bar. Advancing by raw signature length would skip
+                // that boundary and render an incorrect bar grid.
+                let (_, next_bar_tick) = track.measure_bounds_at(bar_tick);
+                bar_tick = next_bar_tick.max(bar_tick + 1);
             }
 
             self.paint_cursor_cell(painter, left, tab_y, system_origin_tick, system_ticks);
@@ -1373,6 +1881,12 @@ fn default_save_name(project: &BwxProject) -> String {
 fn small_tool_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {
     ui.add_sized([42.0, 22.0], egui::Button::new(label))
         .on_hover_text(tooltip)
+}
+
+/// Render a roadmap item exactly where its eventual command belongs, while
+/// keeping it visibly unavailable until the underlying score operation exists.
+fn planned_menu_item(ui: &mut egui::Ui, label: &str) {
+    ui.add_enabled(false, egui::Button::new(label));
 }
 
 fn palette_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
