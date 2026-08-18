@@ -72,7 +72,7 @@ impl ShadowTimeline {
         let mut compiled_track = Self::compile_from_project(&BwxProject {
             schema_version: project.schema_version,
             title: project.title.clone(),
-            tempo_bpm: project.tempo_bpm,
+            tempo_points: project.tempo_points.clone(),
             tracks: project
                 .tracks
                 .iter()

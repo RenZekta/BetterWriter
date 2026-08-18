@@ -46,6 +46,9 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<BwxProject, FormatError> {
     let bytes = std::fs::read(path)?;
     match extension(path).as_deref() {
         Some("bwx") => decode_bwx(&bytes),
+        // `.tg` normalizes its own `bar_count` internally (see
+        // `tuxguitar::read_tg`) since it's deriving project state from a
+        // foreign format, not round-tripping our own.
         Some("tg") => tuxguitar::read_tg(&bytes),
         Some(other) => Err(FormatError::UnsupportedFormat(format!(
             ".{other} loading is not implemented yet"

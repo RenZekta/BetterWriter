@@ -241,20 +241,28 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             fret_count: 24,
             time_signature_changes: signature_changes(&headers),
             notes,
+            bar_count: (headers.len() as u32).max(1),
+            instrument_family: crate::core::project::InstrumentFamily::Stringed,
+            stringed_variant: crate::core::project::StringedVariant::AcousticGuitar,
         });
     }
 
-    Ok(BwxProject {
+    let mut project = BwxProject {
         schema_version: 1,
         title: if title.is_empty() {
             "Imported TuxGuitar score".to_owned()
         } else {
             title
         },
-        tempo_bpm: headers.first().map(|h| h.tempo as f32).unwrap_or(120.0),
+        tempo_points: tempo_points(&headers),
         tracks,
         next_note_id,
-    })
+    };
+    // TuxGuitar's measure headers are shared across all tracks, so bar_count
+    // should already cover every note; this is just a safety net against a
+    // malformed import leaving notes past the last declared bar.
+    project.normalize_bar_counts();
+    Ok(project)
 }
 
 pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
@@ -353,18 +361,50 @@ fn signature_changes(headers: &[MeasureHeader]) -> Vec<TimeSignatureChange> {
     changes
 }
 
+/// Mirrors `signature_changes`: TuxGuitar's measure headers carry a tempo
+/// per measure, so a tempo automation point is emitted wherever that value
+/// changes from the previous measure.
+fn tempo_points(headers: &[MeasureHeader]) -> Vec<crate::core::TempoPoint> {
+    let mut points = Vec::new();
+    let mut last = None;
+    for header in headers {
+        if last != Some(header.tempo) {
+            points.push(crate::core::TempoPoint::new(
+                (header.start - TG_START_OFFSET).max(0),
+                header.tempo as f32,
+            ));
+            last = Some(header.tempo);
+        }
+    }
+    if points.is_empty() {
+        points.push(crate::core::TempoPoint::new(0, 120.0));
+    }
+    points
+}
+
 fn build_headers(project: &BwxProject) -> Vec<MeasureHeader> {
     let base_track = project.tracks.first();
     let mut cursor = TG_START_OFFSET;
+    // Bars are now explicit per-track state; export as many measures as the
+    // widest track actually has, falling back to note content for safety
+    // (e.g. a note placed past the declared bar count).
     let horizon = project
         .tracks
         .iter()
-        .flat_map(|track| track.notes.iter().map(|note| note.end_tick()))
+        .map(|track| {
+            let bars_end = track.bars_end_tick();
+            let notes_end = track
+                .notes
+                .iter()
+                .map(|note| note.end_tick())
+                .max()
+                .unwrap_or(0);
+            bars_end.max(notes_end)
+        })
         .max()
-        .unwrap_or(TICKS_PER_QUARTER * 4)
-        + TICKS_PER_QUARTER * 4;
+        .unwrap_or(TICKS_PER_QUARTER * 4);
     let mut headers = Vec::new();
-    while cursor - TG_START_OFFSET <= horizon.max(TICKS_PER_QUARTER * 4) {
+    while cursor - TG_START_OFFSET < horizon.max(TICKS_PER_QUARTER * 4) {
         let local_tick = cursor - TG_START_OFFSET;
         let signature = base_track
             .map(|track| track.signature_at(local_tick))
@@ -372,9 +412,19 @@ fn build_headers(project: &BwxProject) -> Vec<MeasureHeader> {
         headers.push(MeasureHeader {
             start: cursor,
             signature,
-            tempo: project.tempo_bpm.round().clamp(1.0, i16::MAX as f32) as u16,
+            tempo: project
+                .tempo_at(local_tick)
+                .round()
+                .clamp(1.0, i16::MAX as f32) as u16,
         });
         cursor += signature.measure_ticks().max(TICKS_PER_QUARTER / 4);
+    }
+    if headers.is_empty() {
+        headers.push(MeasureHeader {
+            start: TG_START_OFFSET,
+            signature: TimeSignature::new(4, 4),
+            tempo: project.tempo_at(0).round().clamp(1.0, i16::MAX as f32) as u16,
+        });
     }
     headers
 }

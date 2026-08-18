@@ -17,13 +17,72 @@ use ringbuf::{
 use thiserror::Error;
 use vst3::Steinberg::{IPluginFactory, Vst::IAudioProcessor};
 
-use crate::core::{BwxProject, MidiEventKind, MidiPlaybackEvent, Tick};
+use crate::core::{
+    BwxProject, MidiEventKind, MidiPlaybackEvent, TICKS_PER_QUARTER, TempoTransition, Tick,
+};
+
+/// One constant-rate playback segment derived from the project's tempo
+/// automation. `Progressive` points use the average of their start/end bpm
+/// as the segment's rate — a good approximation for audio scheduling; the
+/// automation graph (in the UI) still shows the exact linear ramp. See
+/// `build_tempo_segments`.
+#[derive(Clone, Copy)]
+struct TempoSegment {
+    start_tick: Tick,
+    start_seconds: f64,
+    seconds_per_tick: f64,
+}
+
+fn seconds_per_tick_for(bpm: f64) -> f64 {
+    60.0 / (bpm.max(1.0) * TICKS_PER_QUARTER as f64)
+}
+
+/// Converts the project's tempo automation timeline into a sequence of
+/// constant-rate segments anchored to real elapsed seconds, so playback can
+/// convert "seconds since play started" into a musical tick position without
+/// assuming a single flat tempo for the whole piece.
+fn build_tempo_segments(project: &BwxProject) -> Vec<TempoSegment> {
+    let mut points: Vec<_> = project.tempo_points.iter().collect();
+    points.sort_by_key(|point| point.at_tick);
+    if points.is_empty() {
+        return vec![TempoSegment {
+            start_tick: 0,
+            start_seconds: 0.0,
+            seconds_per_tick: seconds_per_tick_for(120.0),
+        }];
+    }
+
+    let mut segments = Vec::with_capacity(points.len());
+    let mut elapsed_seconds = 0.0_f64;
+    for (index, point) in points.iter().enumerate() {
+        let next = points.get(index + 1);
+        let rate_bpm = if point.transition == TempoTransition::Progressive {
+            match next {
+                Some(next) => (point.bpm as f64 + next.bpm as f64) / 2.0,
+                None => point.bpm as f64,
+            }
+        } else {
+            point.bpm as f64
+        };
+        let seconds_per_tick = seconds_per_tick_for(rate_bpm);
+        segments.push(TempoSegment {
+            start_tick: point.at_tick,
+            start_seconds: elapsed_seconds,
+            seconds_per_tick,
+        });
+        if let Some(next) = next {
+            let tick_span = (next.at_tick - point.at_tick).max(0) as f64;
+            elapsed_seconds += tick_span * seconds_per_tick;
+        }
+    }
+    segments
+}
 
 #[derive(Clone)]
-pub enum AudioCommand {
+enum AudioCommand {
     Play {
         events: Arc<Vec<MidiPlaybackEvent>>,
-        tempo_bpm: f32,
+        tempo_segments: Arc<Vec<TempoSegment>>,
         start_tick: Tick,
     },
     Stop,
@@ -206,7 +265,7 @@ impl AudioRuntime {
         self.producer
             .try_push(AudioCommand::Play {
                 events: Arc::new(events),
-                tempo_bpm: project.tempo_bpm,
+                tempo_segments: Arc::new(build_tempo_segments(project)),
                 start_tick: 0,
             })
             .map_err(|_| AudioError::CommandQueueFull)
@@ -290,7 +349,11 @@ struct CallbackState {
     events: Arc<Vec<MidiPlaybackEvent>>,
     next_event_index: usize,
     playing: bool,
-    tempo_bpm: f32,
+    tempo_segments: Arc<Vec<TempoSegment>>,
+    /// Monotonically advances forward through `tempo_segments` as playback
+    /// progresses, mirroring `next_event_index`'s incremental scan — cheap
+    /// per audio frame even with many automation points.
+    current_segment_index: usize,
     sample_rate: f32,
     samples_since_start: u64,
 }
@@ -329,7 +392,12 @@ impl CallbackState {
             events: Arc::new(Vec::new()),
             next_event_index: 0,
             playing: false,
-            tempo_bpm: 120.0,
+            tempo_segments: Arc::new(vec![TempoSegment {
+                start_tick: 0,
+                start_seconds: 0.0,
+                seconds_per_tick: seconds_per_tick_for(120.0),
+            }]),
+            current_segment_index: 0,
             sample_rate,
             samples_since_start: 0,
         })
@@ -340,11 +408,12 @@ impl CallbackState {
             match command {
                 AudioCommand::Play {
                     events,
-                    tempo_bpm,
+                    tempo_segments,
                     start_tick,
                 } => {
                     self.events = events;
-                    self.tempo_bpm = tempo_bpm.max(1.0);
+                    self.tempo_segments = tempo_segments;
+                    self.current_segment_index = 0;
                     self.next_event_index = self
                         .events
                         .iter()
@@ -396,10 +465,19 @@ impl CallbackState {
         self.synth.read_next()
     }
 
-    fn current_tick(&self) -> Tick {
-        let seconds = self.samples_since_start as f64 / self.sample_rate as f64;
-        let quarters = seconds * self.tempo_bpm as f64 / 60.0;
-        (quarters * crate::core::TICKS_PER_QUARTER as f64) as Tick
+    /// Converts elapsed playback time into a musical tick, walking forward
+    /// through the tempo automation's precomputed segments.
+    fn current_tick(&mut self) -> Tick {
+        let elapsed_seconds = self.samples_since_start as f64 / self.sample_rate as f64;
+        while self.current_segment_index + 1 < self.tempo_segments.len()
+            && self.tempo_segments[self.current_segment_index + 1].start_seconds
+                <= elapsed_seconds
+        {
+            self.current_segment_index += 1;
+        }
+        let segment = self.tempo_segments[self.current_segment_index];
+        let tick_offset = (elapsed_seconds - segment.start_seconds) / segment.seconds_per_tick;
+        segment.start_tick + tick_offset.max(0.0) as Tick
     }
 }
 
