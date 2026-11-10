@@ -23,7 +23,7 @@ use crate::core::{
 
 /// One constant-rate playback segment derived from the project's tempo
 /// automation. `Progressive` points use the average of their start/end bpm
-/// as the segment's rate — a good approximation for audio scheduling; the
+/// as the segment's rate - a good approximation for audio scheduling; the
 /// automation graph (in the UI) still shows the exact linear ramp. See
 /// `build_tempo_segments`.
 #[derive(Clone, Copy)]
@@ -351,7 +351,7 @@ struct CallbackState {
     playing: bool,
     tempo_segments: Arc<Vec<TempoSegment>>,
     /// Monotonically advances forward through `tempo_segments` as playback
-    /// progresses, mirroring `next_event_index`'s incremental scan — cheap
+    /// progresses, mirroring `next_event_index`'s incremental scan - cheap
     /// per audio frame even with many automation points.
     current_segment_index: usize,
     sample_rate: f32,

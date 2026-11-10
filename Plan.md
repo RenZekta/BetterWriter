@@ -525,6 +525,150 @@ Another round of testing feedback, seven items plus a build warning.
       dark regardless of app theme, like most DAW automation lanes) were
       left as-is — see below.
 
+## 10.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Classic notation view: toggleable
+- [x] The five-line classic notation staff above the tablature can be shown
+      or hidden from the toolbar's **Notation** button or View ▸ Classic
+      notation. Hiding it moves the tab staff up and centers the time
+      signature on the tab; the staff, clef and onset heads/stems are simply
+      not drawn.
+- [x] First version drew every note as a quarter note. Replaced on
+      11.11.2026 by real durations and pitches (see below).
+- [x] System layout (`SystemMetrics`) is computed from the toggle and the
+      track's string count instead of hard-coded constants, so painting,
+      click hit-testing, area selection and edge detection all agree on
+      where the tab staff is. A 6-string layout with the staff shown is
+      pixel-identical to before; 7+ strings no longer crowd the next system.
+
+### 2. One-button brick view ↔ tab view (Guitar Pro style)
+- [x] Toolbar **Tab** / **Bricks** button (and View ▸ Notes) switches
+      `EditorViewMode`. Tab view draws bare fret numbers on the strings with
+      a backing patch so the string doesn't strike through them; selection,
+      the edit cursor and effect labels (P.M.) work as in brick view.
+- [x] **Real tie support** in the model: `TabNote::tied_from_previous:
+      Option<TieOrigin>`, with `TieOrigin::BrickSplit` (a slice cut from a
+      brick) or `TieOrigin::User` (a tie the user wrote). A tie only counts
+      while a matching predecessor exists (same string, same fret, ending
+      exactly where the note starts) — `InstrumentTrack::is_tied_continuation`
+      — so deleting or retuning one slice never leaves a phantom tie.
+- [x] **Switching to tab view** (`BwxProject::split_bricks_at_barlines`):
+      every brick crossing a barline is cut at each barline of its own
+      track (polymetric bars and time signature changes respected) into
+      `BrickSplit` tied notes; slices past the last bar extend `bar_count`.
+      Shown as `7 ⌒ (7)` with the tie arc, also on the classic staff.
+- [x] **Switching back** (`BwxProject::merge_brick_ties`): only
+      `BrickSplit` slices are re-joined into the original brick (the unit
+      test checks the note comes back byte-identical). `User` ties stay
+      separate notes that merely sound continuously; in brick view they get
+      a small arc over the seam.
+- [x] The switch is not an undo step of its own. Undo/redo, project load and
+      every edit in tab view re-normalize for the active mode (both
+      directions are idempotent), so history stays consistent across
+      switches and a note lengthened past a barline in tab view is split
+      immediately (`refresh_after_edit`).
+- [x] **Intelligent end-of-bar rests** (`tail_padding_rests`,
+      `split_rest_gap`): rests only fill from the last sounding note to the
+      barline; chunks are aligned to the bar grid (a gap starting on beat 2
+      of 4/4 is a quarter then a half, not a half straddling the middle); a
+      note sustaining in from an earlier bar counts as sounding; an empty
+      bar is one bar-length rest in any time signature. Tab view draws
+      whole/half/quarter/eighth-and-shorter rest glyphs.
+- [x] Rests are generated for **every bar** in both views — before this pass
+      only the first bar of each row got any.
+- [x] **Tie Note (`L`)** (RMB ▸ Note ▸ Tie Note, or `L`): ties the selected
+      note(s) to the one right before them, or removes an existing tie.
+      Changing a fret (typing over it, `Alt+Shift+Up/Down`) changes the whole
+      tie chain, so ties never break by accident (`set_note_fret`).
+- [x] Playback treats a tie chain as one sustained note: a continuation emits
+      no NoteOn and its predecessor no NoteOff (`ShadowTimeline`), so a
+      brick and its tab-view split chain compile to identical events.
+- [x] `.tg` import reads the tied flag as a `User` tie and export writes it.
+- [x] Moving and stretching notes are disabled in tab view (fret numbers
+      have no edges, and dragging a slice would break its chain); selecting,
+      typing, deleting and tying work.
+- [x] Comment cleanup per the `finding-and-fixing-bad-comments` conventions:
+      removed history narration from seven comments in `app.rs`,
+      `core/edit.rs`, `core/project.rs` and `format/tuxguitar.rs`, and
+      updated `insert_note`'s doc, which still called a bar-spanning note
+      "a stand-in for a tied note until real tie support exists".
+- [x] Verified: 44 unit tests pass (new: bar splitting incl. polymetric and
+      past-last-bar, brick round-trip, `User` ties kept, rest alignment and
+      per-bar padding, tie-aware playback, chain-wide fret change). The UI
+      was also driven under Xvfb: tab/brick switch, tie across a barline,
+      rests and the Notation toggle render as described above.
+
+## 11.11.2026 ✅ Implemented / Fixed this pass (TuxGuitar-informed)
+
+Reference: TuxGuitar's `TGMeasureManager` (rests are real beats that fill
+every gap; adding a note replaces a rest and the remainder is re-filled with
+the "preferred" duration; a note that doesn't fit the bar is rejected),
+`TGBeatGroup`/`TGNoteImpl` (stem direction and beams, ledger lines, per-bar
+accidentals) and `TGMusicKeyUtils` (staff position from the sounding pitch).
+
+### 1. Classic notation: real pitch and real durations (`src/notation.rs`)
+- [x] **Pitch placement**: staff position now comes from the sounding MIDI
+      key (string tuning + fret), written an octave higher as guitars are
+      (open high E in the top space, first fret on the top line), with a
+      small "8" under the clef. Basses use a bass clef.
+- [x] **Accidentals**: black keys are spelled as sharps and remembered for
+      the rest of the bar (a repeated F# gets one sharp; F after F# gets a
+      natural).
+- [x] **Durations**: whole/half (hollow heads), quarter and shorter (filled),
+      dots, stems pointing away from the middle line, flags, and beams
+      grouped per beat (three eighths in 6/8, 9/8, 12/8, 15/8). Chords
+      share one stem; heads a second apart sit on opposite sides.
+- [x] Ledger lines above and below the staff, rests on the staff (whole,
+      half, quarter, eighth and shorter), ties as arcs on the staff.
+- [x] More vertical room per system for ledger lines and stems; tempo labels
+      moved clear of them; the opening time signature in brick view now sits
+      in front of the staff instead of on top of the first note.
+
+### 2. Tab view works like TuxGuitar instead of like bricks
+- [x] **Beat-based layout**: columns are spaced by beat length
+      (sub-linearly), not by a fixed pixels-per-tick, and every full row is
+      stretched to the page width. Bars with a time signature label get
+      extra room. `StaffSystem::x_of` / `tick_at` map ticks to x for
+      painting, hit-testing, clicking and the cursor in both views.
+- [x] **Beat cursor**: `←`/`→` jump from beat to beat (notes and rest
+      slots) instead of stepping by a duration; clicking snaps to the
+      nearest beat; the cursor is a compact box on the fret position, not
+      a duration-wide brick.
+- [x] **Note entry rules** (`commit_fret_at_cursor`): a note in an empty slot
+      takes the duration being entered; a note joining a beat that already
+      has notes takes that beat's length (chords stay aligned); a note that
+      would run past the barline or into the next beat is shortened to the
+      longest standard length that fits, and the status line says so (tie
+      with `L` to sustain across). After writing, the cursor moves to the
+      next beat.
+- [x] **Rests fill every gap** in tab view and on the staff
+      (`BwxProject::bar_rests`, `RestFill::AllGaps`): a gap is cut into rests
+      of the duration being entered where they fit the bar grid, then
+      aligned standard values; an empty bar is one bar-length rest. Brick
+      view keeps end-of-bar rests (`RestFill::BarEnd`).
+- [x] Tests: 67 unit tests pass (new: pitch spelling, clefs, note values,
+      beams, stems, accidentals, rest filling policies, `StaffSystem`
+      mapping, system metrics). Driven under Xvfb: staff pitches and ledger
+      lines, beams, ties across barlines, entry shortening, justified
+      multi-row layout, the 5/8 track and brick view.
+- [x] Comment pass: all new comments describe current behavior; no history
+      narration added.
+
+### 3. Writing conventions cleanup
+- [x] Comments and UI strings are ASCII-only: em dashes and `→` replaced. The
+      `♩` in "♩=bpm" labels is notation, not punctuation, and stays; AGENTS.md
+      now records that exception.
+- [x] The tie notes in `core/edit.rs` and the bundle note in `format.rs`
+      describe the shipped tie model and the flattened text bundle, instead of
+      a stand-in awaiting real ties.
+- [x] `InstrumentFamily::is_implemented` and `StringedVariant` docs no longer
+      cite the plan or future VST3 patch loading; the `Bright` theme doc drops
+      its pre-theme-switching history.
+- [x] Past-tense bug narration in `app.rs` (automation window height,
+      `top_down` wrapping, nested submenu close behavior, recent-project
+      search ranking) rewritten as present-tense egui constraints.
+- [x] README: personal background paragraph removed.
+
 ---
 
 ## 🚧 Not yet done / future work
@@ -565,17 +709,9 @@ Another round of testing feedback, seven items plus a build warning.
 - [ ] Volume/Pan automation is UI-only scaffolding (disabled options in the
       Automation Editor's TYPE dropdown) — no per-track automation data
       model exists yet.
-- [ ] **Future idea (from 16.08.2026 discussion): a block-mode ↔ classic-tab
-      view toggle.** Classic mode would render/edit like Guitar Pro/TuxGuitar
-      (individual tied notes across barlines); block mode (this app's
-      current look) would show a run of tied notes as one single joined
-      block. Switching to block mode would merge tied-note runs into one
-      block each; switching back to classic mode would split a block back
-      into the minimal number of tied notes needed to represent it. Real
-      tie support is a prerequisite (right now, a note simply spanning past
-      a bar boundary is this app's stand-in for a tie — see
-      `BwxProject::insert_note`'s doc comment and the 16.08.2026 section
-      above).
+- [ ] `.tg` export writes a brick that spans a barline as one over-long
+      beat; exporting from tab view (where it is already split into tied
+      notes) is the faithful path. Unverified against TuxGuitar itself.
 
 ### Core notation engine (Phase 2)
 - [x] Right mouse click (RMB) in an area to open context menu with options:
@@ -621,7 +757,7 @@ Another round of testing feedback, seven items plus a build warning.
     - [x] Staccato (`!`)
     - [ ] Staccatissimo
     - [ ] Tenuto
-    - [ ] Tie Note (`L`)
+    - [x] Tie Note (`L`)
     - [ ] Tie Beat (`Shift+L`)
     - [ ] Rest (`R`)
     - [ ] Fermata... (`F`)
@@ -730,8 +866,21 @@ Another round of testing feedback, seven items plus a build warning.
 - [ ] Note effect glyphs rendered on the staff (palm-mute text exists; others
       are modeled but not drawn).
 - [ ] Drag-to-move notes; drag-select range.
-- [ ] Classic notation view above tablature should be toggleable on/off. Also classic notation mode shows all note lengths as a 1/4th note.
-- [ ] One-button mode switching from brick painting to UI similar to Guitar Pro, TuxGuitar, etc. with fret numbers instead of bricks and intelligent rests filling at the end of bars. Upon switching, bricks that lay between bars should be calculated as tied notes, with its length naturally spread across bars as tied notes. when switching back to brick mode they such tied notes should be combined into full bricks again. (only ones that were created as bricks. Custom user's tied notes should be considered separate notes but connected with sound.
+- [ ] Notation limits: one voice per chord (the shortest note's value is
+      used), no tuplets, grace notes, key signatures (every black key is a
+      sharp) or clef changes; 5/8 and 7/8 beam by single eighths instead of
+      3+2 groups.
+- [ ] Tab view has no stems/beams under the staff for use with the classic
+      staff hidden; with it hidden, rhythm is only readable from spacing and
+      rests.
+- [ ] Tab-view rests are derived, not stored: they re-chunk when the duration
+      selection changes (e.g. three quarter rests become six eighth rests),
+      unlike TuxGuitar where each rest beat keeps its own length.
+- [ ] Tab view has no overlapping notes (a second voice): a note is always
+      cut at the next beat that has notes.
+- [ ] A single bar wider than the page isn't scrolled or clipped in tab view.
+- [ ] Moving and stretching notes in tab view (disabled for now, see
+      10.11.2026).
 
 
 Info for left menu:

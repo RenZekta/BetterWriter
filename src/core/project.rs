@@ -63,6 +63,19 @@ impl TempoPoint {
     }
 }
 
+/// Where a tie between two notes came from. The distinction decides what
+/// happens when the editor switches from tab view back to brick view:
+/// `BrickSplit` ties are re-joined into one brick, `User` ties are kept as
+/// separate notes that merely sound continuously.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TieOrigin {
+    /// The note is one slice of a brick that was cut at a barline.
+    BrickSplit,
+    /// The note was tied to its predecessor explicitly (Tie Note command or
+    /// a tie imported from another format).
+    User,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TabNote {
     pub id: u64,
@@ -73,6 +86,13 @@ pub struct TabNote {
     pub velocity: u8,
     #[serde(default)]
     pub effects: NoteEffects,
+    /// `Some` marks this note as a continuation of the note on the same
+    /// string that ends exactly where this one starts: it sounds as one
+    /// sustained pitch with no new attack. Use
+    /// `InstrumentTrack::is_tied_continuation` rather than reading this
+    /// directly, since the flag alone doesn't prove a predecessor exists.
+    #[serde(default)]
+    pub tied_from_previous: Option<TieOrigin>,
 }
 
 impl TabNote {
@@ -176,17 +196,15 @@ impl InstrumentFamily {
         }
     }
 
-    /// Whether this family is actually playable/editable yet. Non-implemented
-    /// families are still selectable in the picker (per the plan) but fall
-    /// back to a Stringed track under the hood until they land.
+    /// Whether this family has its own editor and playback path. The others
+    /// stay selectable in the picker and build a Stringed track underneath.
     pub fn is_implemented(self) -> bool {
         matches!(self, InstrumentFamily::Stringed)
     }
 }
 
-/// Sub-type of a `Stringed` track. Only affects the default tuning/program
-/// today; each variant is meant to carry its own default playback sound once
-/// VST3 instruments land (see Plan.md).
+/// Sub-type of a `Stringed` track: the defaults a new track starts with, and
+/// the clef its notes are written in.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StringedVariant {
     AcousticGuitar,
@@ -219,7 +237,7 @@ impl StringedVariant {
         }
     }
 
-    /// General MIDI program used until VST3 patch loading replaces it.
+    /// General MIDI program that selects this variant's default sound.
     pub fn default_program(self) -> u8 {
         match self {
             StringedVariant::AcousticGuitar => 24,
@@ -290,10 +308,9 @@ pub struct InstrumentTrack {
     pub fret_count: u8,
     pub time_signature_changes: Vec<TimeSignatureChange>,
     pub notes: Vec<TabNote>,
-    /// Explicit number of bars this track has. Bars beyond content used to be
-    /// implied purely by an ever-expanding render horizon; they're now a real
-    /// part of the project so save/load round-trips a project's actual shape
-    /// and so Insert/Add/Delete Bar have something concrete to operate on.
+    /// Explicit number of bars in this track, independent of where the last
+    /// note ends. Saved with the project so empty trailing bars survive a
+    /// round trip, and so Insert/Add/Delete Bar have something to operate on.
     pub bar_count: u32,
     pub instrument_family: InstrumentFamily,
     pub stringed_variant: StringedVariant,
@@ -402,6 +419,25 @@ impl InstrumentTrack {
         (start, end)
     }
 
+    /// The note this one is tied to: same string, ends exactly where `note`
+    /// starts, same fret. `None` if `note` isn't flagged as tied or no such
+    /// predecessor exists (e.g. it was deleted).
+    pub fn tie_predecessor(&self, note: &TabNote) -> Option<&TabNote> {
+        note.tied_from_previous?;
+        self.notes.iter().find(|other| {
+            other.id != note.id
+                && other.string_index == note.string_index
+                && other.fret == note.fret
+                && other.end_tick() == note.abs_tick
+        })
+    }
+
+    /// Whether `note` is a real tie continuation: flagged as tied *and*
+    /// still backed by a matching predecessor.
+    pub fn is_tied_continuation(&self, note: &TabNote) -> bool {
+        self.tie_predecessor(note).is_some()
+    }
+
     pub fn midi_key_for(&self, note: &TabNote) -> u8 {
         self.tuning
             .get(note.string_index)
@@ -425,7 +461,7 @@ impl InstrumentTrack {
 
     /// End tick of the track's explicit bar count, walking `bar_count` bars
     /// forward from tick 0 through the (possibly polymetric) signature
-    /// timeline. This is the real, save/load-stable extent of the track —
+    /// timeline. This is the real, save/load-stable extent of the track -
     /// distinct from wherever the notes happen to currently reach.
     pub fn bars_end_tick(&self) -> Tick {
         let mut cursor = 0;
@@ -457,10 +493,9 @@ impl InstrumentTrack {
 pub struct BwxProject {
     pub schema_version: u16,
     pub title: String,
-    /// Tempo automation timeline, replacing what used to be a single global
-    /// `tempo_bpm`. Always has at least one point; the point at or before
-    /// tick 0 governs playback until the next point takes over. See
-    /// `tempo_at` / `interpolated_tempo_at`.
+    /// Tempo automation timeline. Always has at least one point; the point
+    /// at or before tick 0 governs playback until the next point takes over.
+    /// See `tempo_at` / `interpolated_tempo_at`.
     pub tempo_points: Vec<TempoPoint>,
     pub tracks: Vec<InstrumentTrack>,
     pub next_note_id: u64,
@@ -478,6 +513,7 @@ impl BwxProject {
                 fret: 0,
                 velocity: 110,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
             TabNote {
                 id: 2,
@@ -487,6 +523,7 @@ impl BwxProject {
                 fret: 2,
                 velocity: 108,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
             TabNote {
                 id: 3,
@@ -496,6 +533,7 @@ impl BwxProject {
                 fret: 2,
                 velocity: 108,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
             TabNote {
                 id: 4,
@@ -505,6 +543,7 @@ impl BwxProject {
                 fret: 1,
                 velocity: 108,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
         ];
 
@@ -522,6 +561,7 @@ impl BwxProject {
                 fret: 7,
                 velocity: 94,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
             TabNote {
                 id: 6,
@@ -531,6 +571,7 @@ impl BwxProject {
                 fret: 5,
                 velocity: 94,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
             TabNote {
                 id: 7,
@@ -540,6 +581,7 @@ impl BwxProject {
                 fret: 4,
                 velocity: 94,
                 effects: NoteEffects::default(),
+                tied_from_previous: None,
             },
         ];
 
@@ -618,7 +660,7 @@ impl BwxProject {
     }
 
     /// Like `tempo_at`, but linearly ramps through a `Progressive` point
-    /// toward the next one instead of holding flat — this is what the
+    /// toward the next one instead of holding flat - this is what the
     /// automation graph and the on-staff "♩=bpm" labels use so they read as
     /// a smooth ramp, matching the Guitar Pro automation editor.
     pub fn interpolated_tempo_at(&self, tick: Tick) -> f32 {

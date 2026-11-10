@@ -5,12 +5,10 @@ Key features that others don't care to implement:
 1. Native polyrhythms support with unrestricted time signatures. All notes saved on a buffer for replay without bars. Visible bars in playback timeline are visibly scaled in width from a square based on a smallest time signature size.
 2. Automatic rests ONLY at the end of bars. (instead of whenever a note gets shorter in MuseScore and TuxGuitar)
 3. VST3 (and instruments) support. (Similar to MuseScore)
-4. Custom color palletes, with access to color of each element.
+4. Custom color palettes, with access to color of each element.
 5. Modern look.
 
-RenZekta's note: I don't have a programming degree and I am not a professional programmer. This is only my hobby. I am a musician. I vibecoded it in Codex after days of unsuccessful attempts of building MuseScore and TuxGuitar in attempt to simply make a fork of them with personal desired modifications. Sadly, even with sterile code without any modifications, I wasn't able to do it because of old messy structure and issues with dependencies and their visibility. That's when I looked at Rust with its robust libraries/crates handling.
-
-I plan to use MuseScore's `MS Basic.sf3` for sound generation.
+Sound generation uses MuseScore's `MS Basic.sf3` soundfont (see `assets/soundfonts/`).
 
 ## How to run
 You should have Rust installed

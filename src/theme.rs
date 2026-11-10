@@ -22,10 +22,9 @@ pub struct EditorTheme {
 }
 
 impl EditorTheme {
-    /// The original "sheet music on dark chrome" look — light/cream paper
-    /// surrounded by dark toolbars and panels, similar to Guitar
-    /// Pro/TuxGuitar. Used for `AppThemeMode::Bright`; also this app's
-    /// original, and only, appearance before theme switching existed.
+    /// The "sheet music on dark chrome" look - light/cream paper surrounded
+    /// by dark toolbars and panels, similar to Guitar Pro/TuxGuitar. Used
+    /// for `AppThemeMode::Bright`.
     pub fn bright() -> Self {
         Self {
             sheet_background: Color32::from_rgb(244, 243, 238),
@@ -47,7 +46,7 @@ impl EditorTheme {
         }
     }
 
-    /// A fully dark variant — the sheet itself is dark too, not just the
+    /// A fully dark variant - the sheet itself is dark too, not just the
     /// surrounding chrome. Used for `AppThemeMode::Dark`, and as the
     /// fallback when `AppThemeMode::System` can't determine the OS
     /// preference.

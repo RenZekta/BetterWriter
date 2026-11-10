@@ -99,8 +99,8 @@ pub fn write_multitrack_bundle(
         let file_name = format!("{}{}", sanitize_file_name(&track.name), format.label());
         archive.start_file(file_name, options)?;
 
-        // This placeholder keeps the archive contract wired while native .tg/.gp
-        // writers are implemented behind the compatibility validator.
+        // A flattened text listing per track, not a native .tg/.gp file; the
+        // compatibility validator decides which projects reach this path.
         let mut text = String::new();
         text.push_str("# BetterWriter compatibility export\n");
         text.push_str(&format!("# Track: {}\n", track.name));

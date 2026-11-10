@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod core;
 mod format;
+mod notation;
 mod theme;
 
 use app::BetterWriterApp;

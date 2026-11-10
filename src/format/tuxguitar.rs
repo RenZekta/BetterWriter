@@ -2,7 +2,7 @@ use std::io::{Cursor, Read};
 
 use crate::core::{
     BwxProject, NoteEffects, TICKS_PER_QUARTER, Tick,
-    project::{InstrumentTrack, TabNote, TimeSignature, TimeSignatureChange},
+    project::{InstrumentTrack, TabNote, TieOrigin, TimeSignature, TimeSignatureChange},
 };
 
 use super::FormatError;
@@ -385,9 +385,8 @@ fn tempo_points(headers: &[MeasureHeader]) -> Vec<crate::core::TempoPoint> {
 fn build_headers(project: &BwxProject) -> Vec<MeasureHeader> {
     let base_track = project.tracks.first();
     let mut cursor = TG_START_OFFSET;
-    // Bars are now explicit per-track state; export as many measures as the
-    // widest track actually has, falling back to note content for safety
-    // (e.g. a note placed past the declared bar count).
+    // Exports as many measures as the widest track declares, extended to
+    // cover note content in case a note sits past the declared bar count.
     let horizon = project
         .tracks
         .iter()
@@ -469,7 +468,7 @@ impl<'a> TgReader<'a> {
                         note_header = self.read_u8()?;
                         let fret = self.read_u8()?;
                         let string_number = self.read_u8()?.saturating_sub(1) as usize;
-                        let _tied = note_header & NOTE_TIED != 0;
+                        let tied = note_header & NOTE_TIED != 0;
                         if note_header & NOTE_VELOCITY != 0 {
                             voice.velocity = self.read_u8()?;
                         }
@@ -486,6 +485,7 @@ impl<'a> TgReader<'a> {
                             fret,
                             velocity: voice.velocity,
                             effects,
+                            tied_from_previous: tied.then_some(TieOrigin::User),
                         });
                         *next_note_id += 1;
                     }
@@ -750,6 +750,9 @@ impl TgWriter {
                     }
                     if has_effects(&note.effects) {
                         note_flags |= NOTE_EFFECT;
+                    }
+                    if note.tied_from_previous.is_some() {
+                        note_flags |= NOTE_TIED;
                     }
                     self.write_u8(note_flags);
                     self.write_u8(note.fret);

@@ -13,18 +13,17 @@ pub enum StretchEdge {
 
 impl BwxProject {
     /// Inserts a note, shrinking its duration as needed to avoid overlapping
-    /// another note already sounding on the *same string* — an overlapping
+    /// another note already sounding on the *same string* - an overlapping
     /// *earlier* note on that string gets cut short right here, and this new
     /// note itself gets cut short if a *later* one on that string already
     /// starts before it would end. Notes on different strings (chords) are
     /// unaffected.
     ///
-    /// A note's duration is *not* clamped to the bar it starts in: a note
-    /// can legitimately span past a bar boundary (this doubles as this
-    /// app's stand-in for a tied note, until real tie support exists — see
-    /// Plan.md). Rendering splits such a note visually at the boundary
-    /// instead of letting it float or overlap incorrectly; see
-    /// `BetterWriterApp::paint_note_fragment`.
+    /// A note's duration is *not* clamped to the bar it starts in: in brick
+    /// view a note can span any number of barlines and is drawn as one
+    /// brick, split visually at each boundary (see
+    /// `BetterWriterApp::paint_note_fragment`). Tab view stores the same
+    /// sound as tied notes instead (see `split_bricks_at_barlines`).
     pub fn insert_note(
         &mut self,
         track_id: u64,
@@ -67,6 +66,7 @@ impl BwxProject {
             fret: bounded_fret,
             velocity: 108,
             effects: NoteEffects::default(),
+            tied_from_previous: None,
         });
         track.sort_notes();
         Some(id)
@@ -231,9 +231,9 @@ impl BwxProject {
     /// retreats from that side instead.
     ///
     /// Like `insert_note`, the result is clamped so it can't overlap another
-    /// note on the same string — but (also like `insert_note`, and unlike
-    /// `set_note_duration_fluid`) it's free to cross a bar boundary; that's
-    /// this app's stand-in for a tied note until real ties exist.
+    /// note on the same string - but (also like `insert_note`, and unlike
+    /// `set_note_duration_fluid`) it's free to cross a bar boundary: brick
+    /// view keeps that as one note, tab view cuts it into tied slices.
     pub fn stretch_note(
         &mut self,
         track_id: u64,
@@ -313,9 +313,9 @@ impl BwxProject {
 
     /// Moves a note earlier/later in time and/or to a different string,
     /// keeping its duration fixed. Clamped so it can't overlap another note
-    /// on the target string — except any note listed in `excluded_ids` (the
+    /// on the target string - except any note listed in `excluded_ids` (the
     /// rest of a multi-note drag moving together by the same amount, so
-    /// they don't clamp against each other mid-gesture) — and so the string
+    /// they don't clamp against each other mid-gesture) - and so the string
     /// stays in range. Free to cross a bar boundary, same as
     /// `insert_note`/`stretch_note`.
     pub fn move_note(
@@ -346,7 +346,7 @@ impl BwxProject {
         // If the tentative position overlaps a note already on the target
         // string, resolve it by pushing to whichever side (right before
         // that note, or right after it) is closer to the tentative
-        // position — rather than separately bounding by "the nearest note
+        // position - rather than separately bounding by "the nearest note
         // before" and "the nearest note after", which can agree on the same
         // point and leave the note sitting right on top of the obstacle
         // when the tentative position lands inside it.
@@ -360,7 +360,7 @@ impl BwxProject {
         let new_abs_tick = match obstacle {
             Some(obstacle) => {
                 // "Push before" only makes sense if there's actually room
-                // there — an obstacle sitting at (or near) tick 0 leaves
+                // there - an obstacle sitting at (or near) tick 0 leaves
                 // none, in which case the only valid resolution is after it.
                 let push_before_valid = obstacle.abs_tick >= original.duration_ticks;
                 let push_after = obstacle.abs_tick + obstacle.duration_ticks;
@@ -508,27 +508,103 @@ impl BwxProject {
         true
     }
 
+    /// Rests that fill the end of the bar containing `measure_tick`, from
+    /// where the last sounding note stops to the barline. Rests are never
+    /// generated mid-bar. A bar with nothing sounding in it gets a single
+    /// bar-length rest, whatever its time signature.
     pub fn tail_padding_rests(&self, track_id: u64, measure_tick: Tick) -> Vec<RestNode> {
+        self.bar_rests(track_id, measure_tick, RestFill::BarEnd)
+    }
+
+    /// Rests for the bar containing `measure_tick` under the given fill
+    /// policy. A bar with nothing sounding in it is always one bar-length
+    /// rest, whatever its time signature.
+    pub fn bar_rests(&self, track_id: u64, measure_tick: Tick, fill: RestFill) -> Vec<RestNode> {
         let Some(track) = self.track(track_id) else {
             return Vec::new();
         };
-        let (_, measure_end) = track.measure_bounds_at(measure_tick);
-        let last_end = track
+        let (measure_start, measure_end) = track.measure_bounds_at(measure_tick);
+
+        // Sounding spans clipped to the bar, merged. A note sustaining in
+        // from an earlier bar counts as sounding.
+        let mut spans: Vec<(Tick, Tick)> = track
             .notes
             .iter()
-            .filter(|note| {
-                let (start, end) = track.measure_bounds_at(note.abs_tick);
-                measure_tick >= start && measure_tick < end
+            .filter(|note| note.abs_tick < measure_end && note.end_tick() > measure_start)
+            .map(|note| {
+                (
+                    note.abs_tick.max(measure_start),
+                    note.end_tick().min(measure_end),
+                )
             })
-            .map(TabNote::end_tick)
-            .max()
-            .unwrap_or_else(|| track.measure_bounds_at(measure_tick).0);
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(Tick, Tick)> = Vec::new();
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
 
-        split_rest_gap(last_end.max(measure_tick), measure_end)
+        let Some(&(_, last_end)) = merged.last() else {
+            return vec![RestNode {
+                abs_tick: measure_start,
+                duration_ticks: measure_end - measure_start,
+            }];
+        };
+
+        let preferred = match fill {
+            RestFill::BarEnd => None,
+            RestFill::AllGaps { preferred } => Some(preferred),
+        };
+        let mut rests = Vec::new();
+        if preferred.is_some() {
+            let mut cursor = measure_start;
+            for &(start, end) in &merged {
+                rests.extend(split_rest_gap_preferring(
+                    measure_start,
+                    cursor,
+                    start,
+                    preferred,
+                ));
+                cursor = cursor.max(end);
+            }
+        }
+        rests.extend(split_rest_gap_preferring(
+            measure_start,
+            last_end,
+            measure_end,
+            preferred,
+        ));
+        rests
     }
 }
 
-pub fn split_rest_gap(start_tick: Tick, end_tick: Tick) -> Vec<RestNode> {
+/// Which gaps of a bar get rests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestFill {
+    /// Only the stretch after the last sounding note (brick view).
+    BarEnd,
+    /// Every stretch where nothing sounds, as TuxGuitar does. Gaps are cut
+    /// into `preferred`-sized rests where they fit, so each slot a note of
+    /// that length could go into is a rest of its own.
+    AllGaps { preferred: Tick },
+}
+
+/// Splits the gap `[start_tick, end_tick)` into standard rest durations.
+/// Each rest is the longest standard value that fits the remaining gap and
+/// starts on a multiple of its own length counted from `bar_start`, so a
+/// gap beginning on beat 2 of 4/4 yields a quarter then a half rather than
+/// a half rest straddling the middle of the bar. When `preferred` is given
+/// it is used as the rest length whenever it fits and is aligned to the bar
+/// grid, falling back to the longest aligned standard value for the rest.
+pub fn split_rest_gap_preferring(
+    bar_start: Tick,
+    start_tick: Tick,
+    end_tick: Tick,
+    preferred: Option<Tick>,
+) -> Vec<RestNode> {
     let mut rests = Vec::new();
     let mut cursor = start_tick;
     let standard = [
@@ -544,10 +620,10 @@ pub fn split_rest_gap(start_tick: Tick, end_tick: Tick) -> Vec<RestNode> {
 
     while cursor < end_tick {
         let remaining = end_tick - cursor;
-        let duration = standard
-            .iter()
-            .copied()
-            .find(|ticks| *ticks <= remaining)
+        let fits = |ticks: Tick| ticks <= remaining && (cursor - bar_start) % ticks == 0;
+        let duration = preferred
+            .filter(|ticks| *ticks > 0 && fits(*ticks))
+            .or_else(|| standard.iter().copied().find(|ticks| fits(*ticks)))
             .unwrap_or(remaining);
         rests.push(RestNode {
             abs_tick: cursor,
@@ -633,9 +709,8 @@ mod tests {
             .find(|n| n.id == 1)
             .unwrap()
             .duration_ticks;
-        // Note id 1 starts at tick 0; growing it far past the bar end is
-        // allowed now (this app's stand-in for a tied note — see
-        // `insert_note_can_span_past_a_bar_boundary` below).
+        // Note id 1 starts at tick 0; in brick view a note may grow far past
+        // the end of its bar.
         assert!(project.stretch_note(1, 1, StretchEdge::Right, bar_end * 2, step));
         let track = project.track(1).unwrap();
         let note = track.notes.iter().find(|n| n.id == 1).unwrap();
@@ -676,7 +751,7 @@ mod tests {
         let a = project.insert_note(1, 0, step, 1, 3).unwrap();
         let b = project.insert_note(1, step * 2, step, 1, 5).unwrap();
         // Moving `a` right past where `b` currently sits would normally
-        // clamp against it — excluding `b` (as if it's moving together with
+        // clamp against it - excluding `b` (as if it's moving together with
         // `a` in the same drag) lets it pass through instead.
         assert!(project.move_note(1, a, step * 3, 0, &[b]));
         let track = project.track(1).unwrap();
@@ -712,7 +787,7 @@ mod tests {
         // otherwise land.
         let obstacle_id = project.insert_note(1, 0, step * 2, 2, 7).unwrap();
         let moving_id = project.insert_note(1, 0, step, 3, 3).unwrap();
-        // Move from string 3 onto string 2 (delta -1) — should shrink/clamp
+        // Move from string 3 onto string 2 (delta -1) - should shrink/clamp
         // against the obstacle rather than overlapping it.
         assert!(project.move_note(1, moving_id, 0, -1, &[]));
         let track = project.track(1).unwrap();
@@ -732,10 +807,9 @@ mod tests {
         );
         let track_id = project.tracks[0].id;
         // A 4/4 bar is 3840 ticks. A whole note (3840 ticks) starting at
-        // tick 2000 ends at 5840, well past the bar — and that's allowed:
-        // this is this app's stand-in for a tied note until real ties
-        // exist. Rendering is responsible for splitting it visually at the
-        // boundary (see `paint_note_fragment`), not the data model.
+        // tick 2000 ends at 5840, past the barline - allowed in brick view,
+        // where the data model keeps one note and the painter splits it at
+        // the boundary (see `paint_note_fragment`).
         let id = project
             .insert_note(track_id, 2_000, TICKS_PER_QUARTER * 4, 0, 3)
             .unwrap();
@@ -754,7 +828,7 @@ mod tests {
     fn insert_note_shrinks_to_avoid_overlapping_a_later_note_on_the_same_string() {
         let mut project = BwxProject::demo();
         // Track 1's existing notes are all on string 0; place a long note on
-        // string 1 first, then a short one after it on the same string —
+        // string 1 first, then a short one after it on the same string -
         // the long one should shrink to stop right where the new one starts.
         let long_id = project.insert_note(1, 0, TICKS_PER_QUARTER * 4, 1, 5).unwrap();
         project.insert_note(1, 480, TICKS_PER_QUARTER, 1, 7).unwrap();
@@ -804,10 +878,8 @@ mod tests {
 
     #[test]
     fn fluid_duration_does_not_touch_notes_in_later_bars() {
-        // Regression test: `set_note_duration_fluid` used to end with a
-        // `retain` that deleted every note in the whole track past the
-        // *current* bar's end, not just ones actually affected by the
-        // resize. A resize in bar 0 must leave every later bar untouched.
+        // Resizing a note may only displace notes the resize actually
+        // overlaps; a resize in bar 0 must leave every later bar untouched.
         let mut project = BwxProject::demo();
         let track_id = project.tracks[0].id;
         let bar_width = project.track(track_id).unwrap().measure_bounds_at(0).1;
@@ -828,10 +900,139 @@ mod tests {
 
     #[test]
     fn rest_padding_uses_standard_chunks() {
-        let rests = split_rest_gap(TICKS_PER_QUARTER, TICKS_PER_QUARTER * 4);
+        let rests = split_rest_gap_preferring(0, TICKS_PER_QUARTER, TICKS_PER_QUARTER * 4, None);
         assert_eq!(rests.len(), 2);
-        assert_eq!(rests[0].duration_ticks, TICKS_PER_QUARTER * 2);
-        assert_eq!(rests[1].duration_ticks, TICKS_PER_QUARTER);
+        assert_eq!(rests[0].duration_ticks, TICKS_PER_QUARTER);
+        assert_eq!(rests[1].duration_ticks, TICKS_PER_QUARTER * 2);
+    }
+
+    #[test]
+    fn rest_padding_aligns_chunks_to_the_bar_grid() {
+        // A gap starting on beat 2 of a bar that begins at 3840 must start
+        // with a quarter so the following half lands on beat 3.
+        let bar_start = TICKS_PER_QUARTER * 4;
+        let rests = split_rest_gap_preferring(
+            bar_start,
+            bar_start + TICKS_PER_QUARTER,
+            bar_start + TICKS_PER_QUARTER * 4,
+            None,
+        );
+        let shape: Vec<(Tick, Tick)> = rests
+            .iter()
+            .map(|rest| (rest.abs_tick - bar_start, rest.duration_ticks))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (TICKS_PER_QUARTER, TICKS_PER_QUARTER),
+                (TICKS_PER_QUARTER * 2, TICKS_PER_QUARTER * 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_gaps_fill_rests_between_notes_in_the_preferred_size() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        project.track_mut(track_id).unwrap().notes.clear();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(track_id, 0, q, 0, 3);
+        project.insert_note(track_id, q * 2, q, 0, 3);
+
+        let rests = project.bar_rests(track_id, 0, RestFill::AllGaps { preferred: q });
+        let spans: Vec<(Tick, Tick)> = rests
+            .iter()
+            .map(|rest| (rest.abs_tick, rest.duration_ticks))
+            .collect();
+        assert_eq!(spans, vec![(q, q), (q * 3, q)]);
+    }
+
+    #[test]
+    fn a_long_gap_is_cut_into_preferred_slots() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        project.track_mut(track_id).unwrap().notes.clear();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(track_id, 0, q, 0, 3);
+
+        let quarters = project.bar_rests(track_id, 0, RestFill::AllGaps { preferred: q });
+        assert_eq!(quarters.len(), 3);
+        assert!(quarters.iter().all(|rest| rest.duration_ticks == q));
+
+        // Without a preference the same gap is the aligned quarter + half.
+        let engraved = project.bar_rests(track_id, 0, RestFill::BarEnd);
+        let lengths: Vec<Tick> = engraved.iter().map(|rest| rest.duration_ticks).collect();
+        assert_eq!(lengths, vec![q, q * 2]);
+    }
+
+    #[test]
+    fn a_preferred_size_that_does_not_align_falls_back_to_the_grid() {
+        // Half-note slots can't start on beat 2, so a quarter comes first.
+        let q = TICKS_PER_QUARTER;
+        let rests = split_rest_gap_preferring(0, q, q * 4, Some(q * 2));
+        let lengths: Vec<Tick> = rests.iter().map(|rest| rest.duration_ticks).collect();
+        assert_eq!(lengths, vec![q, q * 2]);
+    }
+
+    #[test]
+    fn all_gaps_in_an_empty_bar_is_still_one_bar_rest() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        project.track_mut(track_id).unwrap().notes.clear();
+        let rests = project.bar_rests(
+            track_id,
+            0,
+            RestFill::AllGaps {
+                preferred: TICKS_PER_QUARTER,
+            },
+        );
+        assert_eq!(rests.len(), 1);
+        assert_eq!(rests[0].duration_ticks, 3840);
+    }
+
+    #[test]
+    fn empty_bar_gets_one_bar_length_rest_in_any_signature() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[1].id; // 5/8 track
+        project.track_mut(track_id).unwrap().notes.clear();
+        let rests = project.tail_padding_rests(track_id, 0);
+        let bar_ticks = TimeSignature::new(5, 8).measure_ticks();
+        assert_eq!(rests.len(), 1);
+        assert_eq!(rests[0].abs_tick, 0);
+        assert_eq!(rests[0].duration_ticks, bar_ticks);
+    }
+
+    #[test]
+    fn rests_only_fill_after_the_last_note_in_each_bar() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        // Demo notes occupy beats 1-3 of bar 0 (ending at 3 quarters).
+        let rests = project.tail_padding_rests(track_id, 0);
+        assert_eq!(rests.len(), 1);
+        assert_eq!(rests[0].abs_tick, TICKS_PER_QUARTER * 3);
+        assert_eq!(rests[0].duration_ticks, TICKS_PER_QUARTER);
+
+        // Asking via any tick inside the bar gives the same answer, and a
+        // second bar is padded independently.
+        assert!(project.add_bar_after(track_id, 0));
+        assert_eq!(project.tail_padding_rests(track_id, 500), rests);
+        let bar_ticks = project.track(track_id).unwrap().measure_bounds_at(0).1;
+        let second = project.tail_padding_rests(track_id, bar_ticks);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].duration_ticks, bar_ticks);
+    }
+
+    #[test]
+    fn a_note_sustaining_in_from_an_earlier_bar_suppresses_the_rest() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        let bar_ticks = project.track(track_id).unwrap().measure_bounds_at(0).1;
+        assert!(project.add_bar_after(track_id, 0));
+        project.insert_note(track_id, bar_ticks - TICKS_PER_QUARTER, bar_ticks, 0, 3);
+        // The brick sounds through beat 4 of bar 0 and all of bar 1 up to
+        // its own end, which is the barline of bar 1 + 3 quarters.
+        let bar1_rests = project.tail_padding_rests(track_id, bar_ticks);
+        assert_eq!(bar1_rests[0].abs_tick, bar_ticks + TICKS_PER_QUARTER * 3);
     }
 
     #[test]

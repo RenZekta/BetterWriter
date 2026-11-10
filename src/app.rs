@@ -6,15 +6,17 @@ use crate::{
     audio::{AudioRuntime, Vst3HostSlot, VstHost},
     core::{
         BwxProject, CompatibilityReport, DurationChoice, InstrumentFamily, InstrumentTrack,
-        MidiEventKind, MidiPlaybackEvent, NoteEffects, ShadowTimeline, StandardExportFormat,
-        StretchEdge, StringedVariant, TICKS_PER_QUARTER, TempoTransition, Tick, TimeSignature,
+        MidiEventKind, MidiPlaybackEvent, NoteEffects, RestFill, ShadowTimeline,
+        StandardExportFormat, StretchEdge, StringedVariant, TICKS_PER_QUARTER, TempoTransition,
+        Tick, TimeSignature,
     },
     format,
+    notation::{self, Clef},
     theme::EditorTheme,
 };
 
 /// The keyboard-driven write cursor. It points at a `(tick, string)` cell on
-/// the active track's tab staff — exactly the cell the next typed fret will
+/// the active track's tab staff - exactly the cell the next typed fret will
 /// land in. Mirrors TuxGuitar's "edit caret" model: moving right advances by
 /// the currently selected note duration, not by a fixed pixel grid.
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +49,23 @@ struct StaffSystem {
     start_tick: Tick,
     end_tick: Tick,
     bars: Vec<(Tick, Tick)>,
+    /// Beat-column layout of each bar. Empty in brick view, where x is
+    /// simply proportional to time.
+    beat_bars: Vec<BeatBarLayout>,
+}
+
+/// Horizontal layout of one bar in tab view: its notes and rests sit in
+/// columns whose spacing depends on their durations, not on a fixed
+/// pixels-per-tick scale.
+struct BeatBarLayout {
+    start: Tick,
+    end: Tick,
+    /// Left edge of the bar, relative to the system's left edge.
+    x: f32,
+    width: f32,
+    /// `(onset tick, center x)` of every beat in the bar, x relative to the
+    /// system's left edge.
+    columns: Vec<(Tick, f32)>,
 }
 
 impl StaffSystem {
@@ -57,11 +76,153 @@ impl StaffSystem {
             start_tick,
             end_tick,
             bars,
+            beat_bars: Vec::new(),
         }
     }
 
     fn tick_span(&self) -> Tick {
         (self.end_tick - self.start_tick).max(0)
+    }
+
+    fn has_beat_layout(&self) -> bool {
+        !self.beat_bars.is_empty()
+    }
+
+    /// X of `tick` relative to the system's left edge. In beat layout, ticks
+    /// between two beats are interpolated within their bar.
+    fn x_of(&self, tick: Tick, pixels_per_tick: f32) -> f32 {
+        if !self.has_beat_layout() {
+            return (tick - self.start_tick) as f32 * pixels_per_tick;
+        }
+        let bar = self
+            .beat_bars
+            .iter()
+            .find(|bar| tick >= bar.start && tick < bar.end)
+            .or(self.beat_bars.last());
+        let Some(bar) = bar else {
+            return 0.0;
+        };
+        let (Some(first), Some(last)) = (bar.columns.first(), bar.columns.last()) else {
+            return bar.x;
+        };
+        if tick <= first.0 {
+            return first.1;
+        }
+        if tick >= bar.end {
+            return bar.x + bar.width - 2.0;
+        }
+        if tick >= last.0 {
+            let span = (bar.end - last.0).max(1) as f32;
+            let fraction = (tick - last.0) as f32 / span;
+            return last.1 + (bar.x + bar.width - 2.0 - last.1) * fraction;
+        }
+        let next = bar.columns.partition_point(|column| column.0 <= tick);
+        let (t0, x0) = bar.columns[next - 1];
+        let (t1, x1) = bar.columns[next];
+        x0 + (x1 - x0) * (tick - t0) as f32 / (t1 - t0).max(1) as f32
+    }
+
+    /// Left edge of bar `index` relative to the system's left edge.
+    fn bar_x(&self, index: usize, pixels_per_tick: f32) -> f32 {
+        match self.beat_bars.get(index) {
+            Some(bar) => bar.x,
+            None => self
+                .bars
+                .get(index)
+                .map(|bar| (bar.0 - self.start_tick) as f32 * pixels_per_tick)
+                .unwrap_or(0.0),
+        }
+    }
+
+    /// Right edge of the system relative to its left edge.
+    fn right_x(&self, pixels_per_tick: f32) -> f32 {
+        match self.beat_bars.last() {
+            Some(bar) => bar.x + bar.width,
+            None => self.tick_span() as f32 * pixels_per_tick,
+        }
+    }
+
+    /// The tick under `x` (relative to the system's left edge): the nearest
+    /// beat in beat layout, the plain proportional position otherwise.
+    fn tick_at(&self, x: f32, pixels_per_tick: f32) -> Tick {
+        if !self.has_beat_layout() {
+            return (x / pixels_per_tick).max(0.0) as Tick + self.start_tick;
+        }
+        let bar = self
+            .beat_bars
+            .iter()
+            .find(|bar| x < bar.x + bar.width)
+            .or(self.beat_bars.last());
+        bar.and_then(|bar| {
+            bar.columns
+                .iter()
+                .min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))
+                .map(|column| column.0)
+        })
+        .unwrap_or(self.start_tick)
+    }
+}
+
+/// How notes are drawn and edited on the staff canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorViewMode {
+    /// Notes are bricks whose width is proportional to their duration. A
+    /// sustained note is a single brick, even across barlines.
+    Bricks,
+    /// Guitar Pro style: bare fret numbers on the strings, every note inside
+    /// one bar, with notes that cross a barline written as tied notes.
+    TabNumbers,
+}
+
+/// Vertical layout of one staff system, which depends on whether the classic
+/// notation staff is shown above the tablature and on the string count.
+#[derive(Clone, Copy, Debug)]
+struct SystemMetrics {
+    /// Distance between the tops of consecutive systems.
+    height: f32,
+    /// Distance from a system's top to the top line of the classic staff.
+    staff_offset: f32,
+    /// Distance from a system's top to its first tab string.
+    tab_offset: f32,
+    string_count: usize,
+}
+
+impl SystemMetrics {
+    const STRING_GAP: f32 = 9.0;
+    /// Gap between adjacent classic staff lines.
+    const STAFF_LINE_GAP: f32 = 7.0;
+    /// Height of the five-line staff.
+    const STAFF_HEIGHT: f32 = Self::STAFF_LINE_GAP * 4.0;
+    /// Room above the staff for high notes' ledger lines, stems and labels.
+    const STAFF_TOP_MARGIN: f32 = 36.0;
+    /// Room between the staff and the tab for low notes' ledger lines and
+    /// stems.
+    const STAFF_BOTTOM_MARGIN: f32 = 40.0;
+    /// Gap between a system's last tab string and its bottom edge.
+    const BOTTOM_PADDING: f32 = 41.0;
+
+    /// Distance from the first to the last tab string.
+    fn tab_span(&self) -> f32 {
+        self.string_count.saturating_sub(1) as f32 * Self::STRING_GAP
+    }
+
+    fn new(show_classic_notation: bool, string_count: usize) -> Self {
+        let (staff_offset, tab_offset) = if show_classic_notation {
+            (
+                Self::STAFF_TOP_MARGIN,
+                Self::STAFF_TOP_MARGIN + Self::STAFF_HEIGHT + Self::STAFF_BOTTOM_MARGIN,
+            )
+        } else {
+            (0.0, 16.0)
+        };
+        let mut metrics = Self {
+            height: 0.0,
+            staff_offset,
+            tab_offset,
+            string_count,
+        };
+        metrics.height = tab_offset + metrics.tab_span() + Self::BOTTOM_PADDING;
+        metrics
     }
 }
 
@@ -102,7 +263,7 @@ enum AutomationDragMode {
     Idle,
     /// Dragging one or more selected points together. Elastic snapping (see
     /// `show_tempo_graph`) needs each point's position *as it was when the
-    /// drag started* — recomputing every frame from a fixed baseline plus
+    /// drag started* - recomputing every frame from a fixed baseline plus
     /// the total raw drag distance, rather than incrementally re-snapping
     /// an already-snapped position, is what keeps a small nudge from
     /// compounding into a runaway jump.
@@ -110,7 +271,7 @@ enum AutomationDragMode {
         /// (tick, bpm) of every selected point at drag start, in the same
         /// order as `AutomationEditorState::selected_points` at that moment.
         original_points: Vec<(Tick, f32)>,
-        /// Index into `original_points` of the point actually grabbed —
+        /// Index into `original_points` of the point actually grabbed -
         /// only *its* raw distance from a grid line decides whether the
         /// whole selection is currently snapped; everything else just
         /// follows the same effective offset.
@@ -145,7 +306,7 @@ enum CanvasDragMode {
     /// grabbed note is part of one.
     MovingNotes {
         note_ids: Vec<u64>,
-        /// The specific note grabbed — its bar start anchors the snap grid
+        /// The specific note grabbed - its bar start anchors the snap grid
         /// (see `finish_canvas_drag`), and its original position is what
         /// the raw drag distance is measured from.
         anchor_note_id: u64,
@@ -174,8 +335,8 @@ struct AutomationEditorState {
     /// Project snapshot taken when a drag gesture starts, so the whole drag
     /// collapses into a single undo step instead of one per frame.
     drag_started_snapshot: Option<BwxProject>,
-    /// The transition new points are created with, and — while any points
-    /// are selected — the transition the Constant/Progressive control
+    /// The transition new points are created with, and - while any points
+    /// are selected - the transition the Constant/Progressive control
     /// applies to that selection. Persists across selection changes (it's a
     /// "brush" setting, not a reflection of whatever's currently selected).
     default_transition: TempoTransition,
@@ -275,6 +436,10 @@ pub struct BetterWriterApp {
     /// note's bar start; see `finish_canvas_drag`). Configurable via RMB >
     /// Note > Dragging.
     drag_step_ticks: Tick,
+    /// Brick or fret-number rendering; toggled by the toolbar's view button.
+    view_mode: EditorViewMode,
+    /// Whether the five-line classic notation staff is drawn above the tab.
+    show_classic_notation: bool,
     selected_duration: DurationChoice,
     active_effects: NoteEffects,
     active_velocity: u8,
@@ -328,6 +493,8 @@ impl BetterWriterApp {
             canvas_drag: CanvasDragMode::Idle,
             stretch_step_ticks: TICKS_PER_QUARTER / 4,
             drag_step_ticks: TICKS_PER_QUARTER / 4,
+            view_mode: EditorViewMode::Bricks,
+            show_classic_notation: true,
             selected_duration: DurationChoice::Quarter,
             active_effects: NoteEffects::default(),
             active_velocity: 108,
@@ -352,7 +519,7 @@ impl BetterWriterApp {
 
     /// Resolves `theme_mode` into an actual `EditorTheme` and applies it,
     /// including telling egui itself (`ctx.set_theme`) so built-in widgets
-    /// (buttons, windows, menus, text fields — everything not painted by
+    /// (buttons, windows, menus, text fields - everything not painted by
     /// hand on the staff canvas) follow along too. Runs every frame since
     /// it's cheap and the OS preference can change at runtime under
     /// `System`.
@@ -361,7 +528,7 @@ impl BetterWriterApp {
             AppThemeMode::Dark => true,
             AppThemeMode::Bright => false,
             // `None` means egui couldn't determine the OS preference (some
-            // platforms/window managers don't report one) — fall back to
+            // platforms/window managers don't report one) - fall back to
             // Dark rather than silently guessing Bright.
             AppThemeMode::System => {
                 !matches!(ctx.input(|input| input.raw.system_theme), Some(egui::Theme::Light))
@@ -380,6 +547,12 @@ impl BetterWriterApp {
     }
 
     fn refresh_after_edit(&mut self, track_id: u64) {
+        // Tab view keeps every note inside one bar, whatever the edit was
+        // (typing, lengthening, a time signature change, ...), so anything
+        // that now crosses a barline is cut into tied notes here.
+        if self.view_mode == EditorViewMode::TabNumbers {
+            self.project.split_bricks_at_barlines();
+        }
         self.shadow_timeline.replace_track(&self.project, track_id);
         self.compatibility =
             CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
@@ -424,6 +597,8 @@ impl BetterWriterApp {
         }
         self.cursor.pending_fret = None;
         self.cursor.pending_at = None;
+        self.normalize_for_view_mode();
+        self.prune_selection();
         self.sync_time_signature_picker();
         self.shadow_timeline.rebuild_all(&self.project);
         self.compatibility =
@@ -447,6 +622,91 @@ impl BetterWriterApp {
         };
         self.undo_stack.push(self.project.clone());
         self.restore_history_state(next, "Redid edit");
+    }
+
+    /// Brings the project's notes into the shape the current view mode needs:
+    /// tab view cuts bricks at barlines into tied notes, brick view joins
+    /// those slices back together. Both directions are idempotent, so this
+    /// is safe to call after anything that replaces or edits the project.
+    /// Returns whether any note changed.
+    fn normalize_for_view_mode(&mut self) -> bool {
+        match self.view_mode {
+            EditorViewMode::Bricks => self.project.merge_brick_ties(),
+            EditorViewMode::TabNumbers => self.project.split_bricks_at_barlines(),
+        }
+    }
+
+    /// Drops selected note ids that no longer exist (a merge removes the
+    /// tied slices it absorbs).
+    fn prune_selection(&mut self) {
+        let existing: std::collections::HashSet<u64> = self
+            .project
+            .track(self.selected_track_id)
+            .map(|track| track.notes.iter().map(|note| note.id).collect())
+            .unwrap_or_default();
+        self.selected_note_id = self.selected_note_id.filter(|id| existing.contains(id));
+        self.area_selected_note_ids
+            .retain(|id| existing.contains(id));
+    }
+
+    /// Switches between brick view and tab view. The conversion is not an
+    /// undo step of its own: undo/redo re-normalize whatever they restore
+    /// for the active mode, so history stays consistent across switches.
+    fn set_view_mode(&mut self, mode: EditorViewMode) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        self.canvas_drag = CanvasDragMode::Idle;
+        self.normalize_for_view_mode();
+        self.prune_selection();
+        self.shadow_timeline.rebuild_all(&self.project);
+        self.compatibility =
+            CompatibilityReport::analyze(&self.project, horizon_tick(&self.project));
+        self.status = match mode {
+            EditorViewMode::Bricks => {
+                "Brick view: notes crossing barlines are single bricks again.".to_owned()
+            }
+            EditorViewMode::TabNumbers => {
+                "Tab view: bricks crossing barlines are now tied notes.".to_owned()
+            }
+        };
+    }
+
+    fn toggle_view_mode(&mut self) {
+        let next = match self.view_mode {
+            EditorViewMode::Bricks => EditorViewMode::TabNumbers,
+            EditorViewMode::TabNumbers => EditorViewMode::Bricks,
+        };
+        self.set_view_mode(next);
+    }
+
+    /// Ties (or unties) the selected note(s) to the note right before them
+    /// on the same string.
+    fn toggle_tie_on_selection(&mut self) {
+        let ids: Vec<u64> = match self.selected_note_id {
+            Some(id) => vec![id],
+            None => self.area_selected_note_ids.clone(),
+        };
+        if ids.is_empty() {
+            self.status = "Select a note first, then press L to tie it.".to_owned();
+            return;
+        }
+        let track_id = self.selected_track_id;
+        let previous_project = self.project.clone();
+        let changed = ids
+            .iter()
+            .filter(|id| self.project.toggle_user_tie(track_id, **id))
+            .count();
+        if changed == 0 {
+            self.status = "A tie needs a note with the same fret ending exactly where this \
+                one starts, on the same string."
+                .to_owned();
+            return;
+        }
+        self.record_project_edit(previous_project);
+        self.refresh_after_edit(track_id);
+        self.status = format!("Toggled the tie on {changed} note(s).");
     }
 
     fn play(&mut self) {
@@ -477,6 +737,8 @@ impl BetterWriterApp {
             .map(|track| track.id)
             .unwrap_or(1);
         self.selected_note_id = None;
+        self.area_selected_note_ids.clear();
+        self.normalize_for_view_mode();
         self.reset_cursor_for_track(self.selected_track_id);
         self.shadow_timeline.rebuild_all(&self.project);
         self.compatibility =
@@ -514,8 +776,8 @@ impl BetterWriterApp {
         self.adopt_loaded_project(format!("Created new project \"{title}\"."));
     }
 
-    /// Loads the built-in demo project — what used to open automatically on
-    /// startup, now reachable from the Start Menu's "Demo Project" button.
+    /// Loads the built-in demo project (the Start Menu's "Demo Project"
+    /// button).
     fn load_demo_project(&mut self) {
         self.project = BwxProject::demo();
         self.current_file = None;
@@ -763,17 +1025,15 @@ impl BetterWriterApp {
         let previous_project = self.project.clone();
         let changed = self
             .project
-            .track_mut(self.selected_track_id)
+            .track(self.selected_track_id)
             .and_then(|track| {
-                let max_fret = track.fret_count;
-                let note = track.notes.iter_mut().find(|note| note.id == note_id)?;
-                let fret = (note.fret as i16 + delta).clamp(0, max_fret as i16) as u8;
-                (fret != note.fret).then(|| {
-                    note.fret = fret;
-                    fret
-                })
+                let note = track.notes.iter().find(|note| note.id == note_id)?;
+                let fret = (note.fret as i16 + delta).clamp(0, track.fret_count as i16) as u8;
+                (fret != note.fret).then_some(fret)
             });
         if let Some(fret) = changed {
+            self.project
+                .set_note_fret(self.selected_track_id, note_id, fret);
             self.record_project_edit(previous_project);
             self.refresh_after_edit(self.selected_track_id);
             self.status = format!("Changed selected note to fret {fret}.");
@@ -825,7 +1085,7 @@ impl BetterWriterApp {
     }
 
     /// If a fret digit has been typed and ~0.3s has passed with no further
-    /// digit, auto-commits it as a note — matching Guitar Pro, so a
+    /// digit, auto-commits it as a note - matching Guitar Pro, so a
     /// multi-digit fret doesn't need an explicit Enter press. Must run every
     /// frame (not just on input) for the delay to actually elapse while the
     /// user does nothing else; schedules a repaint for the deadline itself,
@@ -859,6 +1119,50 @@ impl BetterWriterApp {
             self.cursor.pending_fret = None;
             self.cursor.pending_at = None;
         }
+    }
+
+    /// Onset ticks of every beat of the selected track, in order: the
+    /// positions the tab-view cursor can stop on.
+    fn all_beat_ticks(&self) -> Vec<Tick> {
+        let Some(track) = self.project.track(self.selected_track_id) else {
+            return Vec::new();
+        };
+        let mut ticks = Vec::new();
+        let mut cursor: Tick = 0;
+        for _ in 0..track.bar_count.max(1) {
+            let bounds = track.measure_bounds_at(cursor);
+            cursor = bounds.1;
+            ticks.extend(self.bar_beat_ticks(track, bounds));
+        }
+        ticks
+    }
+
+    /// Moves the tab-view cursor to the next (`forward`) or previous beat.
+    fn move_cursor_beat(&mut self, forward: bool) {
+        let beats = self.all_beat_ticks();
+        let current = self.cursor.tick;
+        let target = if forward {
+            beats.iter().copied().find(|tick| *tick > current)
+        } else {
+            beats.iter().copied().rev().find(|tick| *tick < current)
+        };
+        if let Some(tick) = target {
+            self.cursor.tick = tick;
+        }
+        self.cursor.pending_fret = None;
+        self.cursor.pending_at = None;
+    }
+
+    /// After writing a note in tab view, parks the cursor on the first beat
+    /// at or after the note's end (the rest slot that follows it, or the
+    /// next bar's first beat).
+    fn advance_cursor_past(&mut self, note_end: Tick) {
+        let target = self
+            .all_beat_ticks()
+            .into_iter()
+            .find(|tick| *tick >= note_end)
+            .unwrap_or(note_end);
+        self.cursor.tick = target;
     }
 
     /// Advance the cursor by the currently selected note duration. If the
@@ -932,7 +1236,7 @@ impl BetterWriterApp {
         if tick >= track.bars_end_tick() {
             self.cursor.pending_fret = None;
             self.status =
-                "No bar there yet — add a bar first (Ctrl+B or right-click > Bar > Add Bar)."
+                "No bar there yet - add a bar first (Ctrl+B or right-click > Bar > Add Bar)."
                     .to_owned();
             return;
         }
@@ -941,7 +1245,50 @@ impl BetterWriterApp {
             .string_index
             .min(track.tuning.len().saturating_sub(1));
         let fret = self.cursor.pending_fret.unwrap_or(self.fret_to_insert);
-        let duration = self.selected_duration.ticks();
+        let mut duration = self.selected_duration.ticks();
+        let mut shortened_to: Option<DurationChoice> = None;
+        if self.view_mode == EditorViewMode::TabNumbers {
+            // Tab view enters notes the TuxGuitar way: a note joining a beat
+            // that already has notes takes that beat's length, and a note
+            // in an empty slot takes the duration being entered, cut down
+            // to the longest standard length that fits before the next beat
+            // with notes or the barline.
+            let (_, bar_end) = track.measure_bounds_at(tick);
+            let chord_duration = track
+                .notes
+                .iter()
+                .filter(|note| note.abs_tick == tick)
+                .map(|note| note.duration_ticks)
+                .min();
+            match chord_duration {
+                Some(shared) => duration = shared,
+                None => {
+                    let next_onset = track
+                        .notes
+                        .iter()
+                        .filter(|note| note.abs_tick > tick && note.abs_tick < bar_end)
+                        .map(|note| note.abs_tick)
+                        .min()
+                        .unwrap_or(bar_end);
+                    let room = next_onset - tick;
+                    if duration > room {
+                        let fitting = DurationChoice::ALL
+                            .iter()
+                            .copied()
+                            .filter(|choice| choice.ticks() <= room)
+                            .max_by_key(|choice| choice.ticks());
+                        let Some(fitting) = fitting else {
+                            self.cursor.pending_fret = None;
+                            self.status = "No room for a note here.".to_owned();
+                            return;
+                        };
+                        duration = fitting.ticks();
+                        shortened_to = Some(fitting);
+                    }
+                }
+            }
+        }
+        let mut advance_to = tick + duration;
         let previous_project = self.project.clone();
 
         // If a note already sits on this string at this tick, overwrite its
@@ -954,12 +1301,13 @@ impl BetterWriterApp {
         });
 
         if let Some(id) = existing {
+            self.project.set_note_fret(track_id, id, fret);
             if let Some(track) = self.project.track_mut(track_id)
                 && let Some(note) = track.notes.iter_mut().find(|n| n.id == id)
             {
-                note.fret = fret;
                 note.velocity = self.active_velocity;
                 note.effects = self.active_effects.clone();
+                advance_to = note.end_tick();
                 self.selected_note_id = Some(id);
                 self.status = format!("Replaced note {id} with fret {fret}.");
             }
@@ -974,17 +1322,28 @@ impl BetterWriterApp {
                 note.effects = self.active_effects.clone();
             }
             self.selected_note_id = Some(id);
-            self.status = format!(
-                "Wrote fret {fret} at tick {tick} on string {}.",
-                string_index + 1
-            );
+            self.status = match shortened_to {
+                Some(choice) => format!(
+                    "Wrote fret {fret} as a {} note: that is all that fits before the next \
+                     note or the barline. Tie notes with L to sustain across.",
+                    choice.label()
+                ),
+                None => format!(
+                    "Wrote fret {fret} at tick {tick} on string {}.",
+                    string_index + 1
+                ),
+            };
         }
 
         self.cursor.pending_fret = None;
         self.cursor.pending_at = None;
         self.record_project_edit(previous_project);
         self.refresh_after_edit(track_id);
-        self.advance_cursor();
+        if self.view_mode == EditorViewMode::TabNumbers {
+            self.advance_cursor_past(advance_to);
+        } else {
+            self.advance_cursor();
+        }
     }
 
     /// Delete the note sitting under the cursor (if any) and pull the caret
@@ -1078,7 +1437,7 @@ impl BetterWriterApp {
                 changed = true;
             }
 
-            // Fret digits — always available so the user can start typing
+            // Fret digits - always available so the user can start typing
             // immediately. We read raw events to also catch numpad keys.
             // Skip when a modifier is held so Ctrl+digit can drive duration.
             if !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.mac_cmd {
@@ -1099,17 +1458,25 @@ impl BetterWriterApp {
             if adjust_selected_note && i.key_pressed(egui::Key::ArrowRight) {
                 changed |= self.step_selected_note_duration(-1);
             } else if i.key_pressed(egui::Key::ArrowRight) {
-                self.advance_cursor();
+                if self.view_mode == EditorViewMode::TabNumbers {
+                    self.move_cursor_beat(true);
+                } else {
+                    self.advance_cursor();
+                }
                 self.selected_note_id = None;
                 changed = true;
             }
             if adjust_selected_note && i.key_pressed(egui::Key::ArrowLeft) {
                 changed |= self.step_selected_note_duration(1);
             } else if i.key_pressed(egui::Key::ArrowLeft) {
-                let step = self.selected_duration.ticks();
-                self.cursor.tick = (self.cursor.tick - step).max(0);
-                self.cursor.pending_fret = None;
-                self.cursor.pending_at = None;
+                if self.view_mode == EditorViewMode::TabNumbers {
+                    self.move_cursor_beat(false);
+                } else {
+                    let step = self.selected_duration.ticks();
+                    self.cursor.tick = (self.cursor.tick - step).max(0);
+                    self.cursor.pending_fret = None;
+                    self.cursor.pending_at = None;
+                }
                 self.selected_note_id = None;
                 changed = true;
             }
@@ -1146,7 +1513,7 @@ impl BetterWriterApp {
                 changed = true;
             }
 
-            // Duration cycling: `-` → longer, `+`/`=` → shorter
+            // Duration cycling: `-` -> longer, `+`/`=` -> shorter
             if i.key_pressed(egui::Key::Minus) {
                 self.cycle_duration(1);
                 changed = true;
@@ -1173,6 +1540,11 @@ impl BetterWriterApp {
                     self.status = format!("Note duration: {}", d.label());
                     changed = true;
                 }
+            }
+
+            if i.key_pressed(egui::Key::L) && !i.modifiers.command && !i.modifiers.shift {
+                self.toggle_tie_on_selection();
+                changed = true;
             }
 
             // Clear pending fret
@@ -1355,6 +1727,32 @@ impl BetterWriterApp {
                         ui.close();
                     }
                 }
+                ui.separator();
+                ui.label(egui::RichText::new("Notes").strong());
+                if ui
+                    .radio(self.view_mode == EditorViewMode::Bricks, "Brick view")
+                    .clicked()
+                {
+                    self.set_view_mode(EditorViewMode::Bricks);
+                    ui.close();
+                }
+                if ui
+                    .radio(
+                        self.view_mode == EditorViewMode::TabNumbers,
+                        "Tab view (fret numbers)",
+                    )
+                    .clicked()
+                {
+                    self.set_view_mode(EditorViewMode::TabNumbers);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.show_classic_notation, "Classic notation")
+                    .clicked()
+                {
+                    ui.close();
+                }
             });
             for name in [
                 "Composition",
@@ -1370,7 +1768,7 @@ impl BetterWriterApp {
                 });
             }
             ui.menu_button("Help", |ui| {
-                ui.label(egui::RichText::new("Keyboard — Tab Writing").strong());
+                ui.label(egui::RichText::new("Keyboard - Tab Writing").strong());
                 ui.separator();
                 ui.label("0-9 ............ type fret (multi-digit, e.g. 1 then 2 = 12)");
                 ui.label("Enter / Space ... place the buffered fret at the cursor");
@@ -1385,13 +1783,14 @@ impl BetterWriterApp {
                 );
                 ui.label("Esc ............. clear pending fret / selection");
                 ui.label("Home ............ move cursor to tick 0");
+                ui.label("L ............... tie / untie the selected note to the one before it");
                 ui.separator();
-                ui.label(egui::RichText::new("Keyboard — Bars").strong());
+                ui.label(egui::RichText::new("Keyboard - Bars").strong());
                 ui.label("Ctrl+Ins / Ctrl+Shift+B ... insert a bar before the selected bar");
                 ui.label("Ctrl+B .......... add a bar after the selected bar");
                 ui.label("Ctrl+Del ........ delete the selected bar");
                 ui.separator();
-                ui.label(egui::RichText::new("Mouse — Staff canvas").strong());
+                ui.label(egui::RichText::new("Mouse - Staff canvas").strong());
                 ui.label("Click a note ...... select it");
                 ui.label("Click empty space . move the keyboard cursor there");
                 ui.label("Drag empty space .. rubber-band select several notes at once");
@@ -1644,7 +2043,7 @@ impl BetterWriterApp {
             });
 
         if keep_open {
-            // Delete/Backspace removes the selected point(s) — but only when
+            // Delete/Backspace removes the selected point(s) - but only when
             // no widget has keyboard focus, so backspacing while typing into
             // the bpm field doesn't also delete the point.
             let any_widget_focused = ctx.memory(|memory| memory.focused().is_some());
@@ -1676,11 +2075,10 @@ impl BetterWriterApp {
         ui: &mut egui::Ui,
         state: &mut AutomationEditorState,
     ) {
-        // Without this, the window snaps back to its content's natural
-        // (small) height on every frame, which is what made the resize
-        // handle appear to only work horizontally: egui shrink-wraps a
-        // Window's height to whatever its content actually uses unless the
-        // content explicitly claims the space a manual resize gave it.
+        // egui shrink-wraps a Window's height to whatever its content uses
+        // unless the content claims the space, so a vertical resize is
+        // discarded on the next frame and the handle looks like it only
+        // drags sideways.
         ui.set_min_height(ui.available_height());
 
         ui.horizontal(|ui| {
@@ -1724,13 +2122,11 @@ impl BetterWriterApp {
             AutomationType::Tempo => {
                 let body_height = ui.available_height().max(220.0);
                 ui.horizontal(|ui| {
-                    // `top_down` here is load-bearing, not decorative: a
-                    // plain `ui.allocate_ui` inherits this row's
-                    // left-to-right layout, which disables text wrapping —
-                    // that's what was making the point-settings text spill
-                    // out past its column instead of wrapping/stacking, and
-                    // in turn made the graph column end up far smaller than
-                    // it should've been.
+                    // `top_down` is load-bearing, not decorative: a plain
+                    // `ui.allocate_ui` inherits this row's left-to-right
+                    // layout, which disables text wrapping, so the
+                    // point-settings text spills out of its column and
+                    // squeezes the graph column.
                     ui.allocate_ui_with_layout(
                         Vec2::new(210.0, body_height),
                         egui::Layout::top_down(egui::Align::Min),
@@ -1776,7 +2172,7 @@ impl BetterWriterApp {
         } else {
             None
         };
-        // A stale selection (e.g. the point got deleted from under it) —
+        // A stale selection (e.g. the point got deleted from under it) -
         // drop it and fall through to the "0 selected" presentation.
         if selected_count == 1 && single_point.is_none() {
             state.selected_points.clear();
@@ -1786,7 +2182,7 @@ impl BetterWriterApp {
         ui.label("Position:");
         ui.label(
             egui::RichText::new(match selected_count {
-                0 => "—".to_owned(),
+                0 => "-".to_owned(),
                 1 => format!("tick {}", single_point.unwrap().at_tick),
                 n => format!("{n} points selected"),
             })
@@ -1882,7 +2278,7 @@ impl BetterWriterApp {
             if ui
                 .button(label)
                 .on_hover_text(if selected_count == 1 && !can_delete {
-                    "The first point can't be removed — it sets the project's starting tempo"
+                    "The first point can't be removed - it sets the project's starting tempo"
                 } else {
                     "Remove the selected point(s)"
                 })
@@ -1914,8 +2310,8 @@ impl BetterWriterApp {
         );
     }
 
-    /// The Constant/Progressive transition control. Always visible — not
-    /// nested inside a "1 point selected" branch — because it does double
+    /// The Constant/Progressive transition control. Always visible - not
+    /// nested inside a "1 point selected" branch - because it does double
     /// duty as both a "brush" (the transition new points are created with)
     /// and, while a selection exists, an action that applies to it. It never
     /// resets itself to reflect whatever's currently selected: it's a
@@ -1974,8 +2370,8 @@ impl BetterWriterApp {
         // Explicitly passed down from `show_automation_editor_contents`
         // (rather than read via `ui.available_height()` here) and measured
         // against the zoom row's *actual* drawn height, so the graph
-        // reliably fills whatever room the window currently has — resizing
-        // the window taller gives a taller graph — instead of shrinking to
+        // reliably fills whatever room the window currently has - resizing
+        // the window taller gives a taller graph - instead of shrinking to
         // some small fixed size regardless of the window.
         let graph_height =
             (available_height - zoom_row.response.rect.height() - 8.0).max(MIN_GRAPH_HEIGHT);
@@ -2010,7 +2406,7 @@ impl BetterWriterApp {
                 );
                 let rect = response.rect;
                 // Local copies, not live reads through `state`, so these
-                // little mapping closures never hold a borrow of `state` —
+                // little mapping closures never hold a borrow of `state` -
                 // the interaction handlers below need to freely read *and*
                 // write several other `state` fields in the same scope.
                 let snap_to_grid = state.snap_to_grid;
@@ -2171,7 +2567,7 @@ impl BetterWriterApp {
 
                             // Only the grabbed point's raw (unsnapped)
                             // position decides whether the drag is
-                            // "close enough" to a grid line right now —
+                            // "close enough" to a grid line right now -
                             // recomputed fresh each frame from the
                             // fixed drag-start baseline, so a small
                             // nudge can never compound into a runaway
@@ -2365,6 +2761,29 @@ impl BetterWriterApp {
             .clicked()
             {
                 self.open_automation_editor();
+            }
+            let (view_label, view_hint) = match self.view_mode {
+                EditorViewMode::Bricks => (
+                    "Tab",
+                    "Switch to fret-number tab view. Bricks crossing barlines become tied notes.",
+                ),
+                EditorViewMode::TabNumbers => (
+                    "Bricks",
+                    "Switch back to brick view. Ties made by splitting bricks are joined again.",
+                ),
+            };
+            if small_tool_button(ui, view_label, view_hint).clicked() {
+                self.toggle_view_mode();
+            }
+            if ui
+                .add_sized(
+                    [62.0, 22.0],
+                    egui::Button::new("Notation").selected(self.show_classic_notation),
+                )
+                .on_hover_text("Show or hide the classic notation staff above the tablature")
+                .clicked()
+            {
+                self.show_classic_notation = !self.show_classic_notation;
             }
             ui.label("duration");
             const DURATION_LABELS: [&str; 6] = ["1", "1/2", "1/4", "1/8", "1/16", "1/32"];
@@ -2719,12 +3138,10 @@ impl BetterWriterApp {
             self.handle_canvas_click(pos, track_rect);
             self.sync_time_signature_picker();
         }
-        // `PopupCloseBehavior::CloseOnClickOutside` (egui's default for
-        // context menus is `CloseOnClick`, which closes on *any* click,
-        // including on a widget inside the menu — that's what made
-        // interactive submenu controls like Stretching's DragValue
-        // unusable). Menu items that should still close on click (most
-        // actions) do so via their own explicit `ui.close()` call.
+        // `PopupCloseBehavior::CloseOnClickOutside` keeps nested controls
+        // usable: egui's default `CloseOnClick` closes the menu on *any*
+        // click, including one on a widget inside it. Menu items that should
+        // close on click (most actions) do so via their own `ui.close()`.
         egui::Popup::context_menu(&response)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| self.show_canvas_context_menu(ui));
@@ -2875,7 +3292,7 @@ impl BetterWriterApp {
                     // A list-scrolling `DragValue` here (rather than a
                     // `ComboBox`) sidesteps the same nested-popup-in-menu
                     // conflict ComboBox has, and lets the denominator be
-                    // dragged/clicked through exactly like the numerator —
+                    // dragged/clicked through exactly like the numerator -
                     // just stepping through {1,2,4,8,16,32} instead of every
                     // integer.
                     const DENOMINATORS: [u8; 6] = [1, 2, 4, 8, 16, 32];
@@ -3038,10 +3455,19 @@ impl BetterWriterApp {
                     .checkbox(&mut self.active_effects.staccato, "Staccato  (!)")
                     .changed();
             });
+            if ui
+                .add_enabled(
+                    has_selection || has_area_selection,
+                    egui::Button::new("Tie Note  (L)"),
+                )
+                .clicked()
+            {
+                self.toggle_tie_on_selection();
+                ui.close();
+            }
             for label in [
                 "Staccatissimo",
                 "Tenuto",
-                "Tie Note  (L)",
                 "Tie Beat  (Shift+L)",
                 "Rest  (R)",
                 "Fermata...  (F)",
@@ -3157,11 +3583,181 @@ impl BetterWriterApp {
 
     /// Lays a track's bars out into rows ("systems"): each system is a
     /// contiguous run of whole bars that fits within `available_width`. A
-    /// bar is never split across two systems — if the next bar wouldn't fit
+    /// bar is never split across two systems - if the next bar wouldn't fit
     /// in the remaining space of the current row, the whole row ends there
     /// and that bar starts the next one, mirroring how real notation
     /// software wraps.
-    fn layout_staff_systems(&self, track: &InstrumentTrack, available_width: f32) -> Vec<StaffSystem> {
+    fn layout_staff_systems(
+        &self,
+        track: &InstrumentTrack,
+        available_width: f32,
+    ) -> Vec<StaffSystem> {
+        match self.view_mode {
+            EditorViewMode::Bricks => self.layout_brick_systems(track, available_width),
+            EditorViewMode::TabNumbers => self.layout_beat_systems(track, available_width),
+        }
+    }
+
+    /// The rest policy used wherever rests are shown in tab view and in the
+    /// classic staff: every gap is filled, in slots of the duration being
+    /// entered, as TuxGuitar does.
+    fn tab_rest_fill(&self) -> RestFill {
+        RestFill::AllGaps {
+            preferred: self.selected_duration.ticks(),
+        }
+    }
+
+    /// Onset ticks of every beat in a bar: note onsets and rest onsets, plus
+    /// the bar start. These are the positions the tab cursor can stop on.
+    fn bar_beat_ticks(&self, track: &InstrumentTrack, bar: (Tick, Tick)) -> Vec<Tick> {
+        let mut ticks: Vec<Tick> = vec![bar.0];
+        ticks.extend(
+            track
+                .notes
+                .iter()
+                .filter(|note| note.abs_tick >= bar.0 && note.abs_tick < bar.1)
+                .map(|note| note.abs_tick),
+        );
+        ticks.extend(
+            self.project
+                .bar_rests(track.id, bar.0, self.tab_rest_fill())
+                .iter()
+                .map(|rest| rest.abs_tick),
+        );
+        ticks.sort_unstable();
+        ticks.dedup();
+        ticks
+    }
+
+    /// Width of the slot a beat occupies, from the time until the next beat.
+    /// Longer notes get more room, but sub-linearly, so a whole rest doesn't
+    /// swallow the row while sixteenths stay readable.
+    fn beat_slot_width(&self, ticks_until_next: Tick) -> f32 {
+        let zoom = (self.pixels_per_tick / 0.07).clamp(0.5, 2.0);
+        let quarters = ticks_until_next.max(1) as f32 / TICKS_PER_QUARTER as f32;
+        let natural = 12.0 + 32.0 * quarters.powf(0.6) * zoom;
+        let minimum = if self.show_classic_notation {
+            22.0
+        } else {
+            16.0
+        };
+        natural.max(minimum)
+    }
+
+    /// Tab-view layout: bars are packed into rows by their natural width,
+    /// then each full row is stretched to the page width, as in
+    /// TuxGuitar and Guitar Pro.
+    fn layout_beat_systems(
+        &self,
+        track: &InstrumentTrack,
+        available_width: f32,
+    ) -> Vec<StaffSystem> {
+        const BAR_LEAD: f32 = 4.0;
+        // Extra room after the barline for a time signature label.
+        const SIGNATURE_LEAD: f32 = 24.0;
+        const COLUMN_LEAD: f32 = 8.0;
+        const BAR_TRAIL: f32 = 2.0;
+
+        struct NaturalBar {
+            bounds: (Tick, Tick),
+            lead: f32,
+            beats: Vec<Tick>,
+            slots: Vec<f32>,
+        }
+
+        let mut bars: Vec<NaturalBar> = Vec::new();
+        let mut cursor: Tick = 0;
+        for _ in 0..track.bar_count.max(1) {
+            let bounds = track.measure_bounds_at(cursor);
+            cursor = bounds.1;
+            let beats = self.bar_beat_ticks(track, bounds);
+            let slots = beats
+                .iter()
+                .enumerate()
+                .map(|(index, tick)| {
+                    let next = beats.get(index + 1).copied().unwrap_or(bounds.1);
+                    self.beat_slot_width(next - tick)
+                })
+                .collect();
+            let lead = if signature_label_at(track, bounds.0) {
+                SIGNATURE_LEAD
+            } else {
+                BAR_LEAD
+            };
+            bars.push(NaturalBar {
+                bounds,
+                lead,
+                beats,
+                slots,
+            });
+        }
+
+        let natural_width = |bar: &NaturalBar| bar.lead + bar.slots.iter().sum::<f32>() + BAR_TRAIL;
+
+        let mut rows: Vec<Vec<NaturalBar>> = Vec::new();
+        let mut current: Vec<NaturalBar> = Vec::new();
+        let mut current_width = 0.0_f32;
+        for bar in bars {
+            let width = natural_width(&bar);
+            if !current.is_empty() && current_width + width > available_width {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0.0;
+            }
+            current_width += width;
+            current.push(bar);
+        }
+        if !current.is_empty() {
+            rows.push(current);
+        }
+        if rows.is_empty() {
+            return vec![StaffSystem::from_bars(Vec::new())];
+        }
+
+        let row_count = rows.len();
+        rows.into_iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let fixed: f32 = row.iter().map(|bar| bar.lead + BAR_TRAIL).sum();
+                let slot_total: f32 = row.iter().flat_map(|bar| bar.slots.iter()).sum();
+                let is_last_row = row_index + 1 == row_count;
+                // Full rows are stretched to the page width; the last row
+                // keeps its natural width.
+                let stretch = if is_last_row || slot_total <= 0.0 {
+                    1.0
+                } else {
+                    ((available_width - fixed) / slot_total).max(1.0)
+                };
+
+                let mut system = StaffSystem::from_bars(row.iter().map(|bar| bar.bounds).collect());
+                let mut x = 0.0_f32;
+                for bar in &row {
+                    let slots: Vec<f32> = bar.slots.iter().map(|slot| slot * stretch).collect();
+                    let width = bar.lead + slots.iter().sum::<f32>() + BAR_TRAIL;
+                    let mut slot_start = x + bar.lead;
+                    let mut columns = Vec::with_capacity(bar.beats.len());
+                    for (tick, slot) in bar.beats.iter().zip(&slots) {
+                        columns.push((*tick, slot_start + COLUMN_LEAD.min(slot * 0.5)));
+                        slot_start += slot;
+                    }
+                    system.beat_bars.push(BeatBarLayout {
+                        start: bar.bounds.0,
+                        end: bar.bounds.1,
+                        x,
+                        width,
+                        columns,
+                    });
+                    x += width;
+                }
+                system
+            })
+            .collect()
+    }
+
+    fn layout_brick_systems(
+        &self,
+        track: &InstrumentTrack,
+        available_width: f32,
+    ) -> Vec<StaffSystem> {
         let mut bars: Vec<(Tick, Tick)> = Vec::with_capacity(track.bar_count.max(1) as usize);
         let mut cursor: Tick = 0;
         for _ in 0..track.bar_count.max(1) {
@@ -3187,33 +3783,30 @@ impl BetterWriterApp {
             systems.push(StaffSystem::from_bars(current));
         }
         if systems.is_empty() {
-            systems.push(StaffSystem {
-                start_tick: 0,
-                end_tick: 0,
-                bars: Vec::new(),
-            });
+            systems.push(StaffSystem::from_bars(Vec::new()));
         }
         systems
     }
 
     /// Draws a "♩=bpm" label above the staff at each non-hidden tempo point
     /// falling within `[system_origin_tick, system_origin_tick+system_ticks)`,
-    /// positioned right above the point's tick — matching Guitar Pro's
+    /// positioned right above the point's tick - matching Guitar Pro's
     /// automation display.
     fn paint_tempo_labels(
         &self,
         painter: &egui::Painter,
         left: f32,
         staff_y: f32,
-        system_origin_tick: Tick,
-        system_ticks: Tick,
+        system: &StaffSystem,
     ) {
+        let system_origin_tick = system.start_tick;
+        let system_ticks = system.tick_span();
         for point in self.project.tempo_points.iter().filter(|point| {
             !point.hidden
                 && point.at_tick >= system_origin_tick
                 && point.at_tick < system_origin_tick + system_ticks
         }) {
-            let x = left + (point.at_tick - system_origin_tick) as f32 * self.pixels_per_tick;
+            let x = left + system.x_of(point.at_tick, self.pixels_per_tick);
             painter.text(
                 Pos2::new(x, staff_y - 12.0),
                 Align2::LEFT_BOTTOM,
@@ -3232,8 +3825,9 @@ impl BetterWriterApp {
         let right = page.right() - 18.0;
         let available_width = (right - left).max(40.0);
         let systems = self.layout_staff_systems(track, available_width);
-        let system_height = 168.0;
+        let metrics = self.system_metrics(track);
         let first_top = page.top() + 56.0;
+        let clef = Clef::for_track(track);
 
         painter.text(
             Pos2::new(page.left() + 16.0, page.top() + 12.0),
@@ -3244,58 +3838,96 @@ impl BetterWriterApp {
         );
 
         for (system_index, system) in systems.iter().enumerate() {
-            let top = first_top + system_index as f32 * system_height;
-            if top + 136.0 > page.bottom() {
+            let top = first_top + system_index as f32 * metrics.height;
+            if top + metrics.height - 32.0 > page.bottom() {
                 break;
             }
-            let staff_y = top;
-            let tab_y = top + 82.0;
-            let system_origin_tick = system.start_tick;
-            let system_ticks = system.tick_span();
-            // The row only extends as far as its actual bars reach — never
-            // stretched out to the page edge, and never longer than the
-            // page allows either (a single oversized bar still gets clipped
-            // visually rather than overflowing the layout).
-            let system_right = (left + system_ticks as f32 * self.pixels_per_tick).min(right);
+            let staff_y = top + metrics.staff_offset;
+            let tab_y = top + metrics.tab_offset;
+            let tab_bottom = tab_y + metrics.tab_span();
+            // Bar lines, tempo labels and the system's top edge start at the
+            // classic staff when it's shown, otherwise at the first string.
+            let system_top = if self.show_classic_notation {
+                staff_y
+            } else {
+                tab_y
+            };
+            let system_end_tick = system.start_tick + system.tick_span();
+            // A row only extends as far as its bars reach. Brick rows are
+            // also clipped to the page; beat rows are already fitted to it.
+            let row_right = left + system.right_x(self.pixels_per_tick);
+            let system_right = if system.has_beat_layout() {
+                row_right
+            } else {
+                row_right.min(right)
+            };
 
-            for line in 0..5 {
-                let y = staff_y + line as f32 * 7.0;
-                painter.line_segment(
-                    [Pos2::new(left, y), Pos2::new(system_right, y)],
-                    self.theme.staff_stroke(),
+            if self.show_classic_notation {
+                for line in 0..5 {
+                    let y = staff_y + line as f32 * SystemMetrics::STAFF_LINE_GAP;
+                    painter.line_segment(
+                        [Pos2::new(left, y), Pos2::new(system_right, y)],
+                        self.theme.staff_stroke(),
+                    );
+                }
+                painter.text(
+                    Pos2::new(left - 26.0, staff_y + 14.0),
+                    Align2::CENTER_CENTER,
+                    if clef == Clef::Bass { "F" } else { "G" },
+                    FontId::proportional(28.0),
+                    self.theme.notation_foreground,
+                );
+                // Guitars and basses sound an octave below the written pitch.
+                painter.text(
+                    Pos2::new(left - 26.0, staff_y + 33.0),
+                    Align2::CENTER_CENTER,
+                    "8",
+                    FontId::proportional(10.0),
+                    self.theme.notation_foreground,
                 );
             }
             for string in 0..track.tuning.len() {
-                let y = tab_y + string as f32 * 9.0;
+                let y = tab_y + string as f32 * SystemMetrics::STRING_GAP;
                 painter.line_segment(
                     [Pos2::new(left, y), Pos2::new(system_right, y)],
                     self.theme.staff_stroke(),
                 );
             }
-            painter.text(
-                Pos2::new(left - 26.0, staff_y + 14.0),
-                Align2::CENTER_CENTER,
-                "G",
-                FontId::proportional(28.0),
-                self.theme.notation_foreground,
-            );
 
-            self.paint_tempo_labels(painter, left, staff_y, system_origin_tick, system_ticks);
+            // Tempo labels clear the tallest stems above the staff.
+            let label_baseline = if self.show_classic_notation {
+                top + 20.0
+            } else {
+                tab_y
+            };
+            self.paint_tempo_labels(painter, left, label_baseline, system);
 
-            for &(bar_start, _bar_end) in &system.bars {
-                let x = left + (bar_start - system_origin_tick) as f32 * self.pixels_per_tick;
+            let signature_y = if self.show_classic_notation {
+                staff_y + 14.0
+            } else {
+                tab_y + metrics.tab_span() * 0.5
+            };
+            for (bar_index, &(bar_start, _bar_end)) in system.bars.iter().enumerate() {
+                let x = left + system.bar_x(bar_index, self.pixels_per_tick);
                 painter.line_segment(
-                    [Pos2::new(x, staff_y), Pos2::new(x, tab_y + 48.0)],
+                    [Pos2::new(x, system_top), Pos2::new(x, tab_bottom + 3.0)],
                     self.theme.bar_stroke(),
                 );
                 // Only label a bar where the signature actually *changes*
-                // (or the very first bar of the piece) — not every bar that
+                // (or the very first bar of the piece) - not every bar that
                 // happens to share the current signature.
                 let sig = track.signature_at(bar_start);
-                let is_change = bar_start == 0 || track.signature_at(bar_start - 1) != sig;
-                if is_change {
+                if signature_label_at(track, bar_start) {
+                    // Brick view has no spare room after the barline (a note
+                    // may start right on it), so the opening signature goes
+                    // in front of the staff.
+                    let label_x = if bar_index == 0 && !system.has_beat_layout() {
+                        x - 12.0
+                    } else {
+                        x + 6.0
+                    };
                     painter.text(
-                        Pos2::new(x + 6.0, staff_y + 14.0),
+                        Pos2::new(label_x, signature_y),
                         Align2::LEFT_CENTER,
                         format!("{}\n{}", sig.numerator, sig.denominator),
                         FontId::monospace(14.0),
@@ -3306,82 +3938,587 @@ impl BetterWriterApp {
             // Closing wall at the end of the last bar in this row.
             painter.line_segment(
                 [
-                    Pos2::new(system_right, staff_y),
-                    Pos2::new(system_right, tab_y + 48.0),
+                    Pos2::new(system_right, system_top),
+                    Pos2::new(system_right, tab_bottom + 3.0),
                 ],
                 self.theme.bar_stroke(),
             );
 
-            self.paint_cursor_cell(painter, left, tab_y, system_origin_tick, system_ticks);
+            self.paint_cursor_cell(painter, left, tab_y, system);
 
-            let system_end_tick = system_origin_tick + system_ticks;
-
-            // Continuation fragments first: notes whose onset was in an
-            // earlier system/row but that still sustain into this one (this
-            // app's stand-in for a tied note, until real ties exist — see
-            // Plan.md). Drawn with no left border so they read as a
-            // seamless continuation rather than a new note.
-            for note in track.notes.iter().filter(|note| {
-                note.abs_tick < system_origin_tick
-                    && note.abs_tick + note.duration_ticks > system_origin_tick
-            }) {
-                let fragment_end = (note.abs_tick + note.duration_ticks).min(system_end_tick);
-                self.paint_note_fragment(
-                    painter,
-                    left,
-                    staff_y,
-                    tab_y,
-                    system_origin_tick,
-                    system_right,
-                    note,
-                    system_origin_tick,
-                    fragment_end,
-                    false,
-                );
+            if self.show_classic_notation {
+                self.paint_classic_notation(painter, track, clef, system, left, staff_y);
             }
 
-            // Starting fragments: notes whose onset falls in this system. If
-            // a note's duration reaches past this row's right wall, only the
-            // portion up to the wall is drawn here (no right border, since
-            // it continues as a continuation fragment in a later system).
-            for note in track.notes.iter().filter(|note| {
-                note.abs_tick >= system_origin_tick && note.abs_tick < system_end_tick
-            }) {
-                let fragment_end = (note.abs_tick + note.duration_ticks).min(system_end_tick);
-                self.paint_note_fragment(
-                    painter,
-                    left,
-                    staff_y,
-                    tab_y,
-                    system_origin_tick,
-                    system_right,
-                    note,
-                    note.abs_tick,
-                    fragment_end,
-                    true,
-                );
+            let system_origin_tick = system.start_tick;
+            match self.view_mode {
+                EditorViewMode::Bricks => {
+                    // Continuation fragments first: bricks whose onset was
+                    // in an earlier row but that still sustain into this
+                    // one. Drawn with no left border so they read as one
+                    // seamless block rather than a new note.
+                    for note in track.notes.iter().filter(|note| {
+                        note.abs_tick < system_origin_tick
+                            && note.abs_tick + note.duration_ticks > system_origin_tick
+                    }) {
+                        let fragment_end =
+                            (note.abs_tick + note.duration_ticks).min(system_end_tick);
+                        self.paint_note_fragment(
+                            painter,
+                            left,
+                            tab_y,
+                            system_origin_tick,
+                            system_right,
+                            note,
+                            system_origin_tick,
+                            fragment_end,
+                            false,
+                        );
+                    }
+
+                    // Starting fragments: notes whose onset falls in this
+                    // row. A brick reaching past the row's right wall is
+                    // drawn only up to the wall (no right border, since it
+                    // continues as a continuation fragment in a later row).
+                    for note in track.notes.iter().filter(|note| {
+                        note.abs_tick >= system_origin_tick && note.abs_tick < system_end_tick
+                    }) {
+                        let fragment_end =
+                            (note.abs_tick + note.duration_ticks).min(system_end_tick);
+                        self.paint_note_fragment(
+                            painter,
+                            left,
+                            tab_y,
+                            system_origin_tick,
+                            system_right,
+                            note,
+                            note.abs_tick,
+                            fragment_end,
+                            true,
+                        );
+                    }
+                }
+                EditorViewMode::TabNumbers => {
+                    for note in track.notes.iter().filter(|note| {
+                        note.abs_tick >= system_origin_tick && note.abs_tick < system_end_tick
+                    }) {
+                        self.paint_tab_number(painter, track, left, tab_y, system, note);
+                    }
+                }
             }
-            for rest in self
-                .project
-                .tail_padding_rests(track.id, system_origin_tick)
-                .into_iter()
-                .filter(|rest| {
-                    rest.abs_tick >= system_origin_tick
-                        && rest.abs_tick < system_origin_tick + system_ticks
-                })
-            {
-                let x = left + (rest.abs_tick - system_origin_tick) as f32 * self.pixels_per_tick;
-                painter.line_segment(
-                    [
-                        Pos2::new(x, tab_y + 62.0),
-                        Pos2::new(x + 14.0, tab_y + 62.0),
-                    ],
-                    Stroke::new(2.0, self.theme.rest_color),
-                );
+
+            // Rests: every gap in tab view, only the end of each bar in
+            // brick view (where a gap between bricks is simply empty).
+            for (bar_index, &(bar_start, bar_end)) in system.bars.iter().enumerate() {
+                match self.view_mode {
+                    EditorViewMode::Bricks => {
+                        for rest in self.project.tail_padding_rests(track.id, bar_start) {
+                            let x = left + system.x_of(rest.abs_tick, self.pixels_per_tick);
+                            let y = tab_bottom + 17.0;
+                            painter.line_segment(
+                                [Pos2::new(x, y), Pos2::new(x + 14.0, y)],
+                                Stroke::new(2.0, self.theme.rest_color),
+                            );
+                        }
+                    }
+                    EditorViewMode::TabNumbers => {
+                        for rest in
+                            self.project
+                                .bar_rests(track.id, bar_start, self.tab_rest_fill())
+                        {
+                            let (cx, value) =
+                                self.rest_anchor(system, left, bar_index, bar_end, &rest);
+                            paint_rest_symbol(
+                                painter,
+                                cx,
+                                tab_y + metrics.tab_span() * 0.5,
+                                value,
+                                self.theme.rest_color,
+                            );
+                        }
+                    }
+                }
             }
         }
 
         page
+    }
+
+    /// Where to draw a rest and which note value its glyph shows. A rest
+    /// covering a whole bar is a whole rest centered in the bar, whatever
+    /// the bar's length.
+    fn rest_anchor(
+        &self,
+        system: &StaffSystem,
+        left: f32,
+        bar_index: usize,
+        bar_end: Tick,
+        rest: &crate::core::project::RestNode,
+    ) -> (f32, notation::NoteValue) {
+        let bar_start = system.bars.get(bar_index).map(|bar| bar.0).unwrap_or(0);
+        if rest.abs_tick == bar_start && rest.abs_tick + rest.duration_ticks == bar_end {
+            let x0 = left + system.bar_x(bar_index, self.pixels_per_tick);
+            let x1 = match system.beat_bars.get(bar_index) {
+                Some(bar) => left + bar.x + bar.width,
+                None => left + system.x_of(bar_end, self.pixels_per_tick),
+            };
+            return ((x0 + x1) * 0.5, notation::NoteValue { value: 1, dots: 0 });
+        }
+        (
+            self.content_x(system, left, rest.abs_tick),
+            notation::note_value_for(rest.duration_ticks),
+        )
+    }
+
+    fn system_metrics(&self, track: &InstrumentTrack) -> SystemMetrics {
+        SystemMetrics::new(self.show_classic_notation, track.tuning.len())
+    }
+
+    /// Distance from the first to the last tab string of the selected track.
+    fn selected_string_span(&self) -> f32 {
+        self.project
+            .track(self.selected_track_id)
+            .map(|track| self.system_metrics(track).tab_span())
+            .unwrap_or(0.0)
+    }
+
+    fn is_note_selected(&self, note_id: u64) -> bool {
+        self.selected_note_id == Some(note_id) || self.area_selected_note_ids.contains(&note_id)
+    }
+
+    /// Canvas x of the center of whatever is drawn at `tick`: the beat's
+    /// column in tab view, or the onset plus a small offset in brick view
+    /// (so a number at tick 0 clears the barline).
+    fn content_x(&self, system: &StaffSystem, left: f32, tick: Tick) -> f32 {
+        let offset = if system.has_beat_layout() {
+            0.0
+        } else {
+            TAB_NUMBER_CENTER_OFFSET
+        };
+        left + system.x_of(tick, self.pixels_per_tick) + offset
+    }
+
+    /// Draws the notes and rests of every bar in `system` on the classic
+    /// staff: heads by real pitch and duration, ledger lines, accidentals,
+    /// dots, stems, flags, beams and ties.
+    fn paint_classic_notation(
+        &self,
+        painter: &egui::Painter,
+        track: &InstrumentTrack,
+        clef: Clef,
+        system: &StaffSystem,
+        left: f32,
+        staff_y: f32,
+    ) {
+        use notation::{Accidental, ScoreItem};
+
+        const STEM_LENGTH: f32 = 24.0;
+        let step_px = SystemMetrics::STAFF_LINE_GAP / 2.0;
+        let bottom_y = staff_y + SystemMetrics::STAFF_HEIGHT;
+        let y_of = |step: i32| bottom_y - step as f32 * step_px;
+        let ink = self.theme.notation_foreground;
+        let thin = Stroke::new(1.0_f32, ink);
+        let stem_stroke = Stroke::new(1.2_f32, ink);
+
+        // Head centers by note id, for drawing ties afterwards.
+        let mut head_spots: std::collections::HashMap<u64, (f32, f32, bool)> =
+            std::collections::HashMap::new();
+        let mut ties: Vec<(u64, u64)> = Vec::new();
+
+        for (bar_index, &(bar_start, bar_end)) in system.bars.iter().enumerate() {
+            let signature = track.signature_at(bar_start);
+            let rests = self
+                .project
+                .bar_rests(track.id, bar_start, self.tab_rest_fill());
+            let score = notation::score_bar(
+                track,
+                clef,
+                bar_start,
+                bar_end,
+                &rests,
+                notation::beat_ticks_for(signature.numerator as u32, signature.denominator as u32),
+            );
+
+            // Flat beam tip for each beamed chord: far enough from the
+            // outermost head of the group.
+            let mut beam_tips: std::collections::HashMap<usize, f32> =
+                std::collections::HashMap::new();
+            for group in &score.beams {
+                let mut tip = if group.stem_up { f32::MAX } else { f32::MIN };
+                for &position in &group.items {
+                    if let ScoreItem::Chord(chord) = &score.items[position] {
+                        if group.stem_up {
+                            tip = tip.min(y_of(chord.highest_step()) - STEM_LENGTH);
+                        } else {
+                            tip = tip.max(y_of(chord.lowest_step()) + STEM_LENGTH);
+                        }
+                    }
+                }
+                // A stem always reaches at least the middle line.
+                tip = if group.stem_up {
+                    tip.min(y_of(4))
+                } else {
+                    tip.max(y_of(4))
+                };
+                for &position in &group.items {
+                    beam_tips.insert(position, tip);
+                }
+            }
+
+            let mut stem_xs: std::collections::HashMap<usize, f32> =
+                std::collections::HashMap::new();
+
+            for (position, item) in score.items.iter().enumerate() {
+                match item {
+                    ScoreItem::Rest { tick, value } => {
+                        let rest = crate::core::project::RestNode {
+                            abs_tick: *tick,
+                            duration_ticks: 0,
+                        };
+                        let whole_bar = rests.iter().any(|candidate| {
+                            candidate.abs_tick == *tick
+                                && candidate.abs_tick == bar_start
+                                && candidate.abs_tick + candidate.duration_ticks == bar_end
+                        });
+                        let (cx, glyph) = if whole_bar {
+                            self.rest_anchor(
+                                system,
+                                left,
+                                bar_index,
+                                bar_end,
+                                &crate::core::project::RestNode {
+                                    abs_tick: bar_start,
+                                    duration_ticks: bar_end - bar_start,
+                                },
+                            )
+                        } else {
+                            (self.content_x(system, left, rest.abs_tick), *value)
+                        };
+                        let reference = match glyph.value {
+                            1 => y_of(6),
+                            _ => y_of(4),
+                        };
+                        paint_rest_symbol(painter, cx, reference, glyph, self.theme.rest_color);
+                    }
+                    ScoreItem::Chord(chord) => {
+                        let cx = self.content_x(system, left, chord.tick);
+                        let mut heads = chord.heads.clone();
+                        heads.sort_by_key(|head| head.step);
+
+                        // Heads a second apart would overlap: the upper
+                        // one moves to the other side of the stem.
+                        let mut displaced = vec![false; heads.len()];
+                        for index in 1..heads.len() {
+                            if heads[index].step - heads[index - 1].step == 1
+                                && !displaced[index - 1]
+                            {
+                                displaced[index] = true;
+                            }
+                        }
+                        let side = if chord.stem_up { 1.0 } else { -1.0 };
+
+                        // Accidentals sit left of the heads, stepping
+                        // further left when two would collide.
+                        let mut accidental_column = 0;
+                        let mut last_accidental_step = i32::MIN;
+                        for head in heads.iter().rev() {
+                            if let Some(accidental) = head.accidental {
+                                if last_accidental_step != i32::MIN
+                                    && last_accidental_step - head.step < 5
+                                {
+                                    accidental_column += 1;
+                                } else {
+                                    accidental_column = 0;
+                                }
+                                last_accidental_step = head.step;
+                                let ax = cx - 10.0 - accidental_column as f32 * 7.0;
+                                paint_accidental(
+                                    painter,
+                                    ax,
+                                    y_of(head.step),
+                                    accidental == Accidental::Sharp,
+                                    ink,
+                                );
+                            }
+                        }
+
+                        for (head, &moved) in heads.iter().zip(&displaced) {
+                            let hx = cx + if moved { side * 8.4 } else { 0.0 };
+                            let hy = y_of(head.step);
+                            let selected = self.is_note_selected(head.note_id);
+                            let color = if selected {
+                                self.theme.accent_color
+                            } else {
+                                ink
+                            };
+
+                            // Ledger lines below and above the staff.
+                            let ledger = |step: i32| {
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(hx - 7.5, y_of(step)),
+                                        Pos2::new(hx + 7.5, y_of(step)),
+                                    ],
+                                    thin,
+                                );
+                            };
+                            if head.step < 0 {
+                                let mut step = -2;
+                                while step >= head.step {
+                                    ledger(step);
+                                    step -= 2;
+                                }
+                            } else if head.step > 8 {
+                                let mut step = 10;
+                                while step <= head.step {
+                                    ledger(step);
+                                    step += 2;
+                                }
+                            }
+
+                            if chord.value.value == 1 {
+                                painter.add(egui::epaint::EllipseShape::stroke(
+                                    Pos2::new(hx, hy),
+                                    Vec2::new(5.4, 3.5),
+                                    Stroke::new(1.4_f32, color),
+                                ));
+                            } else if chord.value.filled_head() {
+                                painter.add(egui::epaint::EllipseShape::filled(
+                                    Pos2::new(hx, hy),
+                                    Vec2::new(4.6, 3.4),
+                                    color,
+                                ));
+                            } else {
+                                painter.add(egui::epaint::EllipseShape::stroke(
+                                    Pos2::new(hx, hy),
+                                    Vec2::new(4.3, 3.1),
+                                    Stroke::new(1.3_f32, color),
+                                ));
+                            }
+                            head_spots.insert(head.note_id, (hx, hy, chord.stem_up));
+                        }
+
+                        // Augmentation dots go in the space to the right of
+                        // the heads, nudged off a line.
+                        for head in &heads {
+                            for dot in 0..chord.value.dots {
+                                let dy = if head.step % 2 == 0 { -step_px } else { 0.0 };
+                                painter.circle_filled(
+                                    Pos2::new(
+                                        cx + 9.5
+                                            + dot as f32 * 4.0
+                                            + if displaced.iter().any(|d| *d) && chord.stem_up {
+                                                8.4
+                                            } else {
+                                                0.0
+                                            },
+                                        y_of(head.step) + dy,
+                                    ),
+                                    1.3,
+                                    ink,
+                                );
+                            }
+                        }
+
+                        if chord.value.has_stem() {
+                            let stem_x = if chord.stem_up { cx + 4.4 } else { cx - 4.4 };
+                            stem_xs.insert(position, stem_x);
+                            let tip = beam_tips.get(&position).copied().unwrap_or_else(|| {
+                                if chord.stem_up {
+                                    (y_of(chord.highest_step()) - STEM_LENGTH).min(y_of(4))
+                                } else {
+                                    (y_of(chord.lowest_step()) + STEM_LENGTH).max(y_of(4))
+                                }
+                            });
+                            let base = if chord.stem_up {
+                                y_of(chord.lowest_step())
+                            } else {
+                                y_of(chord.highest_step())
+                            };
+                            painter.line_segment(
+                                [Pos2::new(stem_x, base), Pos2::new(stem_x, tip)],
+                                stem_stroke,
+                            );
+
+                            // Unbeamed flagged notes get flags on the stem.
+                            if chord.value.flags() > 0 && !beam_tips.contains_key(&position) {
+                                for flag in 0..chord.value.flags() {
+                                    let dy = flag as f32 * 5.0;
+                                    let (y0, y1, y2) = if chord.stem_up {
+                                        (tip + dy, tip + dy + 5.0, tip + dy + 11.0)
+                                    } else {
+                                        (tip - dy, tip - dy - 5.0, tip - dy - 11.0)
+                                    };
+                                    painter.add(egui::Shape::line(
+                                        vec![
+                                            Pos2::new(stem_x, y0),
+                                            Pos2::new(stem_x + 4.0, y1),
+                                            Pos2::new(stem_x + 6.0, y2),
+                                        ],
+                                        Stroke::new(1.5_f32, ink),
+                                    ));
+                                }
+                            }
+                        }
+
+                        for note in track.notes.iter().filter(|note| {
+                            note.abs_tick == chord.tick && track.is_tied_continuation(note)
+                        }) {
+                            if let Some(previous) = track.tie_predecessor(note) {
+                                ties.push((previous.id, note.id));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Beams: one thick bar per flag level across each group, with a
+            // short stub where a single note has more flags than its
+            // neighbors.
+            for group in &score.beams {
+                let Some(&tip) = beam_tips.get(&group.items[0]) else {
+                    continue;
+                };
+                let levels = group
+                    .items
+                    .iter()
+                    .filter_map(|position| match &score.items[*position] {
+                        ScoreItem::Chord(chord) => Some(chord.value.flags()),
+                        ScoreItem::Rest { .. } => None,
+                    })
+                    .max()
+                    .unwrap_or(1);
+                let direction = if group.stem_up { 1.0 } else { -1.0 };
+                for level in 1..=levels {
+                    let y = tip + direction * (level - 1) as f32 * 4.6;
+                    let mut run_start: Option<usize> = None;
+                    let flags_at = |index: usize| match &score.items[group.items[index]] {
+                        ScoreItem::Chord(chord) => chord.value.flags(),
+                        ScoreItem::Rest { .. } => 0,
+                    };
+                    let mut runs: Vec<(usize, usize)> = Vec::new();
+                    for index in 0..group.items.len() {
+                        if flags_at(index) >= level {
+                            run_start.get_or_insert(index);
+                        } else if let Some(start) = run_start.take() {
+                            runs.push((start, index - 1));
+                        }
+                    }
+                    if let Some(start) = run_start {
+                        runs.push((start, group.items.len() - 1));
+                    }
+                    for (first, last) in runs {
+                        let x0 = stem_xs[&group.items[first]];
+                        let mut x1 = stem_xs[&group.items[last]];
+                        let mut x0 = x0;
+                        if first == last {
+                            // Stub toward the neighbor.
+                            if last + 1 < group.items.len() {
+                                x1 = x0 + 7.0;
+                            } else {
+                                x0 -= 7.0;
+                            }
+                        }
+                        painter.line_segment(
+                            [Pos2::new(x0, y), Pos2::new(x1, y)],
+                            Stroke::new(2.8_f32, ink),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (from_id, to_id) in ties {
+            let Some(&(x1, y1, stem_up)) = head_spots.get(&to_id) else {
+                continue;
+            };
+            let below = stem_up;
+            let start = match head_spots.get(&from_id) {
+                Some(&(x0, y0, _)) => Pos2::new(x0 + 5.0, y0 + if below { 4.0 } else { -4.0 }),
+                None => Pos2::new(x1 - 16.0, y1 + if below { 4.0 } else { -4.0 }),
+            };
+            paint_tie_arc(
+                painter,
+                start,
+                Pos2::new(x1 - 5.0, y1 + if below { 4.0 } else { -4.0 }),
+                ink,
+                !below,
+            );
+        }
+    }
+
+    /// Draws a note as a bare fret number on its string (tab view). A tied
+    /// continuation is written "(fret)" with a tie arc back to the note it
+    /// continues; when that note sits in an earlier row the arc starts at
+    /// the left edge of this one.
+    fn paint_tab_number(
+        &self,
+        painter: &egui::Painter,
+        track: &InstrumentTrack,
+        left: f32,
+        tab_y: f32,
+        system: &StaffSystem,
+        note: &crate::core::project::TabNote,
+    ) {
+        let x = self.content_x(system, left, note.abs_tick);
+        let y = tab_y + note.string_index as f32 * SystemMetrics::STRING_GAP;
+        let selected = self.is_note_selected(note.id);
+        let predecessor = track.tie_predecessor(note);
+
+        let text_color = if selected {
+            self.theme.accent_color
+        } else {
+            self.theme.notation_foreground
+        };
+        let label = if predecessor.is_some() {
+            format!("({})", note.fret)
+        } else {
+            note.fret.to_string()
+        };
+        let galley = painter.layout_no_wrap(label, FontId::monospace(11.0), text_color);
+        let rect = Rect::from_center_size(Pos2::new(x, y), galley.size());
+        // The backing patch keeps the string line from striking through the
+        // number.
+        let backing = rect.expand2(Vec2::new(1.5, 0.0));
+        painter.rect_filled(backing, 1.0, self.theme.sheet_background);
+        if selected {
+            let [r, g, b, _] = self.theme.accent_color.to_array();
+            painter.rect_filled(
+                backing,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(r, g, b, 50),
+            );
+        }
+        painter.galley(rect.min, galley, text_color);
+        if note.effects.palm_mute && predecessor.is_none() {
+            painter.text(
+                Pos2::new(x - 6.0, tab_y + self.selected_string_span() + 13.0),
+                Align2::LEFT_TOP,
+                "P.M.",
+                FontId::monospace(8.0),
+                self.theme.muted_foreground,
+            );
+        }
+
+        let Some(previous) = predecessor else {
+            return;
+        };
+        let previous_in_row = previous.abs_tick >= system.start_tick;
+        let previous_x = self.content_x(system, left, previous.abs_tick);
+        let tie_end = backing.left() - 1.0;
+        let tie_start = if previous_in_row {
+            previous_x + 8.0
+        } else {
+            left - 2.0
+        }
+        .min(tie_end - 6.0);
+        paint_tie_arc(
+            painter,
+            Pos2::new(tie_start, y - 6.0),
+            Pos2::new(tie_end, y - 6.0),
+            self.theme.notation_foreground,
+            true,
+        );
     }
 
     /// Draws one visual slice of a note. A note whose duration reaches past
@@ -3397,7 +4534,6 @@ impl BetterWriterApp {
         &self,
         painter: &egui::Painter,
         left: f32,
-        staff_y: f32,
         tab_y: f32,
         system_origin_tick: Tick,
         system_right: f32,
@@ -3409,34 +4545,13 @@ impl BetterWriterApp {
         let note_end = note.abs_tick + note.duration_ticks;
         let x = left + (fragment_start - system_origin_tick) as f32 * self.pixels_per_tick;
         let tab_line_y = tab_y + note.string_index as f32 * 9.0;
-        let selected = self.selected_note_id == Some(note.id)
-            || self.area_selected_note_ids.contains(&note.id);
-
-        if is_onset {
-            let staff_note_y = staff_y + 28.0 - (note.fret as f32 % 12.0) * 1.7;
-            painter.circle_filled(
-                Pos2::new(x + 8.0, staff_note_y),
-                4.2,
-                if selected {
-                    self.theme.accent_color
-                } else {
-                    self.theme.notation_foreground
-                },
-            );
-            painter.line_segment(
-                [
-                    Pos2::new(x + 13.0, staff_note_y),
-                    Pos2::new(x + 13.0, staff_note_y - 24.0),
-                ],
-                Stroke::new(1.4, self.theme.notation_foreground),
-            );
-        }
+        let selected = self.is_note_selected(note.id);
 
         // Fragment width is strictly proportional to however much of the
         // note's duration falls in this row. The onset fragment is floored
         // wide enough to keep the fret digit legible (two-digit frets need a
         // touch more room); continuation fragments carry no digit, so no
-        // floor is needed. Either way it's capped at the row's right wall —
+        // floor is needed. Either way it's capped at the row's right wall -
         // never poking past it, even in a cramped corner case.
         let proportional = (fragment_end - fragment_start).max(0) as f32 * self.pixels_per_tick;
         let min_for_digits = if !is_onset {
@@ -3473,6 +4588,23 @@ impl BetterWriterApp {
             fragment_end < note_end,
         );
 
+        // A user-tied brick stays a separate block; an arc over the seam
+        // shows it sounds as a continuation of the brick before it.
+        if is_onset
+            && self
+                .project
+                .track(self.selected_track_id)
+                .is_some_and(|track| track.is_tied_continuation(note))
+        {
+            paint_tie_arc(
+                painter,
+                Pos2::new(x - 8.0, tab_line_y - 8.0),
+                Pos2::new(x + 8.0, tab_line_y - 8.0),
+                self.theme.notation_foreground,
+                true,
+            );
+        }
+
         if is_onset {
             // Shrink the font for cramped bricks so the number still fits.
             let font_size = if width < 11.0 { 7.0 } else { 9.0 };
@@ -3489,7 +4621,7 @@ impl BetterWriterApp {
             );
             if note.effects.palm_mute {
                 painter.text(
-                    Pos2::new(x + 2.0, tab_y + 58.0),
+                    Pos2::new(x + 2.0, tab_y + self.selected_string_span() + 13.0),
                     Align2::LEFT_TOP,
                     "P.M.",
                     FontId::monospace(8.0),
@@ -3507,23 +4639,30 @@ impl BetterWriterApp {
         painter: &egui::Painter,
         left: f32,
         tab_y: f32,
-        system_origin_tick: Tick,
-        system_ticks: Tick,
+        system: &StaffSystem,
     ) {
+        let system_origin_tick = system.start_tick;
         // Only render if the cursor is inside this system's tick window.
         if self.cursor.tick < system_origin_tick
-            || self.cursor.tick >= system_origin_tick + system_ticks
+            || self.cursor.tick >= system_origin_tick + system.tick_span()
         {
             return;
         }
         let string_gap = 9.0;
-        // Mirror the note-brick sizing: the cursor preview should show exactly
-        // the width of the brick that will land there, so a 1/32 cursor looks
-        // narrower than a 1/16 cursor. Keep a small floor so the caret box
-        // stays visible/targetable even at the shortest durations.
-        let proportional = self.selected_duration.ticks() as f32 * self.pixels_per_tick;
-        let cell_width = proportional.max(7.0);
-        let x = left + (self.cursor.tick - system_origin_tick) as f32 * self.pixels_per_tick;
+        // Brick view mirrors the brick that will land there: the cursor box
+        // is as wide as the selected duration, with a small floor so it
+        // stays visible at the shortest durations. Tab view marks the beat
+        // with a compact box around the fret position instead.
+        let cell_width = if system.has_beat_layout() {
+            TAB_CURSOR_WIDTH
+        } else {
+            (self.selected_duration.ticks() as f32 * self.pixels_per_tick).max(7.0)
+        };
+        let x = if system.has_beat_layout() {
+            self.content_x(system, left, self.cursor.tick) - cell_width * 0.5
+        } else {
+            left + system.x_of(self.cursor.tick, self.pixels_per_tick)
+        };
         let y = tab_y + self.cursor.string_index as f32 * string_gap;
 
         // Translucent accent fill derived from the theme's accent color so the
@@ -3579,8 +4718,8 @@ impl BetterWriterApp {
         }
     }
 
-    /// Finds the note (if any) whose visible fragment — onset or
-    /// continuation, in whichever row `pos` falls in — contains `pos`.
+    /// Finds the note (if any) whose visible fragment - onset or
+    /// continuation, in whichever row `pos` falls in - contains `pos`.
     /// Shared by click-to-select and drag-start (which uses it to decide
     /// whether a drag begins a rubber-band area-selection or just grabs an
     /// existing note).
@@ -3593,36 +4732,64 @@ impl BetterWriterApp {
         let right = page.right() - 18.0;
         let available_width = (right - left).max(40.0);
         let systems = self.layout_staff_systems(track, available_width);
-        let system_height = 168.0;
+        let metrics = self.system_metrics(track);
         let first_top = page.top() + 56.0;
-        let system_index = (((pos.y - first_top) / system_height).floor().max(0.0) as usize)
+        let system_index = (((pos.y - first_top) / metrics.height).floor().max(0.0) as usize)
             .min(systems.len().saturating_sub(1));
         let system = systems.get(system_index)?;
-        let system_origin_tick = system.start_tick;
-        let system_end_tick = system_origin_tick + system.tick_span();
-        let tab_y = first_top + system_index as f32 * system_height + 82.0;
-        let string_gap = 9.0;
+        let tab_y = first_top + system_index as f32 * metrics.height + metrics.tab_offset;
 
-        // A note's *onset* (abs_tick falls in this system) as well as a
-        // *continuation* fragment (the note started in an earlier row but
-        // still sustains into this one; see `paint_note_fragment`) both
-        // count as hits — without the continuation case, clicking the
-        // "teleported" half of a split note wouldn't select it, letting a
-        // new note get typed right on top of it instead of onto empty space.
+        // Both a note's onset and a brick's continuation into this row (see
+        // `paint_note_fragment`) are hits. If continuations weren't, a click
+        // on the carried-over part would miss the note and a new one could
+        // be typed on top of it.
         track.notes.iter().find_map(|note| {
-            let note_end = note.abs_tick + note.duration_ticks;
-            if note_end <= system_origin_tick || note.abs_tick >= system_end_tick {
-                return None;
-            }
-            let fragment_start = note.abs_tick.max(system_origin_tick);
-            let fragment_end = note_end.min(system_end_tick);
-            let x = left + (fragment_start - system_origin_tick) as f32 * self.pixels_per_tick;
-            let width = ((fragment_end - fragment_start) as f32 * self.pixels_per_tick).max(22.0);
-            let y = tab_y + note.string_index as f32 * string_gap;
-            let rect =
-                Rect::from_center_size(Pos2::new(x + width * 0.5, y), Vec2::new(width, 14.0));
+            let rect = self.note_hit_rect(note, system, left, tab_y)?;
             rect.contains(pos).then_some(note.id)
         })
+    }
+
+    /// The clickable area of `note`'s visible piece in the system spanning
+    /// `[system_origin_tick, system_end_tick)`, or `None` if it has no piece
+    /// there. In brick view that's the brick's fragment; in tab view it's
+    /// the small box around the fret number at the note's onset.
+    fn note_hit_rect(
+        &self,
+        note: &crate::core::project::TabNote,
+        system: &StaffSystem,
+        left: f32,
+        tab_y: f32,
+    ) -> Option<Rect> {
+        let system_origin_tick = system.start_tick;
+        let system_end_tick = system_origin_tick + system.tick_span();
+        let note_end = note.end_tick();
+        if note_end <= system_origin_tick || note.abs_tick >= system_end_tick {
+            return None;
+        }
+        let y = tab_y + note.string_index as f32 * SystemMetrics::STRING_GAP;
+        match self.view_mode {
+            EditorViewMode::Bricks => {
+                let fragment_start = note.abs_tick.max(system_origin_tick);
+                let fragment_end = note_end.min(system_end_tick);
+                let x = left + system.x_of(fragment_start, self.pixels_per_tick);
+                let width =
+                    ((fragment_end - fragment_start) as f32 * self.pixels_per_tick).max(22.0);
+                Some(Rect::from_center_size(
+                    Pos2::new(x + width * 0.5, y),
+                    Vec2::new(width, 14.0),
+                ))
+            }
+            EditorViewMode::TabNumbers => {
+                if note.abs_tick < system_origin_tick {
+                    return None;
+                }
+                let x = self.content_x(system, left, note.abs_tick);
+                Some(Rect::from_center_size(
+                    Pos2::new(x, y),
+                    Vec2::new(18.0, 14.0),
+                ))
+            }
+        }
     }
 
     /// Every note on the selected track with a fragment (onset or
@@ -3636,33 +4803,21 @@ impl BetterWriterApp {
         let right = page.right() - 18.0;
         let available_width = (right - left).max(40.0);
         let systems = self.layout_staff_systems(track, available_width);
-        let system_height = 168.0;
+        let metrics = self.system_metrics(track);
         let first_top = page.top() + 56.0;
-        let string_gap = 9.0;
 
         let mut hits = Vec::new();
         for (system_index, system) in systems.iter().enumerate() {
-            let top = first_top + system_index as f32 * system_height;
-            if top + 136.0 > page.bottom() {
+            let top = first_top + system_index as f32 * metrics.height;
+            if top + metrics.height - 32.0 > page.bottom() {
                 break;
             }
-            let tab_y = top + 82.0;
-            let system_origin_tick = system.start_tick;
-            let system_end_tick = system_origin_tick + system.tick_span();
+            let tab_y = top + metrics.tab_offset;
 
             for note in &track.notes {
-                let note_end = note.abs_tick + note.duration_ticks;
-                if note_end <= system_origin_tick || note.abs_tick >= system_end_tick {
+                let Some(note_rect) = self.note_hit_rect(note, system, left, tab_y) else {
                     continue;
-                }
-                let fragment_start = note.abs_tick.max(system_origin_tick);
-                let fragment_end = note_end.min(system_end_tick);
-                let x = left + (fragment_start - system_origin_tick) as f32 * self.pixels_per_tick;
-                let width =
-                    ((fragment_end - fragment_start) as f32 * self.pixels_per_tick).max(22.0);
-                let y = tab_y + note.string_index as f32 * string_gap;
-                let note_rect =
-                    Rect::from_center_size(Pos2::new(x + width * 0.5, y), Vec2::new(width, 14.0));
+                };
                 if selection_rect.intersects(note_rect) && !hits.contains(&note.id) {
                     hits.push(note.id);
                 }
@@ -3719,16 +4874,20 @@ impl BetterWriterApp {
     /// If `pos` is near the true left or right edge of the currently
     /// *selected* note (within a few pixels, in whichever row that edge
     /// falls in), returns which edge. Only a note's actual start/end tick
-    /// count as a grabbable edge — not the open side of a continuation
+    /// count as a grabbable edge - not the open side of a continuation
     /// fragment where it merely wraps into a new row (see
     /// `paint_note_fragment`); there's no real boundary there to drag.
     ///
     /// Checks every note in the current selection (single click-select or
     /// multi area-select, whichever is active) and returns the first one
-    /// whose edge `pos` is near, along with which edge — grabbing *any*
+    /// whose edge `pos` is near, along with which edge - grabbing *any*
     /// selected note's edge is enough to start stretching the whole
     /// selection together (see `begin_canvas_drag`).
     fn stretch_edge_at(&self, pos: Pos2, page: Rect) -> Option<(u64, StretchEdge)> {
+        // Fret numbers have no edges to grab.
+        if self.view_mode == EditorViewMode::TabNumbers {
+            return None;
+        }
         // Generous on purpose: this is also what decides where the resize
         // cursor icon shows up, so the hit area should feel at least as big
         // as the visible resize-cursor region, not just a couple of pixels
@@ -3749,7 +4908,7 @@ impl BetterWriterApp {
         let right = page.right() - 18.0;
         let available_width = (right - left).max(40.0);
         let systems = self.layout_staff_systems(track, available_width);
-        let system_height = 168.0;
+        let system_height = self.system_metrics(track).height;
         let first_top = page.top() + 56.0;
         let system_index = (((pos.y - first_top) / system_height).floor().max(0.0) as usize)
             .min(systems.len().saturating_sub(1));
@@ -3801,14 +4960,14 @@ impl BetterWriterApp {
         let anchor_raw_tick = anchor_original_tick as f64 + raw_delta_ticks;
 
         // Snapping is relative to the *bar* the grabbed note started in,
-        // not the project's tick 0 — dragging within a bar should feel
+        // not the project's tick 0 - dragging within a bar should feel
         // anchored to that bar's own grid.
         let (bar_start, _) = track.measure_bounds_at(anchor_original_tick);
         let grid = self.drag_step_ticks.max(1) as f64;
         let offset_from_bar_start = anchor_raw_tick - bar_start as f64;
         let nearest_grid_tick = bar_start as f64 + (offset_from_bar_start / grid).round() * grid;
         // Elastic snap: only pull to the grid line when close to it, and
-        // recomputed fresh each call from the fixed original position — a
+        // recomputed fresh each call from the fixed original position - a
         // small nudge can never compound into a runaway jump, and dragging
         // far enough away from a grid line "unsnaps" back to the raw
         // position under the cursor.
@@ -3843,7 +5002,12 @@ impl BetterWriterApp {
         } else if let Some(note_id) = self.find_note_fragment_at(pos, page) {
             let already_selected = self.selected_note_id == Some(note_id)
                 || self.area_selected_note_ids.contains(&note_id);
-            if already_selected {
+            if already_selected && self.view_mode == EditorViewMode::TabNumbers {
+                // Tied notes in tab view can't be dragged around without
+                // breaking their chains, so a drag on a selected number
+                // leaves the selection alone.
+                self.canvas_drag = CanvasDragMode::Idle;
+            } else if already_selected {
                 // Dragging the body of an already-selected note moves it
                 // (and the rest of the selection, if any) instead of
                 // re-selecting or starting an area-select.
@@ -3952,7 +5116,7 @@ impl BetterWriterApp {
                     snapping_disabled,
                 );
                 // Each string is already a discrete unit, so vertical
-                // movement just rounds to the nearest one — no snap grid
+                // movement just rounds to the nearest one - no snap grid
                 // or threshold needed the way the tick axis has.
                 const STRING_GAP: f32 = 9.0;
                 let string_delta = ((current_pos.y - start_pos.y) / STRING_GAP).round() as i32;
@@ -4008,7 +5172,7 @@ impl BetterWriterApp {
         let right = page.right() - 18.0;
         let available_width = (right - left).max(40.0);
         let systems = self.layout_staff_systems(track, available_width);
-        let system_height = 168.0;
+        let system_height = self.system_metrics(track).height;
         let first_top = page.top() + 56.0;
         let system_index = (((pos.y - first_top) / system_height).floor().max(0.0) as usize)
             .min(systems.len().saturating_sub(1));
@@ -4016,11 +5180,17 @@ impl BetterWriterApp {
             return;
         };
         let system_origin_tick = system.start_tick;
-        let clicked_tick = ((((pos.x - left) / self.pixels_per_tick).max(0.0)) as Tick
-            + system_origin_tick)
-            .min(system.end_tick.max(system_origin_tick));
-        let snapped_tick = snap_tick(clicked_tick, TICKS_PER_QUARTER / 4);
-        let tab_y = first_top + system_index as f32 * system_height + 82.0;
+        // Tab view snaps to the nearest beat; brick view to a sixteenth.
+        let snapped_tick = if system.has_beat_layout() {
+            system.tick_at(pos.x - left, self.pixels_per_tick)
+        } else {
+            let clicked_tick = ((((pos.x - left) / self.pixels_per_tick).max(0.0)) as Tick
+                + system_origin_tick)
+                .min(system.end_tick.max(system_origin_tick));
+            snap_tick(clicked_tick, TICKS_PER_QUARTER / 4)
+        };
+        let tab_y =
+            first_top + system_index as f32 * system_height + self.system_metrics(track).tab_offset;
         let string_gap = 9.0;
 
         let string_index = ((pos.y - tab_y + string_gap * 0.5) / string_gap)
@@ -4028,9 +5198,9 @@ impl BetterWriterApp {
             .clamp(0.0, track.tuning.len().saturating_sub(1) as f32)
             as usize;
 
-        // A click on empty space repositions the keyboard cursor so the user
-        // can click-then-type. Inserting a note is now done with the keyboard
-        // (digits + Enter), keeping mouse and keyboard workflows unified.
+        // A click on empty space moves the keyboard cursor there so the user
+        // can click, then type the fret (digits + Enter). Notes are only ever
+        // inserted from the keyboard.
         self.cursor.tick = snapped_tick;
         self.cursor.string_index = string_index;
         self.cursor.pending_fret = None;
@@ -4041,6 +5211,133 @@ impl BetterWriterApp {
             "Cursor at tick {} on string {}. Type a fret and press Enter.",
             snapped_tick,
             string_index + 1
+        );
+    }
+}
+
+/// Width of the edit cursor box in tab view.
+const TAB_CURSOR_WIDTH: f32 = 18.0;
+
+/// Horizontal offset from a note's onset to the center of its fret number in
+/// tab view, so a number at tick 0 clears the barline.
+const TAB_NUMBER_CENTER_OFFSET: f32 = 7.0;
+
+/// Draws a tie as a shallow arc between `from` and `to`, bulging upward when
+/// `up` is set and downward otherwise.
+fn paint_tie_arc(painter: &egui::Painter, from: Pos2, to: Pos2, color: egui::Color32, up: bool) {
+    let bulge = if up { -9.0 } else { 9.0 };
+    let control = Pos2::new(
+        (from.x + to.x) * 0.5,
+        if up {
+            from.y.min(to.y) + bulge
+        } else {
+            from.y.max(to.y) + bulge
+        },
+    );
+    painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+        [from, control, to],
+        false,
+        egui::Color32::TRANSPARENT,
+        Stroke::new(1.2_f32, color),
+    ));
+}
+
+/// Whether the bar starting at `bar_start` gets a time signature label: the
+/// first bar of the piece and every bar where the signature changes.
+fn signature_label_at(track: &InstrumentTrack, bar_start: Tick) -> bool {
+    bar_start == 0 || track.signature_at(bar_start - 1) != track.signature_at(bar_start)
+}
+
+/// Draws a rest glyph centered on `cx`. `y` is the staff line the glyph
+/// attaches to: a whole rest hangs below it, a half rest sits on it, and
+/// shorter rests are centered on it.
+fn paint_rest_symbol(
+    painter: &egui::Painter,
+    cx: f32,
+    y: f32,
+    value: notation::NoteValue,
+    color: egui::Color32,
+) {
+    let stroke = Stroke::new(1.8_f32, color);
+    let line = Stroke::new(1.0_f32, color);
+    match value.value {
+        1 => {
+            painter.line_segment([Pos2::new(cx - 7.0, y), Pos2::new(cx + 7.0, y)], line);
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(cx - 5.0, y), Pos2::new(cx + 5.0, y + 3.8)),
+                0.0,
+                color,
+            );
+        }
+        2 => {
+            painter.line_segment([Pos2::new(cx - 7.0, y), Pos2::new(cx + 7.0, y)], line);
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(cx - 5.0, y - 3.8), Pos2::new(cx + 5.0, y)),
+                0.0,
+                color,
+            );
+        }
+        4 => {
+            painter.add(egui::Shape::line(
+                vec![
+                    Pos2::new(cx - 2.0, y - 9.0),
+                    Pos2::new(cx + 3.0, y - 4.0),
+                    Pos2::new(cx - 3.0, y + 1.0),
+                    Pos2::new(cx + 3.0, y + 6.0),
+                ],
+                stroke,
+            ));
+        }
+        _ => {
+            // Eighth and shorter: a slash with one dot per flag.
+            painter.line_segment(
+                [Pos2::new(cx + 3.0, y - 8.0), Pos2::new(cx - 3.0, y + 8.0)],
+                stroke,
+            );
+            for flag in 0..value.flags().clamp(1, 5) {
+                let t = flag as f32 * 0.25;
+                painter.circle_filled(
+                    Pos2::new(cx - 6.0 * t - 2.5, y - 8.0 + 16.0 * t),
+                    1.8,
+                    color,
+                );
+            }
+        }
+    }
+    for dot in 0..value.dots {
+        painter.circle_filled(Pos2::new(cx + 8.0 + dot as f32 * 4.0, y - 2.0), 1.3, color);
+    }
+}
+
+/// Draws a sharp or a natural sign centered on `(x, y)`.
+fn paint_accidental(painter: &egui::Painter, x: f32, y: f32, sharp: bool, color: egui::Color32) {
+    let stroke = Stroke::new(1.0_f32, color);
+    let thick = Stroke::new(1.8_f32, color);
+    painter.line_segment(
+        [Pos2::new(x - 1.7, y - 6.0), Pos2::new(x - 1.7, y + 5.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(x + 1.7, y - 5.0), Pos2::new(x + 1.7, y + 6.0)],
+        stroke,
+    );
+    if sharp {
+        painter.line_segment(
+            [Pos2::new(x - 3.6, y - 1.0), Pos2::new(x + 3.6, y - 3.0)],
+            thick,
+        );
+        painter.line_segment(
+            [Pos2::new(x - 3.6, y + 3.0), Pos2::new(x + 3.6, y + 1.0)],
+            thick,
+        );
+    } else {
+        painter.line_segment(
+            [Pos2::new(x - 1.7, y - 2.0), Pos2::new(x + 1.7, y - 3.0)],
+            thick,
+        );
+        painter.line_segment(
+            [Pos2::new(x - 1.7, y + 3.0), Pos2::new(x + 1.7, y + 2.0)],
+            thick,
         );
     }
 }
@@ -4216,8 +5513,7 @@ fn unique_project_name(base: &str, recent: &[PathBuf]) -> String {
 ///   regardless of order (each target character consumed at most once).
 ///
 /// Sorting by this tuple descending (Rust compares tuples lexicographically)
-/// naturally gives `ordered_matches` priority over `overall_matches`, per the
-/// requested "matched in order, then overall" ranking.
+/// ranks an in-order match above one that merely overlaps by character.
 fn search_match_score(query: &str, target: &str) -> (usize, usize) {
     let query_chars: Vec<char> = query.to_lowercase().chars().collect();
     let target_chars: Vec<char> = target.to_lowercase().chars().collect();
@@ -4252,16 +5548,12 @@ fn search_match_score(query: &str, target: &str) -> (usize, usize) {
     (ordered_matches, overall_matches)
 }
 
-/// A submenu button that — unlike plain `ui.menu_button` — doesn't close the
-/// whole context-menu stack when clicking a widget *inside* it, only when
-/// clicking outside it. egui's menus default to
-/// `PopupCloseBehavior::CloseOnClick` (close on *any* click, even inside the
-/// menu's own body), which made interactive controls nested in a submenu
-/// (e.g. the Stretching submenu's DragValue) effectively unusable — the
-/// menu would vanish the instant you touched them. Items that *should*
-/// still close on click (most actions) do so via their own `ui.close()`
-/// call, same as before; this only changes what happens when there's no
-/// such explicit call.
+/// A submenu button that - unlike plain `ui.menu_button` - closes only when
+/// clicking outside it, not when clicking a widget *inside* it. egui's menus
+/// default to `PopupCloseBehavior::CloseOnClick`, which closes on *any*
+/// click, so an interactive control nested in a submenu (the Stretching
+/// submenu's DragValue) needs this to stay open while it's being used.
+/// Actions that should close the menu do so with their own `ui.close()`.
 fn submenu<R>(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui) -> R) {
     egui::containers::menu::MenuButton::new(label)
         .config(
@@ -4272,7 +5564,7 @@ fn submenu<R>(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egu
 }
 
 /// A `DragValue` that scrolls through a fixed list of values (by index)
-/// instead of a raw numeric range — the same drag-to-change / click-and-
+/// instead of a raw numeric range - the same drag-to-change / click-and-
 /// scroll interaction as a normal `DragValue`, but each step moves to the
 /// next *entry in the list* rather than the next integer. Used anywhere a
 /// value is picked from a short set of musically-meaningful options (time
@@ -4343,5 +5635,79 @@ fn gm_program_name(program: u8) -> &'static str {
         33 => "Finger Bass",
         34 => "Pick Bass",
         _ => "General MIDI",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_bar_beat_system() -> StaffSystem {
+        let mut system = StaffSystem::from_bars(vec![(0, 3840), (3840, 7680)]);
+        system.beat_bars = vec![
+            BeatBarLayout {
+                start: 0,
+                end: 3840,
+                x: 0.0,
+                width: 100.0,
+                columns: vec![(0, 10.0), (960, 40.0), (1920, 70.0)],
+            },
+            BeatBarLayout {
+                start: 3840,
+                end: 7680,
+                x: 100.0,
+                width: 100.0,
+                columns: vec![(3840, 110.0), (5760, 160.0)],
+            },
+        ];
+        system
+    }
+
+    #[test]
+    fn brick_layout_maps_ticks_linearly() {
+        let system = StaffSystem::from_bars(vec![(960, 4800)]);
+        assert_eq!(system.x_of(960, 0.1), 0.0);
+        assert_eq!(system.x_of(1960, 0.1), 100.0);
+        assert_eq!(system.bar_x(0, 0.1), 0.0);
+        assert!((system.right_x(0.1) - 384.0).abs() < 0.01);
+        assert_eq!(system.tick_at(100.0, 0.1), 1960);
+    }
+
+    #[test]
+    fn beat_layout_puts_beats_at_their_columns() {
+        let system = two_bar_beat_system();
+        assert_eq!(system.x_of(0, 0.07), 10.0);
+        assert_eq!(system.x_of(960, 0.07), 40.0);
+        // The first beat of the second bar is in the second bar.
+        assert_eq!(system.x_of(3840, 0.07), 110.0);
+        assert_eq!(system.right_x(0.07), 200.0);
+        assert_eq!(system.bar_x(1, 0.07), 100.0);
+    }
+
+    #[test]
+    fn beat_layout_interpolates_between_beats_of_one_bar() {
+        let system = two_bar_beat_system();
+        assert_eq!(system.x_of(480, 0.07), 25.0);
+        // After the last beat, toward the end of the bar.
+        assert_eq!(system.x_of(2880, 0.07), 84.0);
+    }
+
+    #[test]
+    fn clicking_in_beat_layout_picks_the_nearest_beat() {
+        let system = two_bar_beat_system();
+        assert_eq!(system.tick_at(45.0, 0.07), 960);
+        assert_eq!(system.tick_at(5.0, 0.07), 0);
+        assert_eq!(system.tick_at(150.0, 0.07), 5760);
+        assert_eq!(system.tick_at(999.0, 0.07), 5760);
+    }
+
+    #[test]
+    fn system_height_follows_the_notation_toggle_and_string_count() {
+        let with_staff = SystemMetrics::new(true, 6);
+        let without_staff = SystemMetrics::new(false, 6);
+        assert_eq!(with_staff.tab_offset, 104.0);
+        assert_eq!(with_staff.height, 104.0 + 45.0 + 41.0);
+        assert_eq!(without_staff.height, 16.0 + 45.0 + 41.0);
+        assert!(SystemMetrics::new(true, 8).height > with_staff.height);
     }
 }
