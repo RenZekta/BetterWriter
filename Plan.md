@@ -16,9 +16,10 @@ Important: edit this file with its formatting in mind, don't change the formatti
 - [x] **Fret entry from the keyboard**: typing `0`–`9` builds a fret number.
       Two quick digits compose (e.g. `1` then `2` → fret **12**); the buffer
       auto-expires after ~1.2 s of inactivity.
-- [x] **Insert / overwrite at the cursor**: `Enter` or `Space` places the
-      buffered fret (or the toolbar default) at the cursor; if a note already
-      occupies that cell its fret is replaced instead of stacked.
+- [x] **Insert / overwrite at the cursor**: `Enter` places the buffered fret
+      (or the toolbar default) at the cursor; if a note already occupies that
+      cell its fret is replaced instead of stacked. (`Space` is the play/stop
+      shortcut since 12.11.2026.)
 - [x] **Delete**: `Backspace` / `Delete` clears a pending fret, otherwise
       removes the note under the cursor.
 - [x] **Navigation**: `←`/`→` move the cursor by the selected note duration
@@ -669,6 +670,113 @@ accidentals) and `TGMusicKeyUtils` (staff position from the sounding pitch).
       search ranking) rewritten as present-tense egui constraints.
 - [x] README: personal background paragraph removed.
 
+## 12.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Playback no longer freezes the window on the first Play
+- [x] **Soundfont loads off the UI thread.** The 51 MB `MS Basic.sf3` used to
+      be decoded inside the first Play click; in a debug build that blocked
+      the window for ~56 s on one CPU core. The loader now runs on its own
+      thread (`AudioRuntime::preload` starts it when the editor opens), the
+      stream plays silence until the synth arrives, and a Play pressed while
+      loading starts as soon as it is ready (the status bar says so).
+- [x] **Decoder panics are contained.** The `soundfont` parser panics on a
+      malformed file (covered by a test with a corrupt `.sf3`); the loader
+      catches it and reports a normal error. The audio callback is wrapped
+      the same way, and the engine rebuilds itself on the next Play after a
+      fault.
+- [x] A failed stream setup no longer leaves the runtime unusable: every
+      attempt builds a fresh command queue.
+- [x] `Cargo.toml` optimizes only the audio crates (`oxisynth*`, `lewton`,
+      `soundfont`) in the dev profile: soundfont load went from ~56 s to
+      ~8 s in a debug build here.
+- [x] The runtime exposes `is_playing()`. It clears itself 2 s after the last
+      scheduled event, so the UI never shows a finished song as playing.
+- [x] Tests: loader errors for a missing and a corrupt soundfont, the play /
+      stop / finish flag transitions, and an ignored test that loads the real
+      soundfont and renders 2 s of non-silent audio.
+
+### 2. `Space` plays and stops
+- [x] `Space` toggles playback (from the start, like the Play button) and is
+      ignored while a text field owns the keyboard. `Enter` still places the
+      note.
+
+### 3. Zoom and scrolling
+- [x] **Mouse wheel zooms** the score around the pointer; `Ctrl`+wheel and
+      pinch do too. It drives the same `pixels_per_tick` as the toolbar
+      slider (shared `MIN_PIXELS_PER_TICK` / `MAX_PIXELS_PER_TICK`).
+      Rows reflow to the page width at every zoom level, so only the row under
+      the pointer is held at its screen height.
+- [x] **`Shift`+wheel scrolls the score vertically**, and keyboard edits
+      scroll the cursor's row into view. The 8-system cap is gone: rows are
+      culled by the page rect instead.
+- [x] Page placement lives in one `PageGeometry` (`page_geometry`) instead of
+      five copies of the same offsets, so painting, click hit-testing, area
+      selection, stretch edges and the cursor all see the scroll offset.
+
+### 4. Edition palette redone in the Guitar Pro 8 / TuxGuitar style
+- [x] Grouped 22 px vector icons (`src/icons.rs`, drawn with the painter so
+      they follow the theme) in an 8-column grid with thin separators:
+      bar, durations, dynamics, techniques, text/chords. Active duration,
+      dynamic and effects are highlighted with the accent color.
+- [x] Wired: time signature popup (shared with the context menu), add /
+      insert / delete bar, the six durations, tie, the eight dynamics and all
+      14 note effects. Commands that don't exist yet are drawn disabled with
+      a "(planned)" tooltip.
+- [x] Dynamics and effects now apply to every selected note (single or area
+      selection); an effect button flips only that effect on the selection.
+- [x] Palette and fretboard colors are `EditorTheme` fields for both themes.
+
+### 5. Fretboard is interactive
+- [x] Click a string/fret to write the note at the edit cursor (same path as
+      the keyboard, cursor advances). `Shift`+click keeps the cursor on the
+      beat to build chords; clicking a note that is already there removes it.
+- [x] Geometry in `src/fretboard.rs` (unit-tested): equal-tempered fret
+      spacing from the track's `fret_count`, a clickable open-string zone left
+      of the nut, hit testing shared with painting. Strings have graded
+      thickness, inlays and fret numbers; the cursor string is tinted and the
+      notes sounding at the cursor are marked.
+- [x] `View > Fretboard` hides the panel; its height follows the string count.
+
+### 6. RMB context menu: Bar / Note / Effects didn't expand
+- [x] Root cause: `submenu()` (18.08.2026, item 7) was built on egui's
+      `MenuButton`, which in egui 0.34 is a standalone click-to-toggle popup:
+      it never opens on hover and a click on it closed the whole menu. The
+      unmodified repo behaves the same, so this predates the 12.11.2026
+      changes. Inside a menu `submenu()` now uses `SubMenuButton`, the same
+      rule as egui's own `Ui::menu_button`, keeping
+      `PopupCloseBehavior::CloseOnClickOutside` for the controls inside.
+- [x] Checked in an Xvfb session: hovering opens Bar, Note and Effects, the
+      pointer can move into a submenu without it closing, the nested Time
+      Signature submenu opens and stays open, and `Add Bar` from the Bar
+      submenu runs ("Added a bar after bar 2.").
+
+### 7. Dragging bricks shows the bricks, not a line
+- [x] Moving and stretching bricks used to draw an orange / blue vertical
+      line with a tick caption. The preview now shows the notes themselves:
+      their old place is dimmed with a dashed outline, and the bricks as they
+      will land are drawn translucent in the accent color with their fret
+      numbers, across row breaks too. The caption reports the real resulting
+      change (for example `+1920 ticks, string -2`, `No change` when blocked).
+- [x] The preview runs the same edit as the drop on a scratch copy of the
+      project (`NoteDragPlan` + `apply_note_drag`, shared by
+      `finish_canvas_drag`), so clamping against neighbouring notes and bar
+      limits appears in the preview exactly as it will on release.
+- [x] Fixed: a drag was hit-tested and measured from where the pointer was
+      when egui reported the drag start, a few points after the press. A quick
+      flick could miss the 10 px edge grab zone, and every drop was offset by
+      that distance. It now starts from `pointer.press_origin()`.
+- [x] Tests: the plan only changes the notes it names, a scratch copy gives
+      the same notes the real project ends up with (and leaves the project
+      untouched), and a zero drag changes nothing.
+- [ ] `Esc` clears the selection but does not cancel a drag in progress.
+- [ ] The classic-notation staff above the tab does not preview a drag.
+
+Checked in this pass: `cargo test` (90 passed, 1 ignored, which was run
+separately), and a scripted Xvfb session for wheel zoom, a fretboard click,
+`Shift`+click, click-to-delete, `Space` without an audio device (status bar
+reports it, no crash), the View-menu toggle, the bright theme, the
+right-click submenus and the move / stretch drag previews.
+
 ---
 
 ## 🚧 Not yet done / future work
@@ -830,10 +938,13 @@ accidentals) and `TGMusicKeyUtils` (staff position from the sounding pitch).
 - [ ] Real chord detection (multiple notes on one tick drawn as a chord block).
 - [ ] Instruments adding/deleting
 - [ ] Bar adding/deleting
-- [ ] Some kind of bar scrolling
+- [x] ~~Some kind of bar scrolling~~ - implemented 12.11.2026, item 3
+      (`Shift`+wheel; the wheel zooms).
 - [ ] Vertical bar placement to fill the screen efficiently
 - [ ] Brick note length manual editing with pulling it left or right as in piano rolls.
-- [ ] Making Virtual guitar neck/Fretboard panel: 1. usable for note input 2. tuning changable. 3. Hideable (Togglable on/off). 4. Guitar nut area isn't displayed properly, there should be area between the note and the nut (E---|(nut)---|(1 fret)---..., --- is clickable area for the nut/fret to its right)
+- [ ] Virtual guitar neck/Fretboard panel: tuning changable from the panel.
+      (Note input, show/hide and the open-string zone beside the nut shipped
+      12.11.2026, item 5.)
 - [ ] In timeline instead of diamonds for each note display a row of blocks with a block for each existing bar, a block with a width of a bar size/time measure (4/4, 3/4, 6/4) relative to all other bar sizes in the project, so 1/4 is 4x smaller than 4/4, but to make them all visible and clickable, the smallest cannot go smaller than some width amount of pixels, and if it gets to that, make everything get bigger. Each instrument has its own row of bar blocks.
 - [ ] Starting menu with recently opened projects kept in a vertical list, double-clicking opens the project to the edit menu we currently have. There should be a button to create new project with options: 1: name ("Untitled" by default, if it already exists add 1 then 2, etc.), 2. First track instrument Currently only Stringed will work, but also add Orchestra, Drums, MIDI. Stringed has options of Acoustic guitar, Electric guitar, Bass, Other. In the future each will have default playback sound that will be modified with VST3s. 3. Amount of strings selection (up to 12, but in the input menu make any value above inputable.) Add there a button for "Demo project" option will open what we currently have as open-on-startup. New projects are fully empty and only have 1 instrument and 1 bar at 4/4 set to default tempo of 120 bpm.
 - [ ] Make instruments selectable to display multiple of their tabs/notations at the same time (current time of each instrument's notes is the key for synchronization here)
@@ -844,8 +955,12 @@ accidentals) and `TGMusicKeyUtils` (staff position from the sounding pitch).
 - [ ] Transport scrubbing: rewind / fast-forward / jump-to-start actually move
       the playhead (buttons exist but are no-ops).
 - [ ] Loop regions, metronome, count-in.
-- [ ] Verify `oxisynth` actually renders `MS Basic.sf3` audibly (stream is
-      wired but untested end-to-end on this machine).
+- [ ] Verify audible output on a real device: a headless test renders
+      `MS Basic.sf3` to a non-silent buffer (12.11.2026), but the `cpal`
+      stream has never been heard in this sandbox (no sound card).
+- [ ] Playback always starts at tick 0 (Play button and `Space`); starting
+      from the edit cursor is open.
+- [ ] Fretboard clicks don't audition the note.
 - [ ] Channel/program-per-track: each track's `program` should drive its MIDI
       channel's patch on the synth (currently all channels forced to program 24).
 - [ ] Real **VST3 hosting** via `vst3` crate (the `Vst3HostSlot` is currently a
@@ -862,7 +977,16 @@ accidentals) and `TGMusicKeyUtils` (staff position from the sounding pitch).
 ### UI / UX
 - [ ] **Custom theme palette editor** (`EditorTheme` exists but is not
       user-editable at runtime).
-- [ ] Scrollable / paginated score view beyond the 8-system cap.
+- [x] ~~Scrollable / paginated score view beyond the 8-system cap~~ - the cap
+      is gone and the score scrolls (12.11.2026, item 3).
+- [ ] Score scrollbar widget (`Shift`+wheel is the only way to scroll) and a
+      paged layout.
+- [ ] Zoom holds only the row under the pointer in place; its horizontal
+      position shifts because rows reflow to the page width.
+- [ ] Edition palette commands still drawn disabled: key signature, clef,
+      triplet feel, repeats, dotted / double-dotted, tuplet, fermata,
+      crescendo / decrescendo, bend, harmonic, trill, grace note, tremolo
+      bar, text, chord diagram. No voice 1/2 or select/draw modes.
 - [ ] Note effect glyphs rendered on the staff (palm-mute text exists; others
       are modeled but not drawn).
 - [ ] Drag-to-move notes; drag-select range.

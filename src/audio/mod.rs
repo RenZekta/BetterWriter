@@ -1,8 +1,13 @@
 use std::{
     fs::File,
     marker::PhantomData,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, TryRecvError},
+    },
 };
 
 use cpal::{
@@ -78,8 +83,16 @@ fn build_tempo_segments(project: &BwxProject) -> Vec<TempoSegment> {
     segments
 }
 
-#[derive(Clone)]
+/// Time after the last scheduled event before playback counts as finished, so
+/// note releases and reverb are not cut off.
+const END_TAIL_SECONDS: f64 = 2.0;
+
+/// Stack size for the soundfont loader thread. Decoding an SF3 allocates and
+/// recurses far more than a default thread stack comfortably allows.
+const LOADER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 enum AudioCommand {
+    InstallSynth(Box<Synth>),
     Play {
         events: Arc<Vec<MidiPlaybackEvent>>,
         tempo_segments: Arc<Vec<TempoSegment>>,
@@ -104,23 +117,53 @@ pub enum AudioError {
     CommandQueueFull,
 }
 
+/// State shared between the UI thread and the audio callback thread.
+#[derive(Default)]
+struct SharedFlags {
+    /// True from the moment the callback starts a song until it stops or the
+    /// song (plus its release tail) has finished.
+    playing: AtomicBool,
+    /// Set when the audio callback panicked; the runtime rebuilds the stream
+    /// the next time playback is requested.
+    faulted: AtomicBool,
+}
+
+struct PendingPlay {
+    events: Vec<MidiPlaybackEvent>,
+    tempo_segments: Vec<TempoSegment>,
+}
+
+type LoaderResult = Result<Box<Synth>, String>;
+
 pub struct AudioRuntime {
     soundfont_path: PathBuf,
     producer: HeapProd<AudioCommand>,
-    consumer: Option<HeapCons<AudioCommand>>,
     stream: Option<cpal::Stream>,
+    sample_rate: f32,
+    flags: Arc<SharedFlags>,
+    /// Receives the synth built by the soundfont loader thread.
+    loader: Option<mpsc::Receiver<LoaderResult>>,
+    synth_installed: bool,
+    /// A Play request made while the soundfont was still loading; it is sent
+    /// as soon as the synth is installed.
+    pending_play: Option<PendingPlay>,
     status: String,
 }
 
 impl AudioRuntime {
     pub fn new(soundfont_path: impl Into<PathBuf>) -> Self {
-        let rb = HeapRb::<AudioCommand>::new(2048);
-        let (producer, consumer) = rb.split();
+        // Placeholder queue; `ensure_stream` replaces it with a fresh pair
+        // every time it builds a stream, so a failed attempt can be retried.
+        let (producer, _consumer) = HeapRb::<AudioCommand>::new(16).split();
         Self {
             soundfont_path: soundfont_path.into(),
             producer,
-            consumer: Some(consumer),
             stream: None,
+            sample_rate: 44_100.0,
+            flags: Arc::new(SharedFlags::default()),
+            loader: None,
+            synth_installed: false,
+            pending_play: None,
             status: "Audio engine idle".to_owned(),
         }
     }
@@ -129,15 +172,72 @@ impl AudioRuntime {
         &self.status
     }
 
+    /// True while a song is sounding, or while a Play request is waiting for
+    /// the soundfont to finish loading.
+    /// True while the soundfont is still being decoded on the loader thread.
+    pub fn is_loading(&self) -> bool {
+        self.loader.is_some()
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.pending_play.is_some() || self.flags.playing.load(Ordering::Relaxed)
+    }
+
+    /// Call once per UI frame. Moves a finished soundfont load into the audio
+    /// thread, releases a waiting Play request, and recovers from audio
+    /// thread faults. Returns true while the UI should keep repainting.
+    pub fn poll(&mut self) -> bool {
+        if self.flags.faulted.swap(false, Ordering::Relaxed) {
+            self.stream = None;
+            self.loader = None;
+            self.synth_installed = false;
+            self.pending_play = None;
+            self.status = "Audio engine stopped after an internal error; press Play to restart it"
+                .to_owned();
+        }
+
+        if let Some(receiver) = &self.loader {
+            match receiver.try_recv() {
+                Ok(Ok(synth)) => {
+                    self.loader = None;
+                    if self.producer.try_push(AudioCommand::InstallSynth(synth)).is_ok() {
+                        self.synth_installed = true;
+                        self.status = format!(
+                            "Audio online: {} Hz, {}",
+                            self.sample_rate,
+                            self.soundfont_path.display()
+                        );
+                        if let Some(pending) = self.pending_play.take() {
+                            if let Err(err) = self.send_play(pending) {
+                                self.status = format!("Playback failed: {err}");
+                            }
+                        }
+                    } else {
+                        self.pending_play = None;
+                        self.status = "Audio command queue is full".to_owned();
+                    }
+                }
+                Ok(Err(message)) => {
+                    self.loader = None;
+                    self.pending_play = None;
+                    self.status = format!("Soundfont failed to load: {message}");
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.loader = None;
+                    self.pending_play = None;
+                    self.status = "Soundfont loader stopped unexpectedly".to_owned();
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        self.loader.is_some() || self.is_playing()
+    }
+
     pub fn ensure_stream(&mut self) -> Result<(), AudioError> {
         if self.stream.is_some() {
             return Ok(());
         }
-
-        let Some(consumer) = self.consumer.take() else {
-            self.status = "Audio stream already consumed".to_owned();
-            return Ok(());
-        };
 
         let host = cpal::default_host();
         let device = host
@@ -147,97 +247,34 @@ impl AudioRuntime {
         let config: cpal::StreamConfig = supported.clone().into();
         let sample_rate = config.sample_rate as f32;
         let channels = config.channels as usize;
-        let soundfont_path = self.soundfont_path.clone();
 
+        let (producer, consumer) = HeapRb::<AudioCommand>::new(2048).split();
+        let flags = Arc::new(SharedFlags::default());
+
+        macro_rules! build {
+            ($sample:ty) => {
+                build_stream::<$sample>(
+                    &device,
+                    &config,
+                    channels,
+                    sample_rate,
+                    consumer,
+                    flags.clone(),
+                )?
+            };
+        }
         let stream = match supported.sample_format() {
-            cpal::SampleFormat::I8 => build_stream::<i8>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::I16 => build_stream::<i16>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::I24 => build_stream::<cpal::I24>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::I32 => build_stream::<i32>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::I64 => build_stream::<i64>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::U8 => build_stream::<u8>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::U16 => build_stream::<u16>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::U32 => build_stream::<u32>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::U64 => build_stream::<u64>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::F32 => build_stream::<f32>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
-            cpal::SampleFormat::F64 => build_stream::<f64>(
-                &device,
-                &config,
-                channels,
-                sample_rate,
-                soundfont_path,
-                consumer,
-            )?,
+            cpal::SampleFormat::I8 => build!(i8),
+            cpal::SampleFormat::I16 => build!(i16),
+            cpal::SampleFormat::I24 => build!(cpal::I24),
+            cpal::SampleFormat::I32 => build!(i32),
+            cpal::SampleFormat::I64 => build!(i64),
+            cpal::SampleFormat::U8 => build!(u8),
+            cpal::SampleFormat::U16 => build!(u16),
+            cpal::SampleFormat::U32 => build!(u32),
+            cpal::SampleFormat::U64 => build!(u64),
+            cpal::SampleFormat::F32 => build!(f32),
+            cpal::SampleFormat::F64 => build!(f64),
             other => {
                 return Err(AudioError::SoundFontLoad(format!(
                     "unsupported sample format {other:?}"
@@ -247,13 +284,28 @@ impl AudioRuntime {
 
         stream.play()?;
         self.stream = Some(stream);
-        self.status = format!(
-            "Audio online: {} Hz, {} channels, {}",
-            sample_rate,
-            channels,
-            self.soundfont_path.display()
-        );
+        self.producer = producer;
+        self.flags = flags;
+        self.sample_rate = sample_rate;
+        self.synth_installed = false;
+        self.loader = None;
+        self.status = format!("Audio device open: {sample_rate} Hz, {channels} channels");
         Ok(())
+    }
+
+    /// Opens the output device and starts decoding the soundfont in the
+    /// background so the first Play press does not have to wait for it.
+    /// Failures are silent here; `play` reports them to the user.
+    pub fn preload(&mut self) {
+        if self.ensure_stream().is_err() {
+            return;
+        }
+        if !self.synth_installed && self.loader.is_none() {
+            self.loader = Some(spawn_synth_loader(
+                self.sample_rate,
+                self.soundfont_path.clone(),
+            ));
+        }
     }
 
     pub fn play(
@@ -262,20 +314,105 @@ impl AudioRuntime {
         events: Vec<MidiPlaybackEvent>,
     ) -> Result<(), AudioError> {
         self.ensure_stream()?;
-        self.producer
-            .try_push(AudioCommand::Play {
-                events: Arc::new(events),
-                tempo_segments: Arc::new(build_tempo_segments(project)),
-                start_tick: 0,
-            })
-            .map_err(|_| AudioError::CommandQueueFull)
+        let pending = PendingPlay {
+            events,
+            tempo_segments: build_tempo_segments(project),
+        };
+        if self.synth_installed {
+            return self.send_play(pending);
+        }
+        if self.loader.is_none() {
+            self.loader = Some(spawn_synth_loader(
+                self.sample_rate,
+                self.soundfont_path.clone(),
+            ));
+        }
+        self.pending_play = Some(pending);
+        self.status = "Loading soundfont...".to_owned();
+        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), AudioError> {
+        self.pending_play = None;
+        if self.stream.is_none() {
+            return Ok(());
+        }
+        self.flags.playing.store(false, Ordering::Relaxed);
         self.producer
             .try_push(AudioCommand::Stop)
             .map_err(|_| AudioError::CommandQueueFull)
     }
+
+    fn send_play(&mut self, pending: PendingPlay) -> Result<(), AudioError> {
+        self.flags.playing.store(true, Ordering::Relaxed);
+        self.producer
+            .try_push(AudioCommand::Play {
+                events: Arc::new(pending.events),
+                tempo_segments: Arc::new(pending.tempo_segments),
+                start_tick: 0,
+            })
+            .map_err(|_| {
+                self.flags.playing.store(false, Ordering::Relaxed);
+                AudioError::CommandQueueFull
+            })
+    }
+}
+
+/// Builds the synth and loads the soundfont. Runs on the loader thread.
+fn build_synth(sample_rate: f32, soundfont_path: &Path) -> LoaderResult {
+    let mut synth = Synth::new(SynthDescriptor {
+        sample_rate,
+        audio_channels: 2,
+        gain: 0.35,
+        ..Default::default()
+    })
+    .map_err(|err| err.to_string())?;
+
+    let mut file = File::open(soundfont_path)
+        .map_err(|err| format!("{}: {err}", soundfont_path.display()))?;
+    let font = SoundFont::load(&mut file).map_err(|err| err.to_string())?;
+    synth.add_font(font, true);
+
+    for channel in 0..16 {
+        let _ = synth.send_event(MidiEvent::ProgramChange {
+            channel,
+            program_id: 24,
+        });
+    }
+    Ok(Box::new(synth))
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_owned()
+    }
+}
+
+/// Loads the soundfont off the UI thread. The SF3 decoder `unwrap()`s on
+/// malformed samples, so a panic is caught and reported as an ordinary error
+/// instead of taking the whole application down.
+fn spawn_synth_loader(sample_rate: f32, soundfont_path: PathBuf) -> mpsc::Receiver<LoaderResult> {
+    let (sender, receiver) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("betterwriter-soundfont".to_owned())
+        .stack_size(LOADER_STACK_BYTES)
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                build_synth(sample_rate, &soundfont_path)
+            }))
+            .unwrap_or_else(|payload| {
+                Err(format!(
+                    "the soundfont decoder crashed ({})",
+                    panic_message(payload.as_ref())
+                ))
+            });
+            let _ = sender.send(result);
+        });
+    receiver
 }
 
 pub trait VstHost {
@@ -324,19 +461,32 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     channels: usize,
     sample_rate: f32,
-    soundfont_path: PathBuf,
     consumer: HeapCons<AudioCommand>,
+    flags: Arc<SharedFlags>,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: SizedSample + FromSample<f32>,
 {
-    let mut state = CallbackState::new(consumer, sample_rate, &soundfont_path)?;
+    let mut state = CallbackState::new(consumer, sample_rate, flags.clone());
     let err_fn = |err| eprintln!("BetterWriter audio stream error: {err}");
 
     Ok(device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            write_data(data, channels, &mut state);
+            // A panic must never unwind into the platform audio thread.
+            let finished = catch_unwind(AssertUnwindSafe(|| {
+                if !state.faulted {
+                    write_data(data, channels, &mut state);
+                }
+            }));
+            if finished.is_err() {
+                state.faulted = true;
+                flags.playing.store(false, Ordering::Relaxed);
+                flags.faulted.store(true, Ordering::Relaxed);
+            }
+            if state.faulted {
+                data.fill(T::from_sample(0.0_f32));
+            }
         },
         err_fn,
         None,
@@ -345,7 +495,9 @@ where
 
 struct CallbackState {
     command_consumer: HeapCons<AudioCommand>,
-    synth: Synth,
+    /// `None` until the loader thread hands the synth over; the stream
+    /// outputs silence in the meantime.
+    synth: Option<Box<Synth>>,
     events: Arc<Vec<MidiPlaybackEvent>>,
     next_event_index: usize,
     playing: bool,
@@ -356,39 +508,22 @@ struct CallbackState {
     current_segment_index: usize,
     sample_rate: f32,
     samples_since_start: u64,
+    /// Sample count at which a song whose events are all dispatched is
+    /// considered finished.
+    finish_at_sample: Option<u64>,
+    flags: Arc<SharedFlags>,
+    faulted: bool,
 }
 
 impl CallbackState {
     fn new(
         command_consumer: HeapCons<AudioCommand>,
         sample_rate: f32,
-        soundfont_path: &Path,
-    ) -> Result<Self, AudioError> {
-        let mut synth = Synth::new(SynthDescriptor {
-            sample_rate,
-            audio_channels: 2,
-            gain: 0.35,
-            ..Default::default()
-        })
-        .map_err(|err| AudioError::SoundFontLoad(err.to_string()))?;
-
-        let mut file = File::open(soundfont_path).map_err(|err| {
-            AudioError::SoundFontLoad(format!("{}: {err}", soundfont_path.display()))
-        })?;
-        let font =
-            SoundFont::load(&mut file).map_err(|err| AudioError::SoundFontLoad(err.to_string()))?;
-        synth.add_font(font, true);
-
-        for channel in 0..16 {
-            let _ = synth.send_event(MidiEvent::ProgramChange {
-                channel,
-                program_id: 24,
-            });
-        }
-
-        Ok(Self {
+        flags: Arc<SharedFlags>,
+    ) -> Self {
+        Self {
             command_consumer,
-            synth,
+            synth: None,
             events: Arc::new(Vec::new()),
             next_event_index: 0,
             playing: false,
@@ -400,17 +535,39 @@ impl CallbackState {
             current_segment_index: 0,
             sample_rate,
             samples_since_start: 0,
-        })
+            finish_at_sample: None,
+            flags,
+            faulted: false,
+        }
+    }
+
+    fn all_notes_off(&mut self) {
+        if let Some(synth) = self.synth.as_mut() {
+            for channel in 0..16 {
+                let _ = synth.send_event(MidiEvent::AllNotesOff { channel });
+            }
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        self.playing = false;
+        self.finish_at_sample = None;
+        self.flags.playing.store(false, Ordering::Relaxed);
+        self.all_notes_off();
     }
 
     fn drain_commands(&mut self) {
         while let Some(command) = self.command_consumer.try_pop() {
             match command {
+                AudioCommand::InstallSynth(synth) => {
+                    self.synth = Some(synth);
+                }
                 AudioCommand::Play {
                     events,
                     tempo_segments,
                     start_tick,
                 } => {
+                    self.all_notes_off();
                     self.events = events;
                     self.tempo_segments = tempo_segments;
                     self.current_segment_index = 0;
@@ -420,17 +577,11 @@ impl CallbackState {
                         .position(|event| event.tick >= start_tick)
                         .unwrap_or(self.events.len());
                     self.samples_since_start = 0;
+                    self.finish_at_sample = None;
                     self.playing = true;
-                    for channel in 0..16 {
-                        let _ = self.synth.send_event(MidiEvent::AllNotesOff { channel });
-                    }
+                    self.flags.playing.store(true, Ordering::Relaxed);
                 }
-                AudioCommand::Stop => {
-                    self.playing = false;
-                    for channel in 0..16 {
-                        let _ = self.synth.send_event(MidiEvent::AllNotesOff { channel });
-                    }
-                }
+                AudioCommand::Stop => self.stop_playback(),
             }
         }
     }
@@ -456,13 +607,27 @@ impl CallbackState {
                         key: event.key,
                     },
                 };
-                let _ = self.synth.send_event(midi_event);
+                if let Some(synth) = self.synth.as_mut() {
+                    let _ = synth.send_event(midi_event);
+                }
                 self.next_event_index += 1;
+            }
+            if self.next_event_index >= self.events.len() {
+                let tail = (END_TAIL_SECONDS * self.sample_rate as f64) as u64;
+                let deadline = *self
+                    .finish_at_sample
+                    .get_or_insert(self.samples_since_start + tail);
+                if self.samples_since_start >= deadline {
+                    self.stop_playback();
+                }
             }
             self.samples_since_start += 1;
         }
 
-        self.synth.read_next()
+        match self.synth.as_mut() {
+            Some(synth) => synth.read_next(),
+            None => (0.0, 0.0),
+        }
     }
 
     /// Converts elapsed playback time into a musical tick, walking forward
@@ -485,11 +650,173 @@ fn write_data<T>(output: &mut [T], channels: usize, state: &mut CallbackState)
 where
     T: Sample + FromSample<f32>,
 {
-    for frame in output.chunks_mut(channels) {
+    for frame in output.chunks_mut(channels.max(1)) {
         let (left, right) = state.next_frame();
         for (index, sample) in frame.iter_mut().enumerate() {
             let value = if index % 2 == 0 { left } else { right };
             *sample = T::from_sample(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::MidiEventKind;
+
+    fn flags() -> Arc<SharedFlags> {
+        Arc::new(SharedFlags::default())
+    }
+
+    fn state_with_queue() -> (HeapProd<AudioCommand>, CallbackState, Arc<SharedFlags>) {
+        let (producer, consumer) = HeapRb::<AudioCommand>::new(16).split();
+        let flags = flags();
+        let state = CallbackState::new(consumer, 1_000.0, flags.clone());
+        (producer, state, flags)
+    }
+
+    fn one_note(tick_on: Tick, tick_off: Tick) -> Arc<Vec<MidiPlaybackEvent>> {
+        Arc::new(vec![
+            MidiPlaybackEvent {
+                tick: tick_on,
+                kind: MidiEventKind::NoteOn,
+                track_id: 0,
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+            MidiPlaybackEvent {
+                tick: tick_off,
+                kind: MidiEventKind::NoteOff,
+                track_id: 0,
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        ])
+    }
+
+    fn segments() -> Arc<Vec<TempoSegment>> {
+        Arc::new(vec![TempoSegment {
+            start_tick: 0,
+            start_seconds: 0.0,
+            seconds_per_tick: seconds_per_tick_for(120.0),
+        }])
+    }
+
+    #[test]
+    fn silent_until_synth_installed_and_play_sets_flag() {
+        let (mut producer, mut state, flags) = state_with_queue();
+        assert_eq!(state.next_frame(), (0.0, 0.0));
+        assert!(!flags.playing.load(Ordering::Relaxed));
+
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, 10),
+            tempo_segments: segments(),
+            start_tick: 0,
+        });
+        state.next_frame();
+        assert!(flags.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn stop_command_clears_playing_flag() {
+        let (mut producer, mut state, flags) = state_with_queue();
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, 10),
+            tempo_segments: segments(),
+            start_tick: 0,
+        });
+        state.next_frame();
+        let _ = producer.try_push(AudioCommand::Stop);
+        state.next_frame();
+        assert!(!flags.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn song_finishes_by_itself_after_the_release_tail() {
+        let (mut producer, mut state, flags) = state_with_queue();
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, 10),
+            tempo_segments: segments(),
+            start_tick: 0,
+        });
+        // 1 kHz sample rate: 2.0 s tail plus a little slack for the note.
+        for _ in 0..2_500 {
+            state.next_frame();
+        }
+        assert!(!flags.playing.load(Ordering::Relaxed));
+        assert!(!state.playing);
+    }
+
+    #[test]
+    fn song_with_events_keeps_playing_before_the_tail_elapses() {
+        let (mut producer, mut state, flags) = state_with_queue();
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, 10),
+            tempo_segments: segments(),
+            start_tick: 0,
+        });
+        for _ in 0..500 {
+            state.next_frame();
+        }
+        assert!(flags.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn missing_soundfont_is_an_error_not_a_panic() {
+        let result = build_synth(48_000.0, Path::new("definitely/not/here.sf3"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn corrupt_soundfont_is_reported_through_the_loader_channel() {
+        let dir = std::env::temp_dir().join(format!("bw-bad-sf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.sf3");
+        std::fs::write(&path, b"RIFF....sfbkgarbagegarbagegarbage").unwrap();
+
+        let receiver = spawn_synth_loader(48_000.0, path);
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("loader thread must always answer");
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn panic_messages_are_readable() {
+        let caught = catch_unwind(|| panic!("boom")).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "boom");
+    }
+
+    #[test]
+    #[ignore = "slow: loads the real 51 MB soundfont and renders audio"]
+    fn real_soundfont_loads_and_renders_a_song() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("soundfonts")
+            .join("MS Basic.sf3");
+        let started = std::time::Instant::now();
+        let synth = build_synth(48_000.0, &path).expect("soundfont should load");
+        eprintln!("soundfont load took {:?}", started.elapsed());
+
+        let (mut producer, consumer) = HeapRb::<AudioCommand>::new(16).split();
+        let flags = flags();
+        let mut state = CallbackState::new(consumer, 48_000.0, flags.clone());
+        let _ = producer.try_push(AudioCommand::InstallSynth(synth));
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, 240),
+            tempo_segments: segments(),
+            start_tick: 0,
+        });
+        let started = std::time::Instant::now();
+        let mut peak = 0.0_f32;
+        for _ in 0..48_000 * 2 {
+            let (left, right) = state.next_frame();
+            peak = peak.max(left.abs()).max(right.abs());
+        }
+        eprintln!("rendered 2 s of audio in {:?}, peak {peak}", started.elapsed());
+        assert!(peak > 0.001, "the note should be audible");
     }
 }

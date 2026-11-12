@@ -2,6 +2,8 @@ mod app;
 mod audio;
 mod core;
 mod format;
+mod fretboard;
+mod icons;
 mod notation;
 mod theme;
 

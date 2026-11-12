@@ -16,3 +16,18 @@ thiserror = "2.0.17"
 vst3 = "0.3.0"
 wmidi = "4.0.11"
 zip = "6.0.0"
+
+# Decoding the SF3 soundfont and running the synth are far too slow at
+# opt-level 0 (the first Play click froze the UI for tens of seconds), so the
+# audio dependencies are always optimized, even in debug builds. BetterWriter's
+# own code stays unoptimized so debugging is unaffected.
+[profile.dev.package.oxisynth]
+opt-level = 3
+[profile.dev.package.oxisynth-chorus]
+opt-level = 3
+[profile.dev.package.oxisynth-reverb]
+opt-level = 3
+[profile.dev.package.lewton]
+opt-level = 3
+[profile.dev.package.soundfont]
+opt-level = 3
