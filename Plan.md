@@ -777,15 +777,134 @@ separately), and a scripted Xvfb session for wheel zoom, a fretboard click,
 reports it, no crash), the View-menu toggle, the bright theme, the
 right-click submenus and the move / stretch drag previews.
 
+## 13.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Playback starts at the selection or edit cursor
+- [x] **Play and `Space` start where you are working**: from the first
+      selected note (single or area selection), otherwise from the edit
+      cursor. Clicking, arrowing and selecting a note all move the cursor, so
+      the cursor alone covers those; a selection dragged away from the cursor
+      still wins (`playback_start`). The status line reports the bar playback
+      begins in.
+- [x] **The audio clock starts at the start tick, not at zero.** The `Play`
+      command already carried a `start_tick` that only skipped earlier events,
+      so a mid-song start would have waited out the skipped time in silence.
+      `locate_tick` maps the start tick through the tempo segments and the
+      callback begins on that segment and sample offset, so tempo automation
+      before the start point is honoured.
+- [x] Nothing at or after the start point: Play reports it in the status bar
+      and does not start an empty 2 s tail.
+- [x] Tests: the clock offset (a later start sounds immediately), earlier
+      events skipped, a start past the last event only waits for the release
+      tail, `locate_tick` across tempo segments, playback continuing on the
+      later tempo, and start-tick selection rules. `cargo test`: 97 passed, 1
+      ignored (the real-soundfont render, not run in this pass). Not heard on
+      a real audio device.
+
+### 2. Per-track sound, volume and pan reach the synth
+- [x] **Each track's sound, volume and pan drive its MIDI channel.** Play
+      sends a `ChannelSetup` per track (bank 0 select, program change,
+      controller 7, controller 10), and the old "every channel is program 24"
+      loop in `build_synth` is gone. `sync_mix` runs once per frame and sends
+      a `SetChannels` command only when the project's setup changed, so edits,
+      undo, redo and project loads are heard immediately while playing.
+- [x] **Mute and solo now take effect**, by silencing the channel's volume
+      (a muted track, or every other track while one is soloed), so they also
+      work mid-playback and unmuting restores the track's own volume.
+- [x] **Track table is editable**: Solo / Mute toggles, a sound picker, a
+      volume drag value (0 to 127) and a pan drag value (`L64` to `R63`, `C`
+      centre; typing `L20`, `R5`, `C` or a plain number works). Changing the
+      sound, solo or mute is one undo step; a drag on volume or pan is one
+      step however long it is. The table scrolls and the panel is taller.
+- [x] **Sounds per instrument type** (`core/sounds.rs`): the picker lists the
+      sounds suited to the track's type (acoustic guitar, electric guitar,
+      bass, other), keeps a current sound that is outside that list
+      selectable, and the "All sounds" checkbox lists all 128 General MIDI
+      sounds. Names are the bundled soundfont's own preset names.
+- [x] **Channels never land on the drum channel.** The synth treats MIDI
+      channel index 9 as the drum kit whatever the program, so `.tg` import
+      assigns channels with `melodic_channel`, which skips it.
+- [x] **`.tg` import reads each channel's volume and balance** (they were
+      discarded and reset to 100 / centre), and types an imported track from
+      its sound (bass programs become bass, clean to harmonics electric).
+      Export shares the pan mapping, so volume and pan round-trip.
+- [x] Tests: channel setups (sound, volume, pan, mute, solo), the setup
+      events and their order, sync only sending real changes, sound lists and
+      names, drum-channel skipping, pan mapping and parsing, `.tg` round trip
+      of sound/volume/pan, and, in the real-soundfont test, that program 33
+      on channel 0 loads "Fingered Bass". `cargo test -- --include-ignored`:
+      113 passed. The track table was exercised in the running app under a
+      virtual display (open the picker, "All sounds", mute, volume and pan
+      drags, undo); no audio device was available to listen to the result.
+
+### 3. Track panel shows every track, scrolls and resizes
+- [x] **The track list fills the whole bottom panel.** Its content used a
+      one-row-tall `horizontal` layout, so the list and the separator stopped
+      mid-panel and only the first track was visible. The content now gets
+      the panel's full height; the list scrolls with an always-visible
+      scrollbar at the right, and the panel resizes by dragging its top edge
+      (default 110 px, up to 420; the code allows down to 72, but in testing
+      it would not shrink below about 110).
+- [x] The table uses fixed-width columns (`TRACK_COLUMNS`), so the header
+      row and the "All sounds" checkbox stay outside the scrolling list and
+      line up with it. The checkbox sits above the Sound column.
+
+### 4. Copy, cut and paste notes
+- [x] **`Ctrl+C`, `Ctrl+X`, `Ctrl+V`** and Edit > Cut / Copy / Paste work on
+      the selected note or the rubber-band selection (`core/clipboard.rs`).
+      egui reports these as `Copy` / `Cut` / `Paste` events, not key presses;
+      copying also puts a marker text on the system clipboard, because egui
+      only reports a paste while it holds text, and a paste is accepted only
+      while that text is still there (so Ctrl+V after copying something
+      else, elsewhere, does nothing).
+- [x] **Paste goes to the edit cursor** and leaves exactly the new notes
+      selected (including the tied pieces tab view cuts at barlines). Pasted
+      notes replace what they land on, on the same string: a note starting
+      inside a pasted note is removed and one sounding across its start is
+      cut there. Notes on strings the track lacks are skipped, and a tie
+      survives only when the note it continues was copied too.
+- [x] **Past the last bar**: when the cursor is at or beyond the end of the
+      bars, one bar is appended (it continues the last bar's time
+      signature) and the notes go to its start. Bars are also appended so a
+      long paste ends inside the track. Cut and paste are one undo step each.
+
+### 5. Dotted and double-dotted notes
+- [x] **Entry**: `.` toggles a dot and `Ctrl+.` two dots for the notes being
+      written and for the selected note; the toolbar has `.` and `..`
+      toggles next to the duration, the palette's dotted and double-dotted
+      buttons are enabled, and Note > Duration lists them. The dots stay on
+      until toggled off, like the duration itself.
+- [x] **Detection from the brick length** (`core/length.rs`): a length that is
+      exactly a note value with up to two dots (whole to 128th, plus dotted
+      and double-dotted wholes) is recognized. The staff shows it with its
+      dots, bricks show their dots at the end, and selecting a note says what
+      it is ("dotted quarter note (1/4.)"). Any other length shows as the
+      longest standard length that fits, capped at a whole note.
+- [x] Notes shortened to fit before the next note or the barline now land on
+      the longest standard length including dotted ones; stepping a note's
+      length with the arrows keeps its dots.
+- [x] **Tab view rhythm marks**: with the classic staff hidden, tab view draws
+      a stem per beat under the strings, with flags or beams for short
+      values and a dot for each augmentation dot (a whole note is an open
+      head). The marks come from the same bar data as the staff, so they
+      agree with it.
+- [x] **`.tg` dotted durations**: import read a double-dotted length as 1.25
+      times the value (it is 1.75), and export wrote every dotted length as
+      its plain value. Both are fixed and round-trip.
+- [x] Tests: dotted lengths, detection and labels, notation for double dots,
+      dotted wholes and every standard length, the longest-fitting rule,
+      length descriptions, `.tg` round trip of dotted lengths, and the
+      clipboard rules above. `cargo test -- --include-ignored`: 135 passed.
+      Panel layout, resizing, copy/paste (including past the last bar),
+      dotting by key and the tab rhythm marks were exercised in the running
+      app under a virtual display. Audio was tried by the user with the
+      per-track sounds from section 2.
+
 ---
 
 ## 🚧 Not yet done / future work
 
 ### Current issues:
-- [x] ~~Compilation not verified~~ — confirmed building clean with zero
-      warnings as of 17.08.2026 and 18.08.2026 (this pass has not yet had
-      its own build verified locally, same as every pass in this sandbox —
-      see the per-pass notes above).
 - [ ] Theme switching (19.08.2026, item 2) covers the biggest-impact colors
       but not every hardcoded one in `app.rs` — smaller accents (e.g. the
       P.M. label, playhead, selection-rectangle colors) weren't audited
@@ -796,9 +915,6 @@ right-click submenus and the move / stretch drag previews.
       equivalent for *stretching* a note's edges across strings (stretching
       only ever changes duration/start on the note's current string) — not
       requested, just noting the asymmetry.
-- [x] ~~Batch-moving an area-selection of note blocks together~~ —
-      implemented 18.08.2026, item 6 (drag the body of any selected note to
-      move the whole selection together).
 - [x] ~~Drag-to-stretch can't cross a bar boundary~~ — relaxed 18.08.2026,
       item 2, consistent with `insert_note`/`move_note`. `Shift+→` resizing
       (`set_note_duration_fluid`) is the one place that still can't cross a
@@ -934,7 +1050,13 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Left mouse drag to select area of notes, both vertically and horizontally, in tab view.
 - [ ] **Tempo map** (`tempo_bpm` is project-global today; needs per-tick tempo
       changes for the shadow-timeline playback to be sample-accurate).
-- [ ] Ties, grace notes, tuplets, dotted/double-dotted durations.
+- [ ] Grace notes and tuplets.
+- [ ] Rests are only split into plain note values (a dotted rest appears only
+      when it is the length being written), and no length is split into tied
+      dotted pieces when it is not a single standard value.
+- [ ] Copy and paste carries notes only: no rests, bar properties or tempo,
+      no paste into another track's bar grid beyond the cursor rule, and not
+      between two running copies of the app.
 - [ ] Real chord detection (multiple notes on one tick drawn as a chord block).
 - [ ] Instruments adding/deleting
 - [ ] Bar adding/deleting
@@ -958,11 +1080,17 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Verify audible output on a real device: a headless test renders
       `MS Basic.sf3` to a non-silent buffer (12.11.2026), but the `cpal`
       stream has never been heard in this sandbox (no sound card).
-- [ ] Playback always starts at tick 0 (Play button and `Space`); starting
-      from the edit cursor is open.
+- [ ] Playing from the middle does not sound notes already held at the start
+      tick (a tied continuation chosen as the start point stays silent until
+      its next attack).
 - [ ] Fretboard clicks don't audition the note.
-- [ ] Channel/program-per-track: each track's `program` should drive its MIDI
-      channel's patch on the synth (currently all channels forced to program 24).
+- [ ] Changing a track's sound, volume or pan does not audition: the new setup
+      is heard the next time notes play (live while playing, immediately).
+- [ ] Sounds other than the 128 General MIDI ones in bank 0 (the soundfont's
+      variation banks and the 37 drum kits in bank 128) are not selectable,
+      and there is no drum track type yet.
+- [ ] Track table: instrument type (which sound list a track gets) can't be
+      changed after creation, and channel assignment is not editable.
 - [ ] Real **VST3 hosting** via `vst3` crate (the `Vst3HostSlot` is currently a
       pass-through stub that only records loaded paths). Requires implementation of VST3 folder scanning (`C:\Program Files\Common Files\VST3`).
 
@@ -984,7 +1112,7 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Zoom holds only the row under the pointer in place; its horizontal
       position shifts because rows reflow to the page width.
 - [ ] Edition palette commands still drawn disabled: key signature, clef,
-      triplet feel, repeats, dotted / double-dotted, tuplet, fermata,
+      triplet feel, repeats, tuplet, fermata,
       crescendo / decrescendo, bend, harmonic, trill, grace note, tremolo
       bar, text, chord diagram. No voice 1/2 or select/draw modes.
 - [ ] Note effect glyphs rendered on the staff (palm-mute text exists; others
@@ -994,9 +1122,9 @@ right-click submenus and the move / stretch drag previews.
       used), no tuplets, grace notes, key signatures (every black key is a
       sharp) or clef changes; 5/8 and 7/8 beam by single eighths instead of
       3+2 groups.
-- [ ] Tab view has no stems/beams under the staff for use with the classic
-      staff hidden; with it hidden, rhythm is only readable from spacing and
-      rests.
+- [ ] Tab view rhythm marks (shown only with the classic staff hidden) have
+      no tuplets, no rest marks of their own (the tab rests stay as they
+      were), and beam groups follow the staff's beat grouping only.
 - [ ] Tab-view rests are derived, not stored: they re-chunk when the duration
       selection changes (e.g. three quarter rests become six eighth rests),
       unlike TuxGuitar where each rest beat keeps its own length.
@@ -1007,7 +1135,7 @@ right-click submenus and the move / stretch drag previews.
       10.11.2026).
 
 
-Info for left menu:
+# Info for left menu:
 Here are the official names for all the notation symbols and functions found on the left Edition Palette of Guitar Pro 8, broken down section by section from top to bottom.
 ## Section 1: Bar, Time Signature, and Repeats
 

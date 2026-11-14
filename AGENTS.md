@@ -118,3 +118,29 @@ cargo test
 - Newer compilers print an `f32` literal fallback warning for some existing
   `Stroke::new(1.0, ...)` calls. Use an explicit `_f32` suffix in new code so
   the warning count doesn't grow.
+
+### Limited sandboxes
+
+A cold build compiles egui, eframe and the audio crates, which takes several
+minutes on one core and can exceed a sandbox's per-command time limit. A
+command killed by the limit also kills the build it started.
+
+- Run long builds detached and poll the log, so the limit only applies to the
+  short polling commands:
+
+  ```
+  setsid nohup bash -c 'cargo test > /tmp/test.log 2>&1; echo EXIT:$? >> /tmp/test.log' \
+      > /dev/null 2>&1 < /dev/null &
+  tail -n 3 /tmp/test.log
+  ```
+
+- Run `cargo check --all-targets` while iterating: it skips code generation
+  and is much faster, but it does not warm the build `cargo test` needs, so
+  the first `cargo test` still compiles every dependency once.
+- Compiled dependencies survive in `target/`, so after the first build,
+  incremental `check` and `test` runs take seconds to a couple of minutes.
+  Don't `cargo clean`, and don't change `Cargo.toml` or `Cargo.lock` without
+  a reason, since that recompiles the dependencies.
+- `cargo test <filter>` takes a single filter; use `-- --skip <name>` or
+  separate runs for more.
+- Skip the ignored real-soundfont test unless audio code changed.

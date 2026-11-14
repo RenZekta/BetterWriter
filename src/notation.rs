@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use crate::core::length::{detect_length, standard_lengths};
+
 use crate::core::project::{
     InstrumentTrack, RestNode, StringedVariant, TICKS_PER_QUARTER, TabNote, Tick,
 };
@@ -123,31 +125,19 @@ impl NoteValue {
     }
 }
 
-/// The longest standard note value (plain or dotted) that fits in `ticks`.
-/// Durations longer than a whole note show as a whole note, and ones below a
-/// 128th as a 128th.
+/// How `ticks` is notated. A length that is exactly a note value with up to
+/// two dots shows as that, so a brick of one and a half quarters reads as a
+/// dotted quarter. Any other length shows as the longest standard length that
+/// fits, capped at a whole note and floored at a 128th.
 pub fn note_value_for(ticks: Tick) -> NoteValue {
-    let q = TICKS_PER_QUARTER;
-    let table: [(Tick, u32, u8); 14] = [
-        (q * 4, 1, 0),
-        (q * 3, 2, 1),
-        (q * 2, 2, 0),
-        (q * 3 / 2, 4, 1),
-        (q, 4, 0),
-        (q * 3 / 4, 8, 1),
-        (q / 2, 8, 0),
-        (q * 3 / 8, 16, 1),
-        (q / 4, 16, 0),
-        (q * 3 / 16, 32, 1),
-        (q / 8, 32, 0),
-        (q * 3 / 32, 64, 1),
-        (q / 16, 64, 0),
-        (q / 32, 128, 0),
-    ];
-    table
-        .iter()
-        .find(|(length, _, _)| *length <= ticks)
-        .map(|&(_, value, dots)| NoteValue { value, dots })
+    if let Some((value, dots)) = detect_length(ticks) {
+        return NoteValue { value, dots };
+    }
+    let whole = TICKS_PER_QUARTER * 4;
+    standard_lengths()
+        .into_iter()
+        .find(|(length, _, _)| *length <= ticks && *length <= whole)
+        .map(|(_, value, dots)| NoteValue { value, dots })
         .unwrap_or(NoteValue {
             value: 128,
             dots: 0,
@@ -473,6 +463,26 @@ mod tests {
         assert_eq!(value(q + 100), NoteValue { value: 4, dots: 0 });
         // Longer than a whole note stays a whole note.
         assert_eq!(value(q * 8), NoteValue { value: 1, dots: 0 });
+    }
+
+    #[test]
+    fn double_dots_and_dotted_wholes_are_recognized_from_the_length() {
+        let q = TICKS_PER_QUARTER;
+        let value = |ticks| note_value_for(ticks);
+        assert_eq!(value(q * 7 / 4), NoteValue { value: 4, dots: 2 });
+        assert_eq!(value(q * 7 / 2), NoteValue { value: 2, dots: 2 });
+        assert_eq!(value(q / 2 * 7 / 4), NoteValue { value: 8, dots: 2 });
+        assert_eq!(value(q * 6), NoteValue { value: 1, dots: 1 });
+        assert_eq!(value(q * 7), NoteValue { value: 1, dots: 2 });
+        // Just short of a double dot is not one; it rounds down to the dotted value.
+        assert_eq!(value(q * 7 / 4 - 1), NoteValue { value: 4, dots: 1 });
+    }
+
+    #[test]
+    fn every_standard_length_round_trips_through_its_notation() {
+        for (ticks, value, dots) in standard_lengths() {
+            assert_eq!(note_value_for(ticks), NoteValue { value, dots }, "{ticks}");
+        }
     }
 
     #[test]

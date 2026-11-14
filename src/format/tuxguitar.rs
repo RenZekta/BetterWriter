@@ -3,6 +3,8 @@ use std::io::{Cursor, Read};
 use crate::core::{
     BwxProject, NoteEffects, TICKS_PER_QUARTER, Tick,
     project::{InstrumentTrack, TabNote, TieOrigin, TimeSignature, TimeSignatureChange},
+    length::{detect_length, dotted_ticks},
+    sounds::{melodic_channel, midi_pan, pan_from_midi, variant_for_program},
 };
 
 use super::FormatError;
@@ -129,13 +131,14 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
 
     let channel_count = reader.read_u8()? as usize;
     let mut channel_programs = Vec::with_capacity(channel_count);
+    let mut channel_mixes = Vec::with_capacity(channel_count);
     let mut channel_names = Vec::with_capacity(channel_count);
     for _ in 0..channel_count {
         let _channel_id = reader.read_i16()? as u16;
         let _bank = reader.read_u8()?;
         let program = reader.read_u8()?;
-        let _volume = reader.read_u8()?;
-        let _balance = reader.read_u8()?;
+        let volume = reader.read_u8()?;
+        let balance = reader.read_u8()?;
         let _chorus = reader.read_u8()?;
         let _reverb = reader.read_u8()?;
         let _phaser = reader.read_u8()?;
@@ -147,6 +150,7 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             let _value = reader.read_i32_string()?;
         }
         channel_programs.push(program);
+        channel_mixes.push((volume.min(127), pan_from_midi(balance)));
         channel_names.push(name);
     }
 
@@ -197,6 +201,10 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             .get(channel_id.saturating_sub(1))
             .copied()
             .unwrap_or(24);
+        let (volume, pan) = channel_mixes
+            .get(channel_id.saturating_sub(1))
+            .copied()
+            .unwrap_or((100, 0));
         let mut notes = Vec::new();
 
         for header in &headers {
@@ -227,12 +235,12 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             } else {
                 name
             },
-            channel: track_index.min(15) as u8,
+            channel: melodic_channel(track_index),
             program,
             solo: track_flags & TRACK_SOLO != 0,
             mute: track_flags & TRACK_MUTE != 0,
-            volume: 100,
-            pan: 0,
+            volume,
+            pan,
             tuning: if tuning.is_empty() {
                 vec![64, 59, 55, 50, 45, 40]
             } else {
@@ -243,7 +251,7 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             notes,
             bar_count: (headers.len() as u32).max(1),
             instrument_family: crate::core::project::InstrumentFamily::Stringed,
-            stringed_variant: crate::core::project::StringedVariant::AcousticGuitar,
+            stringed_variant: variant_for_program(program),
         });
     }
 
@@ -280,7 +288,7 @@ pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
         writer.write_u8(0);
         writer.write_u8(track.program.min(127));
         writer.write_u8(track.volume.min(127));
-        writer.write_u8((64_i16 + track.pan as i16).clamp(0, 127) as u8);
+        writer.write_u8(midi_pan(track.pan));
         writer.write_u8(0);
         writer.write_u8(24);
         writer.write_u8(0);
@@ -600,13 +608,13 @@ impl<'a> TgReader<'a> {
             let _enters = self.read_u8()?;
             let _times = self.read_u8()?;
         }
-        let mut ticks = TICKS_PER_QUARTER * 4 / value as Tick;
-        if flags & DURATION_DOTTED != 0 {
-            ticks += ticks / 2;
-        }
-        if flags & DURATION_DOUBLE_DOTTED != 0 {
-            ticks += ticks / 4;
-        }
+        let dots = if flags & DURATION_DOUBLE_DOTTED != 0 {
+            2
+        } else {
+            u8::from(flags & DURATION_DOTTED != 0)
+        };
+        let ticks = dotted_ticks(value as u32, dots)
+            .unwrap_or_else(|| TICKS_PER_QUARTER * 4 / value as Tick);
         Ok(TgDuration { value, ticks })
     }
 
@@ -779,9 +787,18 @@ impl TgWriter {
     }
 
     fn write_duration(&mut self, ticks: Tick) {
-        let duration = duration_from_ticks(ticks);
-        self.write_u8(0);
-        self.write_u8(duration.value);
+        // A length that is exactly a (dotted) note value is written as that
+        // value plus its dot flag; any other length as the value it reaches.
+        let (value, dots) = match detect_length(ticks) {
+            Some((value, dots)) if value <= 64 => (value as u8, dots),
+            _ => (duration_from_ticks(ticks).value, 0),
+        };
+        self.write_u8(match dots {
+            1 => DURATION_DOTTED,
+            2 => DURATION_DOUBLE_DOTTED,
+            _ => 0,
+        });
+        self.write_u8(value);
     }
 
     fn write_note_effects(&mut self, effects: &NoteEffects) {
@@ -934,6 +951,7 @@ fn has_effects(effects: &NoteEffects) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::StringedVariant;
 
     #[test]
     fn tg_subset_round_trips_betterwriter_project() {
@@ -942,5 +960,60 @@ mod tests {
         let decoded = read_tg(&bytes).unwrap();
         assert_eq!(decoded.tracks.len(), project.tracks.len());
         assert!(!decoded.tracks[0].notes.is_empty());
+    }
+
+    #[test]
+    fn tg_round_trip_keeps_sound_volume_and_pan() {
+        let mut project = BwxProject::demo();
+        project.tracks[0].program = 29;
+        project.tracks[0].volume = 80;
+        project.tracks[0].pan = -20;
+        project.tracks[1].program = 35;
+        project.tracks[1].pan = 63;
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+
+        let first = &decoded.tracks[0];
+        assert_eq!((first.program, first.volume, first.pan), (29, 80, -20));
+        assert_eq!(first.stringed_variant, StringedVariant::ElectricGuitar);
+        let second = &decoded.tracks[1];
+        assert_eq!((second.program, second.pan), (35, 63));
+        assert_eq!(second.stringed_variant, StringedVariant::Bass);
+    }
+
+    #[test]
+    fn tg_round_trip_keeps_dotted_and_double_dotted_lengths() {
+        let q = TICKS_PER_QUARTER;
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        project.tracks[0].notes.clear();
+        // One whole bar: dotted quarter, eighth, double-dotted quarter,
+        // sixteenth.
+        let lengths = [q * 3 / 2, q / 2, q * 7 / 4, q / 4];
+        let mut tick = 0;
+        for length in lengths {
+            project.insert_note(track_id, tick, length, 0, 3).unwrap();
+            tick += length;
+        }
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        let read: Vec<Tick> = decoded.tracks[0]
+            .notes
+            .iter()
+            .map(|note| note.duration_ticks)
+            .collect();
+        assert_eq!(read, lengths);
+    }
+
+    #[test]
+    fn imported_tracks_skip_the_drum_channel() {
+        let mut project = BwxProject::demo();
+        let template = project.tracks[0].clone();
+        for index in 3..=11 {
+            let mut track = template.clone();
+            track.id = index;
+            project.tracks.push(track);
+        }
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        assert_eq!(decoded.tracks.len(), 11);
+        assert!(decoded.tracks.iter().all(|track| track.channel != 9));
     }
 }
