@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use crate::core::length::{detect_length, standard_lengths};
+use crate::core::ties::note_slices;
 
 use crate::core::project::{
     InstrumentTrack, RestNode, StringedVariant, TICKS_PER_QUARTER, TabNote, Tick,
@@ -144,12 +145,17 @@ pub fn note_value_for(ticks: Tick) -> NoteValue {
         })
 }
 
-/// One note head inside a chord.
+/// One note head inside a chord. A note that crosses a barline or whose
+/// length is no single note value is written as several heads joined by
+/// ties, one per piece; `piece_start` tells them apart.
 #[derive(Clone, Copy, Debug)]
 pub struct Head {
     pub note_id: u64,
+    pub piece_start: Tick,
     pub step: StaffStep,
     pub accidental: Option<Accidental>,
+    /// The `(note id, piece start)` of the head this one is tied from.
+    pub tie_from: Option<(u64, Tick)>,
 }
 
 /// Notes sharing an onset, drawn as one stem. The look is taken from the
@@ -201,15 +207,23 @@ pub struct BarScore {
     pub beams: Vec<BeamGroup>,
 }
 
+/// One written piece of a note that starts inside the bar being built.
+struct Onset<'a> {
+    note: &'a TabNote,
+    start: Tick,
+    length: Tick,
+    tie_from: Option<(u64, Tick)>,
+}
+
 /// Step of the middle line; stems point down for notes on or above it.
 const MIDDLE_STEP: f32 = 4.0;
 
 /// Builds the notation for the bar `[bar_start, bar_end)` of `track`.
 ///
 /// `rests` are the rests to draw in the bar (from
-/// `BwxProject::bar_rests`); notes that sustain in from an earlier bar are
-/// not repeated. `beat_ticks` is the beaming unit: chords are only joined
-/// within one beat.
+/// `BwxProject::bar_rests`). A note sustaining in from an earlier bar appears
+/// as a tied head at the start of this one. `beat_ticks` is the beaming unit:
+/// chords are only joined within one beat.
 pub fn score_bar(
     track: &InstrumentTrack,
     clef: Clef,
@@ -218,12 +232,35 @@ pub fn score_bar(
     rests: &[RestNode],
     beat_ticks: Tick,
 ) -> BarScore {
-    let mut onsets: Vec<&TabNote> = track
+    let mut onsets: Vec<Onset> = Vec::new();
+    for note in track
         .notes
         .iter()
-        .filter(|note| note.abs_tick >= bar_start && note.abs_tick < bar_end)
-        .collect();
-    onsets.sort_by_key(|note| (note.abs_tick, note.string_index));
+        .filter(|note| note.abs_tick < bar_end && note.end_tick() > bar_start)
+    {
+        let pieces = note_slices(track, note.abs_tick, note.end_tick());
+        for (index, &(start, end)) in pieces.iter().enumerate() {
+            if start < bar_start || start >= bar_end {
+                continue;
+            }
+            let tie_from = if index > 0 {
+                Some((note.id, pieces[index - 1].0))
+            } else {
+                track.tie_predecessor(note).map(|previous| {
+                    let last_piece =
+                        note_slices(track, previous.abs_tick, previous.end_tick()).last().map(|piece| piece.0);
+                    (previous.id, last_piece.unwrap_or(previous.abs_tick))
+                })
+            };
+            onsets.push(Onset {
+                note,
+                start,
+                length: end - start,
+                tie_from,
+            });
+        }
+    }
+    onsets.sort_by_key(|onset| (onset.start, onset.note.string_index));
 
     // Accidentals are remembered for the rest of the bar, per staff line or
     // space, so a repeated C# only gets its sharp once.
@@ -232,22 +269,23 @@ pub fn score_bar(
 
     let mut index = 0;
     while index < onsets.len() {
-        let tick = onsets[index].abs_tick;
-        let mut group: Vec<&TabNote> = Vec::new();
-        while index < onsets.len() && onsets[index].abs_tick == tick {
-            group.push(onsets[index]);
+        let tick = onsets[index].start;
+        let mut group: Vec<&Onset> = Vec::new();
+        while index < onsets.len() && onsets[index].start == tick {
+            group.push(&onsets[index]);
             index += 1;
         }
         let shortest = group
             .iter()
-            .map(|note| note.duration_ticks)
+            .map(|onset| onset.length)
             .min()
             .unwrap_or(TICKS_PER_QUARTER);
         let value = note_value_for(shortest);
 
         let heads: Vec<Head> = group
             .iter()
-            .map(|note| {
+            .map(|onset| {
+                let note = onset.note;
                 let pitch = spell(track.midi_key_for(note) as i32);
                 let before = remembered.get(&pitch.diatonic).copied().unwrap_or(0);
                 let accidental = if pitch.alteration != before {
@@ -262,8 +300,10 @@ pub fn score_bar(
                 };
                 Head {
                     note_id: note.id,
+                    piece_start: tick,
                     step: staff_step(clef, pitch),
                     accidental,
+                    tie_from: onset.tie_from,
                 }
             })
             .collect();
@@ -586,5 +626,64 @@ mod tests {
             ScoreItem::Rest { .. } => None,
         };
         assert_eq!(second, Some(Accidental::Natural));
+    }
+
+    fn chords(score: &BarScore) -> Vec<&Chord> {
+        score
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ScoreItem::Chord(chord) => Some(chord),
+                ScoreItem::Rest { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_length_with_no_single_note_value_is_written_as_tied_heads() {
+        let q = TICKS_PER_QUARTER;
+        let mut track = guitar();
+        track.notes = vec![note(1, 0, q + q / 4, 5, 3)];
+        let score = score_bar(&track, Clef::Treble, 0, 3840, &[], q);
+        let written = chords(&score);
+
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].value, NoteValue { value: 4, dots: 0 });
+        assert_eq!(written[0].heads[0].tie_from, None);
+        assert_eq!(written[1].tick, q);
+        assert_eq!(written[1].value, NoteValue { value: 16, dots: 0 });
+        assert_eq!(written[1].heads[0].tie_from, Some((1, 0)));
+    }
+
+    #[test]
+    fn a_note_crossing_a_barline_continues_as_a_tied_head_in_the_next_bar() {
+        let q = TICKS_PER_QUARTER;
+        let mut track = guitar();
+        track.bar_count = 2;
+        track.notes = vec![note(1, 3 * q, 2 * q, 5, 3)];
+
+        let first = score_bar(&track, Clef::Treble, 0, 4 * q, &[], q);
+        assert_eq!(chords(&first).len(), 1);
+        let second = score_bar(&track, Clef::Treble, 4 * q, 8 * q, &[], q);
+        let continued = chords(&second);
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].tick, 4 * q);
+        assert_eq!(continued[0].heads[0].tie_from, Some((1, 3 * q)));
+    }
+
+    #[test]
+    fn a_tied_note_points_at_the_last_piece_of_the_one_before_it() {
+        let q = TICKS_PER_QUARTER;
+        let mut track = guitar();
+        let mut second = note(2, q + q / 4, q, 5, 3);
+        second.tied_from_previous = Some(crate::core::project::TieOrigin::User);
+        track.notes = vec![note(1, 0, q + q / 4, 5, 3), second];
+
+        let score = score_bar(&track, Clef::Treble, 0, 4 * q, &[], q);
+        let tied = chords(&score)
+            .into_iter()
+            .find(|chord| chord.heads[0].note_id == 2)
+            .unwrap();
+        assert_eq!(tied.heads[0].tie_from, Some((1, q)));
     }
 }

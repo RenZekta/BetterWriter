@@ -1,17 +1,21 @@
 //! Conversion between brick view and tab view.
 //!
 //! Brick view stores a sustained note as one `TabNote` that may span any
-//! number of barlines. Tab view (Guitar Pro style) needs every note to sit
-//! inside a single bar, so a brick crossing a barline becomes a chain of
-//! tied notes. Slices cut from a brick are marked `TieOrigin::BrickSplit`;
-//! only those are re-joined when returning to brick view, so ties the user
-//! wrote deliberately (`TieOrigin::User`) survive as separate notes.
+//! number of barlines and have any length. Tab view (Guitar Pro style) needs
+//! every note to sit inside a single bar and to be writable as one note
+//! value, so a brick crossing a barline, or one whose length is not a note
+//! value with up to two dots, becomes a chain of tied notes. Slices cut from
+//! a brick are marked `TieOrigin::BrickSplit`; only those are re-joined when
+//! returning to brick view, so ties the user wrote deliberately
+//! (`TieOrigin::User`) survive as separate notes.
 
+use super::length::standard_pieces;
 use super::project::{BwxProject, InstrumentTrack, NoteEffects, TabNote, Tick, TieOrigin};
 
 impl BwxProject {
-    /// Cuts every note in every track at the barlines it crosses. Returns
-    /// whether anything changed. Idempotent.
+    /// Cuts every note in every track at the barlines it crosses and into
+    /// standard lengths where its length is not one. Returns whether
+    /// anything changed. Idempotent.
     pub fn split_bricks_at_barlines(&mut self) -> bool {
         let mut changed = false;
         let track_ids: Vec<u64> = self.tracks.iter().map(|track| track.id).collect();
@@ -27,10 +31,10 @@ impl BwxProject {
         changed
     }
 
-    /// Cuts one note at every barline it crosses. The first slice keeps the
-    /// note's id and effects; each later slice is a new note tied to the
-    /// one before it. Slices past the track's last bar extend `bar_count`
-    /// so every slice still lands inside a real bar.
+    /// Cuts one note at every barline it crosses and into standard lengths.
+    /// The first slice keeps the note's id and effects; each later slice is
+    /// a new note tied to the one before it. Slices past the track's last
+    /// bar extend `bar_count` so every slice still lands inside a real bar.
     pub fn split_note_at_barlines(&mut self, track_id: u64, note_id: u64) -> bool {
         let Some(track) = self.track(track_id) else {
             return false;
@@ -38,7 +42,7 @@ impl BwxProject {
         let Some(note) = track.notes.iter().find(|note| note.id == note_id) else {
             return false;
         };
-        let slices = bar_slices(track, note.abs_tick, note.end_tick());
+        let slices = note_slices(track, note.abs_tick, note.end_tick());
         if slices.len() < 2 {
             return false;
         }
@@ -154,6 +158,29 @@ impl BwxProject {
         }
         changed
     }
+
+    /// Moves each of `note_ids` by `delta` frets on its own string. If any
+    /// of them would leave the neck nothing moves and the result is `None`,
+    /// so a chord keeps its shape. Otherwise it is how many notes were found.
+    pub fn shift_note_frets(&mut self, track_id: u64, note_ids: &[u64], delta: i16) -> Option<usize> {
+        let track = self.track(track_id)?;
+        let targets: Vec<(u64, i16)> = track
+            .notes
+            .iter()
+            .filter(|note| note_ids.contains(&note.id))
+            .map(|note| (note.id, note.fret as i16 + delta))
+            .collect();
+        if targets
+            .iter()
+            .any(|&(_, fret)| fret < 0 || fret > track.fret_count as i16)
+        {
+            return None;
+        }
+        for &(id, fret) in &targets {
+            self.set_note_fret(track_id, id, fret as u8);
+        }
+        Some(targets.len())
+    }
 }
 
 /// Ids of every note tied together with `note_id` (including itself), found
@@ -197,6 +224,20 @@ fn tie_chain_ids(track: &InstrumentTrack, note_id: u64) -> Vec<u64> {
         }
     }
     chain
+}
+
+/// The pieces `[start, end)` is written as: cut at each bar boundary, then
+/// each bar's share cut into standard lengths.
+pub fn note_slices(track: &InstrumentTrack, start: Tick, end: Tick) -> Vec<(Tick, Tick)> {
+    let mut slices = Vec::new();
+    for (slice_start, slice_end) in bar_slices(track, start, end) {
+        let mut cursor = slice_start;
+        for length in standard_pieces(slice_end - slice_start) {
+            slices.push((cursor, cursor + length));
+            cursor += length;
+        }
+    }
+    slices
 }
 
 /// `[start, end)` pieces of `[start, end)` cut at each bar boundary.
@@ -421,5 +462,91 @@ mod tests {
         assert!(project.toggle_user_tie(1, second));
         assert!(project.toggle_user_tie(1, second));
         assert_eq!(project.tracks[0].notes[1].tied_from_previous, None);
+    }
+
+    #[test]
+    fn a_length_that_is_no_note_value_splits_into_tied_standard_lengths() {
+        let mut project = project_with_bars(1);
+        let id = project
+            .insert_note(1, 0, TICKS_PER_QUARTER + TICKS_PER_QUARTER / 4, 2, 4)
+            .unwrap();
+        assert!(project.split_bricks_at_barlines());
+
+        let notes = &project.tracks[0].notes;
+        assert_eq!(notes.len(), 2);
+        let head = notes.iter().find(|note| note.id == id).unwrap();
+        assert_eq!(
+            (head.abs_tick, head.duration_ticks),
+            (0, TICKS_PER_QUARTER)
+        );
+        let tail = notes.iter().find(|note| note.id != id).unwrap();
+        assert_eq!(
+            (tail.abs_tick, tail.duration_ticks),
+            (TICKS_PER_QUARTER, TICKS_PER_QUARTER / 4)
+        );
+        assert_eq!(tail.tied_from_previous, Some(TieOrigin::BrickSplit));
+        assert!(!project.split_bricks_at_barlines());
+    }
+
+    #[test]
+    fn merging_restores_a_brick_cut_into_standard_lengths() {
+        let mut project = project_with_bars(1);
+        let length = TICKS_PER_QUARTER + TICKS_PER_QUARTER / 4;
+        let id = project.insert_note(1, 0, length, 2, 4).unwrap();
+        project.split_bricks_at_barlines();
+        assert!(project.merge_brick_ties());
+
+        let notes = &project.tracks[0].notes;
+        assert_eq!(notes.len(), 1);
+        assert_eq!((notes[0].id, notes[0].duration_ticks), (id, length));
+    }
+
+    #[test]
+    fn each_bar_of_a_crossing_brick_is_cut_into_standard_lengths_on_its_own() {
+        let mut project = project_with_bars(2);
+        // Starts a quarter and a sixteenth before the barline and runs the
+        // same distance past it.
+        let reach = TICKS_PER_QUARTER + TICKS_PER_QUARTER / 4;
+        project.insert_note(1, BAR - reach, reach * 2, 0, 1).unwrap();
+        project.split_bricks_at_barlines();
+        let spans: Vec<(Tick, Tick)> = project.tracks[0]
+            .notes
+            .iter()
+            .map(|note| (note.abs_tick, note.duration_ticks))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (BAR - reach, TICKS_PER_QUARTER),
+                (BAR - TICKS_PER_QUARTER / 4, TICKS_PER_QUARTER / 4),
+                (BAR, TICKS_PER_QUARTER),
+                (BAR + TICKS_PER_QUARTER, TICKS_PER_QUARTER / 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn shifting_frets_moves_every_note_or_none() {
+        let mut project = project_with_bars(1);
+        let low = project.insert_note(1, 0, TICKS_PER_QUARTER, 0, 0).unwrap();
+        let high = project.insert_note(1, 0, TICKS_PER_QUARTER, 1, 5).unwrap();
+
+        assert_eq!(project.shift_note_frets(1, &[low, high], 1), Some(2));
+        let frets: Vec<u8> = project.tracks[0].notes.iter().map(|note| note.fret).collect();
+        assert_eq!(frets, vec![1, 6]);
+
+        // Going down would push the first note below the open string.
+        assert_eq!(project.shift_note_frets(1, &[low, high], -2), None);
+        let frets: Vec<u8> = project.tracks[0].notes.iter().map(|note| note.fret).collect();
+        assert_eq!(frets, vec![1, 6]);
+    }
+
+    #[test]
+    fn shifting_frets_stops_at_the_top_of_the_neck() {
+        let mut project = project_with_bars(1);
+        let top = project.tracks[0].fret_count;
+        let id = project.insert_note(1, 0, TICKS_PER_QUARTER, 0, top).unwrap();
+        assert_eq!(project.shift_note_frets(1, &[id], 1), None);
+        assert_eq!(project.shift_note_frets(1, &[], 1), Some(0));
     }
 }

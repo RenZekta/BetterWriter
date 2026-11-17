@@ -25,6 +25,8 @@ pub struct NoteClip {
 pub struct PasteOutcome {
     /// Tick the first pasted note landed on.
     pub start_tick: Tick,
+    /// Where the last pasted note stops.
+    pub end_tick: Tick,
     pub note_ids: Vec<u64>,
     pub bars_added: u32,
 }
@@ -156,6 +158,7 @@ impl BwxProject {
 
         Some(PasteOutcome {
             start_tick: start,
+            end_tick: last_end,
             note_ids: ids,
             bars_added,
         })
@@ -230,6 +233,23 @@ mod tests {
             onsets(&project, track_id),
             [(0, 0, 1), (Q, 1, 2), (Q * 4, 0, 1), (Q * 5, 1, 2)]
         );
+    }
+
+    #[test]
+    fn the_outcome_ends_where_the_last_pasted_note_stops() {
+        let (mut project, track_id) = project_with(&[(0, Q, 0, 1), (Q, Q * 2, 1, 2)]);
+        let clip = clip_of_all(&project, track_id);
+        let outcome = project.paste_notes(track_id, &clip, Q * 4).unwrap();
+        assert_eq!(outcome.start_tick, Q * 4);
+        assert_eq!(outcome.end_tick, Q * 7);
+
+        let single = NoteClip::from_track(
+            project.track(track_id).unwrap(),
+            &[project.track(track_id).unwrap().notes[0].id],
+        )
+        .unwrap();
+        let outcome = project.paste_notes(track_id, &single, Q * 8).unwrap();
+        assert_eq!(outcome.end_tick, Q * 9);
     }
 
     #[test]

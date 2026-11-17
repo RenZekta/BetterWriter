@@ -417,6 +417,7 @@ impl BwxProject {
                 change.at_tick += width;
             }
         }
+        track.shift_bar_marks(bar_start, width);
         track.bar_count = track.bar_count.saturating_add(1);
         track.sort_notes();
         true
@@ -448,6 +449,7 @@ impl BwxProject {
                 change.at_tick += width;
             }
         }
+        track.shift_bar_marks(bar_end, width);
         track.bar_count = track.bar_count.saturating_add(1);
         track.sort_notes();
         true
@@ -487,6 +489,10 @@ impl BwxProject {
                 change.at_tick -= width;
             }
         }
+        track
+            .bar_marks
+            .retain(|mark| mark.at_tick < bar_start || mark.at_tick >= bar_end);
+        track.shift_bar_marks(bar_end, -width);
         if track
             .time_signature_changes
             .first()
@@ -512,6 +518,7 @@ impl BwxProject {
     /// where the last sounding note stops to the barline. Rests are never
     /// generated mid-bar. A bar with nothing sounding in it gets a single
     /// bar-length rest, whatever its time signature.
+    #[allow(dead_code)]
     pub fn tail_padding_rests(&self, track_id: u64, measure_tick: Tick) -> Vec<RestNode> {
         self.bar_rests(track_id, measure_tick, RestFill::BarEnd)
     }
@@ -581,10 +588,68 @@ impl BwxProject {
     }
 }
 
+impl BwxProject {
+    /// Removes the rest of `fill` that contains `tick` by pulling the notes
+    /// after it, in the same bar, left by its length; the bar's tail then
+    /// fills with rests again. A note that sustains past the barline (or is
+    /// tied to a note in the next bar) stays where it is, and so does
+    /// everything from that note onward, so the freed space ends up right
+    /// before it. Returns the removed length, or `None` when there is no
+    /// rest at `tick` or nothing after it would move.
+    pub fn delete_rest(&mut self, track_id: u64, tick: Tick, fill: RestFill) -> Option<Tick> {
+        let rest = self
+            .bar_rests(track_id, tick, fill)
+            .into_iter()
+            .find(|rest| rest.abs_tick <= tick && tick < rest.abs_tick + rest.duration_ticks)?;
+        let track = self.track_mut(track_id)?;
+        let (_, bar_end) = track.measure_bounds_at(tick);
+        let rest_end = rest.abs_tick + rest.duration_ticks;
+
+        let carries_on = |note: &TabNote| {
+            note.end_tick() > bar_end
+                || (note.end_tick() == bar_end
+                    && track.notes.iter().any(|next| {
+                        next.string_index == note.string_index
+                            && next.abs_tick == bar_end
+                            && track.is_tied_continuation(next)
+                    }))
+        };
+        let anchor_tick = track
+            .notes
+            .iter()
+            .filter(|note| note.abs_tick >= rest_end && note.abs_tick < bar_end)
+            .filter(|note| carries_on(note))
+            .map(|note| note.abs_tick)
+            .min()
+            .unwrap_or(bar_end);
+
+        let movable: Vec<u64> = track
+            .notes
+            .iter()
+            .filter(|note| note.abs_tick >= rest_end && note.abs_tick < anchor_tick)
+            .map(|note| note.id)
+            .collect();
+        if movable.is_empty() {
+            return None;
+        }
+        for note in track
+            .notes
+            .iter_mut()
+            .filter(|note| movable.contains(&note.id))
+        {
+            note.abs_tick -= rest.duration_ticks;
+        }
+        track.sort_notes();
+        Some(rest.duration_ticks)
+    }
+}
+
 /// Which gaps of a bar get rests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestFill {
-    /// Only the stretch after the last sounding note (brick view).
+    /// Only the stretch after the last sounding note. No view draws this
+    /// policy today.
+    #[allow(dead_code)]
     BarEnd,
     /// Every stretch where nothing sounds, as TuxGuitar does. Gaps are cut
     /// into `preferred`-sized rests where they fit, so each slot a note of
@@ -1167,5 +1232,113 @@ mod tests {
         ));
         assert!(project.delete_tempo_point(TICKS_PER_QUARTER * 4));
         assert_eq!(project.tempo_points.len(), 1);
+    }
+
+    fn quarter_fill() -> RestFill {
+        RestFill::AllGaps {
+            preferred: TICKS_PER_QUARTER,
+        }
+    }
+
+    fn one_bar_project() -> (BwxProject, u64) {
+        let mut project = BwxProject::empty_with_track(
+            "t",
+            crate::core::InstrumentFamily::Stringed,
+            crate::core::StringedVariant::AcousticGuitar,
+            6,
+        );
+        project.tracks[0].bar_count = 2;
+        (project, 1)
+    }
+
+    fn spans(project: &BwxProject, track_id: u64) -> Vec<(Tick, Tick)> {
+        project
+            .track(track_id)
+            .unwrap()
+            .notes
+            .iter()
+            .map(|note| (note.abs_tick, note.duration_ticks))
+            .collect()
+    }
+
+    #[test]
+    fn deleting_a_rest_pulls_the_later_notes_of_the_bar_left() {
+        let (mut project, id) = one_bar_project();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(id, 0, q, 0, 1);
+        project.insert_note(id, q * 2, q, 0, 2);
+        project.insert_note(id, q * 3, q, 1, 3);
+
+        assert_eq!(project.delete_rest(id, q, quarter_fill()), Some(q));
+        assert_eq!(spans(&project, id), vec![(0, q), (q, q), (q * 2, q)]);
+
+        let rests = project.bar_rests(id, 0, quarter_fill());
+        assert_eq!(rests.len(), 1);
+        assert_eq!((rests[0].abs_tick, rests[0].duration_ticks), (q * 3, q));
+    }
+
+    #[test]
+    fn deleting_a_rest_leaves_other_bars_alone() {
+        let (mut project, id) = one_bar_project();
+        let q = TICKS_PER_QUARTER;
+        let bar = q * 4;
+        project.insert_note(id, q * 2, q, 0, 1);
+        project.insert_note(id, bar + q * 2, q, 0, 2);
+
+        assert_eq!(project.delete_rest(id, 0, quarter_fill()), Some(q));
+        assert_eq!(spans(&project, id), vec![(q, q), (bar + q * 2, q)]);
+    }
+
+    #[test]
+    fn a_note_tied_into_the_next_bar_keeps_its_place() {
+        let (mut project, id) = one_bar_project();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(id, 0, q, 0, 1);
+        project.insert_note(id, q * 2, q, 1, 2);
+        project.insert_note(id, q * 3, q * 2, 0, 5);
+        project.split_bricks_at_barlines();
+
+        assert_eq!(project.delete_rest(id, q, quarter_fill()), Some(q));
+        assert_eq!(
+            spans(&project, id),
+            vec![(0, q), (q, q), (q * 3, q), (q * 4, q)]
+        );
+    }
+
+    #[test]
+    fn a_rest_right_before_a_tied_note_cannot_be_deleted() {
+        let (mut project, id) = one_bar_project();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(id, q * 3, q * 2, 0, 5);
+        project.split_bricks_at_barlines();
+        let before = project.clone();
+
+        assert_eq!(project.delete_rest(id, q * 2, quarter_fill()), None);
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn a_trailing_rest_and_an_empty_bar_have_nothing_to_pull() {
+        let (mut project, id) = one_bar_project();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(id, 0, q, 0, 1);
+        assert_eq!(project.delete_rest(id, q * 2, quarter_fill()), None);
+        assert_eq!(project.delete_rest(id, q * 4, quarter_fill()), None);
+        assert_eq!(project.delete_rest(id, 0, quarter_fill()), None);
+    }
+
+    #[test]
+    fn deleting_a_rest_keeps_user_ties_inside_the_bar_together() {
+        let (mut project, id) = one_bar_project();
+        let q = TICKS_PER_QUARTER;
+        project.insert_note(id, q * 2, q, 0, 4);
+        project.insert_note(id, q * 3, q, 0, 4);
+        let tied = project.track(id).unwrap().notes[1].id;
+        assert!(project.toggle_user_tie(id, tied));
+
+        project.delete_rest(id, 0, quarter_fill());
+        let track = project.track(id).unwrap();
+        assert!(track.notes.iter().all(|note| note.abs_tick < q * 3));
+        assert!(track.is_tied_continuation(&track.notes[1]));
     }
 }

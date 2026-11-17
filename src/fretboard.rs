@@ -4,6 +4,8 @@
 
 use eframe::egui::{Pos2, Rect};
 
+use crate::core::project::{InstrumentTrack, Tick};
+
 const LABEL_WIDTH: f32 = 34.0;
 const OPEN_ZONE_WIDTH: f32 = 30.0;
 const RIGHT_PAD: f32 = 14.0;
@@ -14,6 +16,25 @@ const STRING_EDGE: f32 = 7.0;
 /// Panel height that keeps strings comfortably clickable for `string_count`.
 pub fn panel_height(string_count: usize) -> f32 {
     (TOP_PAD + NUMBER_STRIP + 2.0 * STRING_EDGE + 15.0 * string_count as f32).clamp(112.0, 200.0)
+}
+
+/// A note sounding on the neck: its string, its fret, and whether it has
+/// just been struck (a filled marker) rather than ringing on (a ring).
+pub type Marker = (usize, u8, bool);
+
+/// The notes of `track` sounding at `tick`. A note counts as struck for its
+/// first `onset_ticks` ticks, unless it is the tied continuation of a note
+/// that already sounded.
+pub fn sounding_markers(track: &InstrumentTrack, tick: Tick, onset_ticks: Tick) -> Vec<Marker> {
+    track
+        .notes
+        .iter()
+        .filter(|note| note.abs_tick <= tick && tick < note.end_tick())
+        .map(|note| {
+            let struck = tick - note.abs_tick < onset_ticks && !track.is_tied_continuation(note);
+            (note.string_index, note.fret, struck)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +198,44 @@ mod tests {
             strings,
             24,
         )
+    }
+
+    fn track_with_notes() -> InstrumentTrack {
+        let mut project = crate::core::project::BwxProject::demo();
+        let track = &mut project.tracks[0];
+        track.notes.clear();
+        let mut track = track.clone();
+        for (id, tick, string, fret) in [(1, 0, 5, 3), (2, 480, 4, 2)] {
+            track.notes.push(crate::core::project::TabNote {
+                id,
+                abs_tick: tick,
+                duration_ticks: 960,
+                string_index: string,
+                fret,
+                ..track_note_template()
+            });
+        }
+        track
+    }
+
+    fn track_note_template() -> crate::core::project::TabNote {
+        crate::core::project::BwxProject::demo().tracks[0].notes[0].clone()
+    }
+
+    #[test]
+    fn a_note_is_struck_only_at_its_start() {
+        let track = track_with_notes();
+        assert_eq!(sounding_markers(&track, 0, 1), vec![(5, 3, true)]);
+        assert_eq!(sounding_markers(&track, 100, 1), vec![(5, 3, false)]);
+        assert_eq!(sounding_markers(&track, 100, 240), vec![(5, 3, true)]);
+    }
+
+    #[test]
+    fn every_sounding_note_is_marked_and_ended_ones_are_not() {
+        let track = track_with_notes();
+        let at = sounding_markers(&track, 600, 240);
+        assert_eq!(at, vec![(5, 3, false), (4, 2, true)]);
+        assert_eq!(sounding_markers(&track, 1440, 240), Vec::<Marker>::new());
     }
 
     #[test]

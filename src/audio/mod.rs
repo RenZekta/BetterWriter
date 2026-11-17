@@ -1,11 +1,10 @@
 use std::{
     fs::File,
-    marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, TryRecvError},
     },
 };
@@ -20,8 +19,12 @@ use ringbuf::{
     traits::{Consumer, Producer, Split},
 };
 use thiserror::Error;
-use vst3::Steinberg::{IPluginFactory, Vst::IAudioProcessor};
-
+use crate::{
+    plugins::{
+        host::{Graph, LivePlugin},
+        vst3::NoteEvent,
+    },
+};
 use crate::core::{
     BwxProject, MidiEventKind, MidiPlaybackEvent, TICKS_PER_QUARTER, TempoTransition, Tick,
     sounds::midi_pan,
@@ -161,20 +164,20 @@ fn setup_events(setup: ChannelSetup) -> [MidiEvent; 5] {
     ]
 }
 
-/// Time after the last scheduled event before playback counts as finished, so
-/// note releases and reverb are not cut off.
-const END_TAIL_SECONDS: f64 = 2.0;
-
 /// Stack size for the soundfont loader thread. Decoding an SF3 allocates and
 /// recurses far more than a default thread stack comfortably allows.
 const LOADER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 enum AudioCommand {
     InstallSynth(Box<Synth>),
+    /// The plug-in chains to run; replaces the previous graph.
+    SetGraph(Arc<Graph>),
     Play {
         events: Arc<Vec<MidiPlaybackEvent>>,
         tempo_segments: Arc<Vec<TempoSegment>>,
         start_tick: Tick,
+        /// Playback counts as finished once the clock reaches this tick.
+        end_tick: Tick,
         channels: Arc<Vec<ChannelSetup>>,
     },
     /// Applies new channel setups without touching playback.
@@ -202,8 +205,11 @@ pub enum AudioError {
 #[derive(Default)]
 struct SharedFlags {
     /// True from the moment the callback starts a song until it stops or the
-    /// song (plus its release tail) has finished.
+    /// clock reaches the song's end. Notes still ringing at the end keep
+    /// sounding after this goes false.
     playing: AtomicBool,
+    /// The song position in ticks, as `f64` bits, kept current while playing.
+    position: AtomicU64,
     /// Set when the audio callback panicked; the runtime rebuilds the stream
     /// the next time playback is requested.
     faulted: AtomicBool,
@@ -213,6 +219,7 @@ struct PendingPlay {
     events: Vec<MidiPlaybackEvent>,
     tempo_segments: Vec<TempoSegment>,
     start_tick: Tick,
+    end_tick: Tick,
 }
 
 type LoaderResult = Result<Box<Synth>, String>;
@@ -232,6 +239,9 @@ pub struct AudioRuntime {
     /// Channel setups last handed to the synth, or about to be with the next
     /// Play; `sync_mix` only sends a command when the project's differ.
     mix: Vec<ChannelSetup>,
+    /// The plug-in chains last handed to the audio thread.
+    graph: Arc<Graph>,
+    graph_key: Vec<u64>,
     status: String,
 }
 
@@ -250,7 +260,27 @@ impl AudioRuntime {
             synth_installed: false,
             pending_play: None,
             mix: Vec::new(),
+            graph: Arc::new(Graph::default()),
+            graph_key: Vec::new(),
             status: "Audio engine idle".to_owned(),
+        }
+    }
+
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// Hands the audio thread a new set of plug-in chains. Does nothing when
+    /// the chains are the same plug-ins in the same places as before.
+    pub fn set_graph(&mut self, graph: Graph) {
+        let key = graph.key();
+        if key == self.graph_key {
+            return;
+        }
+        self.graph_key = key;
+        self.graph = Arc::new(graph);
+        if self.stream.is_some() {
+            let _ = self.producer.try_push(AudioCommand::SetGraph(self.graph.clone()));
         }
     }
 
@@ -263,6 +293,15 @@ impl AudioRuntime {
     /// True while the soundfont is still being decoded on the loader thread.
     pub fn is_loading(&self) -> bool {
         self.loader.is_some()
+    }
+
+    /// Where the song is right now, in ticks, while it plays. The position
+    /// follows the tempo clock continuously, not the notes.
+    pub fn playback_tick(&self) -> Option<f64> {
+        self.flags
+            .playing
+            .load(Ordering::Relaxed)
+            .then(|| f64::from_bits(self.flags.position.load(Ordering::Relaxed)))
     }
 
     pub fn is_playing(&self) -> bool {
@@ -376,6 +415,7 @@ impl AudioRuntime {
         self.sample_rate = sample_rate;
         self.synth_installed = false;
         self.loader = None;
+        let _ = self.producer.try_push(AudioCommand::SetGraph(self.graph.clone()));
         self.status = format!("Audio device open: {sample_rate} Hz, {channels} channels");
         Ok(())
     }
@@ -405,7 +445,12 @@ impl AudioRuntime {
     ) -> Result<(), AudioError> {
         self.ensure_stream()?;
         self.mix = channel_setups(project);
+        let last_event_tick = events.iter().map(|event| event.tick).max().unwrap_or(0);
         let pending = PendingPlay {
+            end_tick: project
+                .playback_end_tick()
+                .unwrap_or(0)
+                .max(last_event_tick),
             events,
             tempo_segments: build_tempo_segments(project),
             start_tick,
@@ -458,6 +503,7 @@ impl AudioRuntime {
                 events: Arc::new(pending.events),
                 tempo_segments: Arc::new(pending.tempo_segments),
                 start_tick: pending.start_tick,
+                end_tick: pending.end_tick,
                 channels: Arc::new(self.mix.clone()),
             })
             .map_err(|_| {
@@ -467,11 +513,21 @@ impl AudioRuntime {
     }
 }
 
+/// Audio groups of the synth: channel `n` is group `n`, the last is the
+/// reverb and chorus return.
+const SYNTH_GROUPS: u8 = 17;
+
+/// The synth renders, and plug-ins run, in blocks of this many frames.
+const BLOCK: usize = 64;
+
 /// Builds the synth and loads the soundfont. Runs on the loader thread.
 fn build_synth(sample_rate: f32, soundfont_path: &Path) -> LoaderResult {
     let mut synth = Synth::new(SynthDescriptor {
         sample_rate,
         audio_channels: 2,
+        // One group per MIDI channel plus one for reverb and chorus, so
+        // each track's sound can run through its own plug-in chain.
+        audio_groups: SYNTH_GROUPS,
         gain: 0.35,
         ..Default::default()
     })
@@ -515,47 +571,6 @@ fn spawn_synth_loader(sample_rate: f32, soundfont_path: PathBuf) -> mpsc::Receiv
             let _ = sender.send(result);
         });
     receiver
-}
-
-pub trait VstHost {
-    fn load_plugin(&mut self, path: &Path) -> Result<(), String>;
-    fn process_replacing(&mut self, input: &[f32], output: &mut [f32]);
-    fn status(&self) -> String;
-}
-
-#[derive(Default)]
-pub struct Vst3HostSlot {
-    loaded_plugins: Vec<PathBuf>,
-    _api_marker: PhantomData<fn() -> (*mut IPluginFactory, *mut IAudioProcessor)>,
-}
-
-impl VstHost for Vst3HostSlot {
-    fn load_plugin(&mut self, path: &Path) -> Result<(), String> {
-        let extension = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if extension != "vst3" {
-            return Err("expected a .vst3 bundle or module".to_owned());
-        }
-        self.loaded_plugins.push(path.to_path_buf());
-        Ok(())
-    }
-
-    fn process_replacing(&mut self, input: &[f32], output: &mut [f32]) {
-        let len = input.len().min(output.len());
-        output[..len].copy_from_slice(&input[..len]);
-        output[len..].fill(0.0);
-    }
-
-    fn status(&self) -> String {
-        if self.loaded_plugins.is_empty() {
-            "VST3 host slot: ready, no plug-in loaded".to_owned()
-        } else {
-            format!("VST3 plug-ins loaded: {}", self.loaded_plugins.len())
-        }
-    }
 }
 
 fn build_stream<T>(
@@ -612,11 +627,23 @@ struct CallbackState {
     /// Position on the tempo clock in samples, counted from tick 0 of the
     /// song. A play that starts mid-song begins at its start tick's offset.
     samples_since_start: u64,
-    /// Sample count at which a song whose events are all dispatched is
-    /// considered finished.
-    finish_at_sample: Option<u64>,
+    end_tick: Tick,
     flags: Arc<SharedFlags>,
     faulted: bool,
+    graph: Arc<Graph>,
+    /// Channels whose chain holds an instrument plug-in: the soundfont is
+    /// silent there and the notes go to the plug-in.
+    instrument_channels: [bool; 16],
+    /// Volume and pan of each channel, for the instrument plug-ins' output.
+    channel_mix: [(u8, u8); 16],
+    /// Notes for the plug-ins in the block being rendered, per channel.
+    notes: [Vec<NoteEvent>; 16],
+    /// Instrument notes that were started and not yet ended, so a stop can
+    /// end them.
+    sounding: Vec<(u8, u8)>,
+    block_left: [f32; BLOCK],
+    block_right: [f32; BLOCK],
+    block_pos: usize,
 }
 
 impl CallbackState {
@@ -639,9 +666,39 @@ impl CallbackState {
             current_segment_index: 0,
             sample_rate,
             samples_since_start: 0,
-            finish_at_sample: None,
+            end_tick: 0,
             flags,
             faulted: false,
+            graph: Arc::new(Graph::default()),
+            instrument_channels: [false; 16],
+            channel_mix: [(100, 64); 16],
+            notes: std::array::from_fn(|_| Vec::with_capacity(64)),
+            sounding: Vec::with_capacity(256),
+            block_left: [0.0; BLOCK],
+            block_right: [0.0; BLOCK],
+            block_pos: BLOCK,
+        }
+    }
+
+    fn set_graph(&mut self, graph: Arc<Graph>) {
+        self.end_instrument_notes();
+        self.instrument_channels = std::array::from_fn(|channel| {
+            graph.channels[channel].iter().any(|plugin| plugin.is_instrument)
+        });
+        self.graph = graph;
+    }
+
+    /// Ends every note an instrument plug-in is still holding, at the start
+    /// of the next block.
+    fn end_instrument_notes(&mut self) {
+        for (channel, key) in self.sounding.drain(..) {
+            self.notes[usize::from(channel)].push(NoteEvent {
+                offset: 0,
+                on: false,
+                channel: 0,
+                key,
+                velocity: 0.0,
+            });
         }
     }
 
@@ -661,13 +718,22 @@ impl CallbackState {
                 }
             }
         }
+        for setup in setups {
+            self.channel_mix[usize::from(setup.channel.min(15))] = (setup.volume, setup.pan);
+        }
+    }
+
+    /// Ends the transport but leaves the synth alone, so releases, reverb
+    /// and delay ring out.
+    fn finish_playback(&mut self) {
+        self.playing = false;
+        self.flags.playing.store(false, Ordering::Relaxed);
     }
 
     fn stop_playback(&mut self) {
-        self.playing = false;
-        self.finish_at_sample = None;
-        self.flags.playing.store(false, Ordering::Relaxed);
+        self.finish_playback();
         self.all_notes_off();
+        self.end_instrument_notes();
     }
 
     fn drain_commands(&mut self) {
@@ -676,13 +742,16 @@ impl CallbackState {
                 AudioCommand::InstallSynth(synth) => {
                     self.synth = Some(synth);
                 }
+                AudioCommand::SetGraph(graph) => self.set_graph(graph),
                 AudioCommand::Play {
                     events,
                     tempo_segments,
                     start_tick,
+                    end_tick,
                     channels,
                 } => {
                     self.all_notes_off();
+                    self.end_instrument_notes();
                     self.apply_channels(&channels);
                     let (segment_index, start_seconds) =
                         locate_tick(&tempo_segments, start_tick);
@@ -696,7 +765,7 @@ impl CallbackState {
                         .unwrap_or(self.events.len());
                     self.samples_since_start =
                         (start_seconds * self.sample_rate as f64).ceil() as u64;
-                    self.finish_at_sample = None;
+                    self.end_tick = end_tick;
                     self.playing = true;
                     self.flags.playing.store(true, Ordering::Relaxed);
                 }
@@ -706,16 +775,60 @@ impl CallbackState {
         }
     }
 
+    /// The next frame of audio. A block of `BLOCK` frames is rendered at a
+    /// time, because the synth and the plug-ins both work on blocks.
     fn next_frame(&mut self) -> (f32, f32) {
         self.drain_commands();
-        if self.playing {
-            let tick = self.current_tick();
+        if self.block_pos >= BLOCK {
+            self.render_block();
+        }
+        let frame = (self.block_left[self.block_pos], self.block_right[self.block_pos]);
+        self.block_pos += 1;
+        frame
+    }
+
+    /// Advances the song clock by one block, sending the notes that fall in
+    /// it to the synth and to instrument plug-ins.
+    fn advance_clock(&mut self) {
+        for offset in 0..BLOCK {
+            if !self.playing {
+                break;
+            }
+            let position = self.current_position();
+            let tick = position as Tick;
+            self.flags.position.store(position.to_bits(), Ordering::Relaxed);
             while self
                 .events
                 .get(self.next_event_index)
                 .is_some_and(|event| event.tick <= tick)
             {
                 let event = self.events[self.next_event_index];
+                self.next_event_index += 1;
+                let channel = usize::from(event.channel.min(15));
+                if self.instrument_channels[channel] {
+                    let on = event.kind == MidiEventKind::NoteOn;
+                    self.notes[channel].push(NoteEvent {
+                        offset: offset as u32,
+                        on,
+                        channel: 0,
+                        key: event.key,
+                        velocity: if on { f32::from(event.velocity) / 127.0 } else { 0.0 },
+                    });
+                    let held = (channel as u8, event.key);
+                    if on {
+                        if !self.sounding.contains(&held) {
+                            self.sounding.push(held);
+                        }
+                    } else {
+                        self.sounding.retain(|note| *note != held);
+                    }
+                }
+                if self.instrument_channels[channel] {
+                    // The plug-in is this channel's sound: the soundfont
+                    // does not play it, so nothing of it (not even its
+                    // reverb) reaches the mix.
+                    continue;
+                }
                 let midi_event = match event.kind {
                     MidiEventKind::NoteOn => MidiEvent::NoteOn {
                         channel: event.channel,
@@ -730,29 +843,90 @@ impl CallbackState {
                 if let Some(synth) = self.synth.as_mut() {
                     let _ = synth.send_event(midi_event);
                 }
-                self.next_event_index += 1;
             }
-            if self.next_event_index >= self.events.len() {
-                let tail = (END_TAIL_SECONDS * self.sample_rate as f64) as u64;
-                let deadline = *self
-                    .finish_at_sample
-                    .get_or_insert(self.samples_since_start + tail);
-                if self.samples_since_start >= deadline {
-                    self.stop_playback();
-                }
+            if tick >= self.end_tick && self.next_event_index >= self.events.len() {
+                self.finish_playback();
             }
             self.samples_since_start += 1;
         }
+    }
 
+    /// Renders one block: the soundfont per channel, each channel's chain,
+    /// the mix, the master chain.
+    fn render_block(&mut self) {
+        self.advance_clock();
+
+        let mut left = [0.0_f32; BLOCK];
+        let mut right = [0.0_f32; BLOCK];
+        let graph = self.graph.clone();
         match self.synth.as_mut() {
-            Some(synth) => synth.read_next(),
-            None => (0.0, 0.0),
+            Some(synth) => {
+                synth.render_groups();
+                for channel in 0..16 {
+                    let chain = &graph.channels[channel];
+                    let (mut dry_left, mut dry_right) = if self.instrument_channels[channel] {
+                        // The soundfont stays out; the plug-in is the sound.
+                        ([0.0_f32; BLOCK], [0.0_f32; BLOCK])
+                    } else {
+                        let (source_left, source_right) = synth.group_block(channel);
+                        (*source_left, *source_right)
+                    };
+                    run_chain(
+                        chain,
+                        &mut dry_left,
+                        &mut dry_right,
+                        &mut self.notes[channel],
+                        self.channel_mix[channel],
+                    );
+                    for index in 0..BLOCK {
+                        left[index] += dry_left[index];
+                        right[index] += dry_right[index];
+                    }
+                }
+                let (send_left, send_right) = synth.group_block(usize::from(SYNTH_GROUPS) - 1);
+                for index in 0..BLOCK {
+                    left[index] += send_left[index];
+                    right[index] += send_right[index];
+                }
+            }
+            None => {
+                // No soundfont yet: instrument plug-ins can still play.
+                for channel in 0..16 {
+                    if graph.channels[channel].is_empty() {
+                        continue;
+                    }
+                    let (mut dry_left, mut dry_right) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK]);
+                    run_chain(
+                        &graph.channels[channel],
+                        &mut dry_left,
+                        &mut dry_right,
+                        &mut self.notes[channel],
+                        self.channel_mix[channel],
+                    );
+                    for index in 0..BLOCK {
+                        left[index] += dry_left[index];
+                        right[index] += dry_right[index];
+                    }
+                }
+            }
         }
+        for notes in &mut self.notes {
+            notes.clear();
+        }
+
+        for plugin in graph.master.iter().filter(|plugin| !plugin.is_instrument) {
+            if let Ok(mut instance) = plugin.instance.try_lock() {
+                instance.process(&mut left, &mut right, &[]);
+            }
+        }
+        self.block_left = left;
+        self.block_right = right;
+        self.block_pos = 0;
     }
 
     /// Converts elapsed playback time into a musical tick, walking forward
     /// through the tempo automation's precomputed segments.
-    fn current_tick(&mut self) -> Tick {
+    fn current_position(&mut self) -> f64 {
         let elapsed_seconds = self.samples_since_start as f64 / self.sample_rate as f64;
         while self.current_segment_index + 1 < self.tempo_segments.len()
             && self.tempo_segments[self.current_segment_index + 1].start_seconds
@@ -762,7 +936,43 @@ impl CallbackState {
         }
         let segment = self.tempo_segments[self.current_segment_index];
         let tick_offset = (elapsed_seconds - segment.start_seconds) / segment.seconds_per_tick;
-        segment.start_tick + tick_offset.max(0.0) as Tick
+        segment.start_tick as f64 + tick_offset.max(0.0)
+    }
+}
+
+/// Runs a channel's plug-ins over its block, in order. An instrument takes
+/// the channel's notes and replaces the sound; an effect changes it. A
+/// plug-in the UI is busy with this instant is skipped for the block.
+fn run_chain(
+    chain: &[Arc<LivePlugin>],
+    left: &mut [f32; BLOCK],
+    right: &mut [f32; BLOCK],
+    notes: &mut Vec<NoteEvent>,
+    (volume, pan): (u8, u8),
+) {
+    for plugin in chain {
+        let Ok(mut instance) = plugin.instance.try_lock() else {
+            if plugin.is_instrument {
+                left.fill(0.0);
+                right.fill(0.0);
+            }
+            continue;
+        };
+        if plugin.is_instrument {
+            instance.process(left, right, notes);
+            // The soundfont has its volume and pan inside the synth; an
+            // instrument plug-in gets the track's here.
+            let gain = f32::from(volume.min(127)) / 127.0;
+            let pan = f32::from(pan.min(127));
+            let left_gain = gain * if pan <= 64.0 { 1.0 } else { (127.0 - pan) / 63.0 };
+            let right_gain = gain * if pan >= 64.0 { 1.0 } else { pan / 64.0 };
+            for index in 0..BLOCK {
+                left[index] *= left_gain;
+                right[index] *= right_gain;
+            }
+        } else {
+            instance.process(left, right, &[]);
+        }
     }
 }
 
@@ -838,6 +1048,7 @@ mod tests {
             events: one_note(0, 10),
             tempo_segments: segments(),
             start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 2,
             channels: no_channels(),
         });
         state.next_frame();
@@ -851,6 +1062,7 @@ mod tests {
             events: one_note(0, 10),
             tempo_segments: segments(),
             start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 2,
             channels: no_channels(),
         });
         state.next_frame();
@@ -860,16 +1072,17 @@ mod tests {
     }
 
     #[test]
-    fn song_finishes_by_itself_after_the_release_tail() {
+    fn song_finishes_by_itself_when_the_clock_reaches_the_end() {
         let (mut producer, mut state, flags) = state_with_queue();
         let _ = producer.try_push(AudioCommand::Play {
             events: one_note(0, 10),
             tempo_segments: segments(),
             start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 2,
             channels: no_channels(),
         });
-        // 1 kHz sample rate: 2.0 s tail plus a little slack for the note.
-        for _ in 0..2_500 {
+        // 1 kHz sample rate: the end tick is two quarters, 1 s at 120 bpm.
+        for _ in 0..1_100 {
             state.next_frame();
         }
         assert!(!flags.playing.load(Ordering::Relaxed));
@@ -877,12 +1090,33 @@ mod tests {
     }
 
     #[test]
-    fn song_with_events_keeps_playing_before_the_tail_elapses() {
+    fn the_position_follows_the_clock_between_notes() {
         let (mut producer, mut state, flags) = state_with_queue();
         let _ = producer.try_push(AudioCommand::Play {
             events: one_note(0, 10),
             tempo_segments: segments(),
             start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 8,
+            channels: no_channels(),
+        });
+        for _ in 0..500 {
+            state.next_frame();
+        }
+        let position = f64::from_bits(flags.position.load(Ordering::Relaxed));
+        // The position is stamped per frame while a block of 64 is played
+        // ahead of the 500 frames asked for.
+        let block = 64.0 / 1_000.0 * 2.0 * TICKS_PER_QUARTER as f64;
+        assert!((position - TICKS_PER_QUARTER as f64).abs() <= block, "{position}");
+    }
+
+    #[test]
+    fn song_keeps_playing_until_the_end_tick() {
+        let (mut producer, mut state, flags) = state_with_queue();
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, 10),
+            tempo_segments: segments(),
+            start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 2,
             channels: no_channels(),
         });
         for _ in 0..500 {
@@ -899,6 +1133,7 @@ mod tests {
             events: one_note(start, start + TICKS_PER_QUARTER),
             tempo_segments: segments(),
             start_tick: start,
+            end_tick: start + TICKS_PER_QUARTER,
             channels: no_channels(),
         });
         // 8 quarters at 120 bpm is 4 s, i.e. 4000 frames at 1 kHz.
@@ -922,24 +1157,26 @@ mod tests {
             events,
             tempo_segments: segments(),
             start_tick: 2_000,
+            end_tick: 2_100,
             channels: no_channels(),
         });
         state.next_frame();
-        assert_eq!(state.next_event_index, 3);
+        // The two notes before the start are skipped; the first block holds
+        // the note at the start tick, and may hold its end too.
+        assert!(state.next_event_index >= 3, "{}", state.next_event_index);
     }
 
     #[test]
-    fn play_past_the_last_event_only_waits_for_the_release_tail() {
+    fn play_past_the_last_event_finishes_at_once() {
         let (mut producer, mut state, flags) = state_with_queue();
         let _ = producer.try_push(AudioCommand::Play {
             events: one_note(0, 10),
             tempo_segments: segments(),
             start_tick: TICKS_PER_QUARTER * 100,
+            end_tick: TICKS_PER_QUARTER * 100,
             channels: no_channels(),
         });
-        for _ in 0..2_500 {
-            state.next_frame();
-        }
+        state.next_frame();
         assert!(!flags.playing.load(Ordering::Relaxed));
     }
 
@@ -989,16 +1226,18 @@ mod tests {
             events: one_note(start + TICKS_PER_QUARTER, start + TICKS_PER_QUARTER * 2),
             tempo_segments,
             start_tick: start,
+            end_tick: start + TICKS_PER_QUARTER * 2,
             channels: no_channels(),
         });
         state.next_frame();
         assert_eq!(state.current_segment_index, 1);
         // One quarter at 120 bpm is 0.5 s: the note is due 500 frames in.
-        for _ in 0..450 {
+        // The clock moves a block (64 frames) at a time.
+        for _ in 0..390 {
             state.next_frame();
         }
         assert_eq!(state.next_event_index, 0);
-        for _ in 0..100 {
+        for _ in 0..160 {
             state.next_frame();
         }
         assert_eq!(state.next_event_index, 1);
@@ -1140,6 +1379,7 @@ mod tests {
             events: one_note(0, 240),
             tempo_segments: segments(),
             start_tick: 0,
+            end_tick: 240,
             channels,
         });
         let started = std::time::Instant::now();
@@ -1152,5 +1392,141 @@ mod tests {
         let preset = state.synth.as_ref().unwrap().channel_preset(0);
         assert_eq!(preset.as_ref().map(|preset| preset.name()), Some("Fingered Bass"));
         assert!(peak > 0.001, "the note should be audible");
+    }
+
+    /// The test plug-ins come from the vst3 crate's `gain` example (effect)
+    /// and a variant of it that plays a sine on note-on (instrument); the
+    /// tests run when BW_TEST_GAIN_VST3 / BW_TEST_SYNTH_VST3 name them.
+    fn live_plugin(var: &str, id: u64, instrument: bool) -> Option<Arc<LivePlugin>> {
+        let path = std::env::var_os(var)?;
+        let module = crate::plugins::vst3::Module::load(Path::new(&path)).expect("load");
+        let instance = crate::plugins::vst3::Instance::create(&module, "", 1_000.0).expect("create");
+        Some(Arc::new(LivePlugin {
+            id,
+            is_instrument: instrument,
+            instance: std::sync::Mutex::new(instance),
+        }))
+    }
+
+    fn play_one_note(state: &mut CallbackState, producer: &mut HeapProd<AudioCommand>, frames: usize) -> f32 {
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, TICKS_PER_QUARTER * 4),
+            tempo_segments: segments(),
+            start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 4,
+            channels: Arc::new(vec![ChannelSetup { channel: 0, program: 0, volume: 127, pan: 64 }]),
+        });
+        let mut peak = 0.0_f32;
+        for _ in 0..frames {
+            let (left, right) = state.next_frame();
+            peak = peak.max(left.abs()).max(right.abs());
+        }
+        peak
+    }
+
+    #[test]
+    fn an_instrument_plug_in_gets_the_notes_of_its_channel_and_is_the_only_sound() {
+        let Some(synth) = live_plugin("BW_TEST_SYNTH_VST3", 1, true) else { return };
+        let (mut producer, mut state, _flags) = state_with_queue();
+        let mut graph = Graph::default();
+        graph.channels[0].push(synth);
+        let _ = producer.try_push(AudioCommand::SetGraph(Arc::new(graph)));
+        let peak = play_one_note(&mut state, &mut producer, 400);
+        // Velocity 100 of 127 at half scale.
+        assert!((peak - 0.5 * 100.0 / 127.0).abs() < 0.02, "{peak}");
+        assert_eq!(state.sounding, vec![(0, 60)]);
+        let _ = producer.try_push(AudioCommand::Stop);
+        for _ in 0..200 {
+            state.next_frame();
+        }
+        assert!(state.sounding.is_empty(), "stop ends the plug-in's notes");
+    }
+
+    #[test]
+    fn a_muted_track_silences_its_instrument_plug_in() {
+        let Some(synth) = live_plugin("BW_TEST_SYNTH_VST3", 1, true) else { return };
+        let (mut producer, mut state, _flags) = state_with_queue();
+        let mut graph = Graph::default();
+        graph.channels[0].push(synth);
+        let _ = producer.try_push(AudioCommand::SetGraph(Arc::new(graph)));
+        let _ = producer.try_push(AudioCommand::Play {
+            events: one_note(0, TICKS_PER_QUARTER * 4),
+            tempo_segments: segments(),
+            start_tick: 0,
+            end_tick: TICKS_PER_QUARTER * 4,
+            channels: Arc::new(vec![ChannelSetup { channel: 0, program: 0, volume: 0, pan: 64 }]),
+        });
+        let mut peak = 0.0_f32;
+        for _ in 0..400 {
+            let (left, right) = state.next_frame();
+            peak = peak.max(left.abs()).max(right.abs());
+        }
+        assert_eq!(peak, 0.0);
+    }
+
+    #[test]
+    fn effects_on_a_channel_and_on_the_master_change_the_mix() {
+        let (Some(synth), Some(gain_a), Some(gain_b)) = (
+            live_plugin("BW_TEST_SYNTH_VST3", 1, true),
+            live_plugin("BW_TEST_GAIN_VST3", 2, false),
+            live_plugin("BW_TEST_GAIN_VST3", 3, false),
+        ) else {
+            return;
+        };
+        for plugin in [&gain_a, &gain_b] {
+            let handle = plugin.controller_handle().unwrap();
+            handle.set(0, 0.5);
+        }
+        let (mut producer, mut state, _flags) = state_with_queue();
+        let mut graph = Graph::default();
+        graph.channels[0].push(synth);
+        graph.channels[0].push(gain_a);
+        graph.master.push(gain_b);
+        let _ = producer.try_push(AudioCommand::SetGraph(Arc::new(graph)));
+        let peak = play_one_note(&mut state, &mut producer, 600);
+        // Half twice over.
+        let expected = 0.5 * 100.0 / 127.0 * 0.25;
+        assert!((peak - expected).abs() < 0.02, "{peak} vs {expected}");
+    }
+
+    #[test]
+    #[ignore = "slow: loads the real 51 MB soundfont"]
+    fn an_instrument_plug_in_leaves_no_soundfont_sound_behind() {
+        if live_plugin("BW_TEST_SYNTH_VST3", 1, true).is_none() {
+            return;
+        }
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("soundfonts")
+            .join("MS Basic.sf3");
+        let run = |with_soundfont: bool| {
+            let (mut producer, consumer) = HeapRb::<AudioCommand>::new(16).split();
+            let mut state = CallbackState::new(consumer, 48_000.0, flags());
+            if with_soundfont {
+                let _ = producer.try_push(AudioCommand::InstallSynth(
+                    build_synth(48_000.0, &path).expect("soundfont"),
+                ));
+            }
+            let mut graph = Graph::default();
+            // A fresh plug-in each run, so both start from the same phase.
+            graph.channels[0].push(live_plugin("BW_TEST_SYNTH_VST3", 1, true).unwrap());
+            let _ = producer.try_push(AudioCommand::SetGraph(Arc::new(graph)));
+            let _ = producer.try_push(AudioCommand::Play {
+                events: one_note(0, 240),
+                tempo_segments: segments(),
+                start_tick: 0,
+                end_tick: 240,
+                channels: Arc::new(vec![ChannelSetup { channel: 0, program: 33, volume: 127, pan: 64 }]),
+            });
+            (0..48_000).map(|_| state.next_frame()).collect::<Vec<_>>()
+        };
+        let with = run(true);
+        let without = run(false);
+        let worst = with
+            .iter()
+            .zip(&without)
+            .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()))
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 1e-4, "the soundfont leaked into the plug-in's channel: {worst}");
     }
 }

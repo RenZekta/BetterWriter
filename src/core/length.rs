@@ -42,6 +42,35 @@ pub fn detect_length(ticks: Tick) -> Option<(u32, u8)> {
         .map(|(_, value, dots)| (value, dots))
 }
 
+/// Cuts a length into standard lengths, longest first, that add up to it: a quarter stretched by a sixteenth is a quarter plus a
+/// sixteenth. A length that is already standard comes back whole. A leftover
+/// shorter than the smallest standard length is folded into the last piece
+/// rather than becoming a piece of its own.
+pub fn standard_pieces(ticks: Tick) -> Vec<Tick> {
+    if ticks <= 0 || detect_length(ticks).is_some() {
+        return vec![ticks];
+    }
+    let lengths = standard_lengths();
+    let smallest = lengths.last().map_or(1, |(length, _, _)| *length);
+    let mut pieces = Vec::new();
+    let mut remaining = ticks;
+    while remaining >= smallest {
+        let Some(&(length, _, _)) = lengths.iter().find(|(length, _, _)| *length <= remaining)
+        else {
+            break;
+        };
+        pieces.push(length);
+        remaining -= length;
+    }
+    if remaining > 0 {
+        match pieces.last_mut() {
+            Some(last) => *last += remaining,
+            None => pieces.push(remaining),
+        }
+    }
+    pieces
+}
+
 impl DurationChoice {
     /// The note value this choice stands for (1 = whole, 4 = quarter, ...).
     pub fn note_value(self) -> u32 {
@@ -89,6 +118,42 @@ mod tests {
     use super::*;
 
     const Q: Tick = TICKS_PER_QUARTER;
+
+    #[test]
+    fn a_standard_length_is_one_piece() {
+        for (length, _, _) in standard_lengths() {
+            assert_eq!(standard_pieces(length), vec![length]);
+        }
+    }
+
+    #[test]
+    fn a_quarter_and_a_sixteenth_is_two_pieces() {
+        assert_eq!(standard_pieces(Q + Q / 4), vec![Q, Q / 4]);
+        assert_eq!(standard_pieces(Q * 2 + Q * 3 / 4), vec![Q * 2, Q * 3 / 4]);
+    }
+
+    #[test]
+    fn pieces_add_up_and_are_each_standard_except_a_folded_remainder() {
+        for ticks in 1..=Q * 8 {
+            let pieces = standard_pieces(ticks);
+            assert_eq!(pieces.iter().sum::<Tick>(), ticks, "{ticks}");
+            let smallest = standard_lengths().last().unwrap().0;
+            if ticks >= smallest {
+                for piece in &pieces[..pieces.len() - 1] {
+                    assert!(detect_length(*piece).is_some(), "{ticks}: {piece}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splitting_pieces_again_changes_nothing() {
+        for ticks in 1..=Q * 4 {
+            let pieces = standard_pieces(ticks);
+            let last = *pieces.last().unwrap();
+            assert_eq!(standard_pieces(last), vec![last], "{ticks}");
+        }
+    }
 
     #[test]
     fn each_dot_adds_half_of_what_came_before() {

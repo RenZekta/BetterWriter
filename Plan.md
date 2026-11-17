@@ -883,11 +883,11 @@ right-click submenus and the move / stretch drag previews.
 - [x] Notes shortened to fit before the next note or the barline now land on
       the longest standard length including dotted ones; stepping a note's
       length with the arrows keeps its dots.
-- [x] **Tab view rhythm marks**: with the classic staff hidden, tab view draws
-      a stem per beat under the strings, with flags or beams for short
-      values and a dot for each augmentation dot (a whole note is an open
-      head). The marks come from the same bar data as the staff, so they
-      agree with it.
+- [x] **Tab view rhythm marks**: tab view draws a stem per beat under the
+      strings, with flags or beams for short values and a dot for each
+      augmentation dot (a whole note is an open head). The marks come from
+      the same bar data as the staff, so they agree with it. They show with
+      the classic staff too (16.11.2026 item 6).
 - [x] **`.tg` dotted durations**: import read a double-dotted length as 1.25
       times the value (it is 1.75), and export wrote every dotted length as
       its plain value. Both are fixed and round-trip.
@@ -899,6 +899,422 @@ right-click submenus and the move / stretch drag previews.
       dotting by key and the tab rhythm marks were exercised in the running
       app under a virtual display. Audio was tried by the user with the
       per-track sounds from section 2.
+
+## 15.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Playback ends with the last bar that has notes
+- [x] **The transport stops at the end of the last bar holding a note**, over
+      every track (`BwxProject::playback_end_tick`, passed to the callback as
+      `end_tick` in the `Play` command). Finishing only clears the playing
+      flag; the synth is not told to stop, so releases, reverb and delay ring
+      out. One click on Play restarts the song after it ended. Supersedes the
+      fixed 2 s wait after the last event (13.11.2026 item 1 and the
+      `is_playing` note in the audio section); `END_TAIL_SECONDS` is gone. An
+      explicit Stop still silences everything.
+- [x] Tests: the end tick (bar that a note ends in, note ending on a barline,
+      no notes), the song finishing when the clock reaches the end tick, a
+      start past the end finishing at once.
+
+### 2. Typing in a value field no longer writes notes
+- [x] While a text field has focus (Scale, Vol, Pan, velocity, name boxes)
+      `handle_keyboard` ignores every key: digits, arrows, Enter, Delete,
+      `L`, minus/plus, undo. Before, only Space was guarded, so a typed value
+      also wrote a fret at the cursor.
+
+### 3. Add Track
+- [x] **`Add Track` button** under the velocity slider in the bottom panel
+      (`BwxProject::add_track_like`): an empty track shaped like the selected
+      one (instrument type, tuning, sound, bar count, time signatures), a
+      unique name ("Acoustic Guitar 2"), the next free channel, unmuted. It
+      becomes the selected track, the table scrolls to it, and it is one undo
+      step.
+
+### 4. Instrument column in the track table
+- [x] **`Instrument` picker per track** (Acoustic Guitar, Electric Guitar, Bass,
+      Other) between Name and Sound. It sets the clef and which sounds the
+      Sound list offers (`InstrumentTrack::set_stringed_variant`). A sound
+      that was one of the old type's own suggestions moves to the new type's
+      default; a sound picked from outside that list is kept. Tuning and
+      notes are never touched, so a guitar track switched to Bass keeps its
+      six strings.
+
+### 5. Brick and tab rows no longer overlap
+- [x] `SystemMetrics::STRING_GAP` is 14 px and every brick is exactly that
+      tall, so notes on neighboring strings touch instead of overlapping, in
+      brick and tab view. The remaining hard-coded 9 px spots (hit tests,
+      cursor cell, drag snapping) use the constant.
+
+### 6. Rests can be deleted in tab view
+- [x] **Click a rest, press Delete/Backspace** (`BwxProject::delete_rest`).
+      The notes after it in the same bar move left by the rest's length and
+      the bar's tail fills with rests again. A note that sustains past the
+      barline or is tied to a note in the next bar stays put along with
+      everything from it onward, so the freed space opens just before it. A
+      rest with nothing to pull into it (trailing, or right before such a
+      note) reports that and changes nothing.
+
+### 7. Lengths that are no single note value are tied automatically
+- [x] **Tab view**: `split_bricks_at_barlines` also cuts a note into standard
+      lengths (`core/length.rs::standard_pieces`, longest first, a remainder
+      under a 128th folds into the last piece). The slices are
+      `TieOrigin::BrickSplit`, so brick view merges them back. A quarter
+      stretched by a sixteenth is a quarter tied to a sixteenth.
+- [x] **Staff, both views** (`notation.rs`): every note is written as its
+      pieces (`note_slices`), each a head with `tie_from`; a brick crossing a
+      barline continues as a tied head in the next bar. Supersedes "any other
+      length shows as the longest standard length that fits" (13.11.2026
+      item 5) for notes in a project; `note_value_for` remains for fixtures.
+
+### 8. Brick view draws no rests under the strings
+- [x] The dashes below the tab in brick view (end-of-bar rests) are gone.
+      Supersedes "brick view keeps end-of-bar rests" (11.11.2026): the staff
+      still shows rests for every gap in both views. `tail_padding_rests` and
+      `RestFill::BarEnd` stay in core, marked `allow(dead_code)`, with tests.
+
+### 9. Bricks share the cursor's rounded corners
+- [x] A brick is drawn with the cursor box's corner radius. A fragment of a
+      brick that continues through a barline or row break stays square and
+      unstroked on that side, so the pieces still read as one block.
+
+### 10. Last written fret replaces the default fret
+- [x] The `default fret` toolbar field is gone. Enter with nothing typed
+      writes the fret of the note written last (0 at start).
+
+### 11. Clefs and rests drawn from vector outlines
+- [x] The treble and bass clefs and the quarter to 64th rests are TuxGuitar's
+      outlines (`src/symbols.rs`), rasterized once into coverage masks since
+      egui cannot fill concave paths. The "8" stays under the clef. Whole and
+      half rests are blocks sized like TuxGuitar's. Shorter than a 64th share
+      the 64th rest. The source is LGPL-2.1 or later.
+
+### 12. Moving playback line
+- [x] While playing, a line moves along the score of the selected track by
+      the tempo clock alone (`AudioRuntime::playback_tick`, fractional
+      ticks), interpolated between beat columns in tab view. It keeps moving
+      when another track is selected, and the view scrolls to the row being
+      played when that row changes. It is drawn in the accent color, 2.5
+      points wide, reaching 16 points past the staff and the tab.
+
+### 13. Bar timeline replaces the shadow timeline strip
+- [x] The diamond strip under the score is gone. The track table's right
+      side shows one row of bar blocks per track on a shared time axis: a
+      block is as wide as its bar lasts, so a 3/4 bar is three quarters of a
+      4/4 one and polymeter lines up. The shortest bar never drops below 30
+      points (the rest grow with it and the row scrolls sideways); a few
+      bars stop growing at about 170 points for a 4/4 bar. A click selects
+      the track and moves the cursor to the bar start. Blocks show the bar
+      number, the signature where it changes, whether the bar has notes, the
+      cursor's bar and the bar being played. The table columns are narrower
+      to make room. The timeline's horizontal scrollbar sits at the bottom
+      of the panel, not under the last row; the track columns beside it
+      scroll vertically with it and share one offset.
+- [ ] Missing: a context menu on the blocks (selection and dragging:
+      16.11.2026 items 10 to 12).
+
+### 14. Paste moves the cursor past what it pasted
+- [x] After a paste the cursor lands on the first beat at or after the end
+      of the last pasted note (`PasteOutcome::end_tick`), so pasting a
+      quarter note moves it a quarter on, and a second paste goes right
+      behind the first. The pasted notes stay selected. Supersedes the
+      cursor staying on the paste start (13.11.2026 item 4).
+
+### 15. Score scrollbar
+- [x] A vertical scrollbar along the right edge of the score area (thumb
+      drag, click to jump). The wheel zooms, so Shift+wheel and this bar
+      are how the score scrolls. It shows only when the score is taller
+      than the page.
+
+### 16. Cursor box has no placeholder mark
+- [x] The "_" in the middle of the cursor box is gone; the box only shows a
+      ghost fret while one is being typed.
+
+- [x] Tests: `cargo test`: 168 passed, 1 ignored (the real-soundfont render,
+      not run). Exercised in the running app under a virtual display: row
+      heights, rounded bricks, the clef, rests, the bar timeline, its click and
+      its scrollbar, the score scrollbar, paste moving the cursor,
+      Add Track, the Instrument picker, deleting a note then its rest, and
+      typing in the Scale box writing no note. The playback line was drawn
+      from a fixed test position, since there is no audio device there; the
+      clock position itself is covered by a unit test. Not exercised in the
+      app: tie arcs on screen, deleting a rest next to a tied note, the stop
+      at the end of the song.
+
+## 16.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Right-click keeps the selection
+- [x] A right-click on empty space only moves the edit cursor there; a
+      right-click on a note does nothing to the selection. Neither unselects
+      anything, so the context menu acts on the selection you already made.
+
+### 2. Shift+Up/Down moves a whole selection
+- [x] With an area selection, Shift+Up/Down shifts every selected note by a
+      semitone on its own string (`BwxProject::shift_note_frets`) instead of
+      moving the fretboard's string focus. If any note would leave the neck,
+      none moves and the status line says so. A single selected note works
+      as before.
+
+### 3. Fretboard shows what is playing
+- [x] While the song plays, the neck marks the notes of the selected track
+      that sound at the playback position (`fretboard::sounding_markers`): a
+      filled marker for the first sixteenth of a note, a ring while it rings
+      on, tied continuations as rings. The cursor's string band is hidden
+      then; with playback stopped it shows the cursor's notes as before.
+
+### 4. Themes
+- [x] **View > Theme**: mode (System/Dark/Bright), the preset list and
+      `Customize theme...`, a window with the preset picker and name, a color
+      for the bright and the dark background, Accent 1, Accent 2, a Highlight
+      (timeline bars being played), a Warning color, an optional background
+      image with a visibility slider, and an Advanced section that sets the
+      color of each part (selection and toggles, edit cursor, playback line,
+      bar timeline, left sidebar, fretboard, selected notes, tempo
+      automation) to Accent 1, Accent 2 or its own color.
+- [x] **Accent 1 is the one accent everywhere by default**: the blue the
+      track list used, now lightened to `#4ca4f0` so it stands next to the
+      green (an old saved default `#005c80` is moved to it). The bar
+      timeline, edit cursor, playback line, left sidebar, selected notes,
+      fretboard, tempo automation and egui's own selection (track list, the Notation and similar toggles) all
+      follow it. Accent 2 defaults to the old green (`#40c4b8`) and nothing
+      uses it until an element is pointed at it. Supersedes the green accent
+      of 15.11.2026 items 12 and 13.
+- [x] Every theme has a bright and a dark variant; the background color of
+      the active variant drives all surfaces, and text, lines and the
+      fretboard wood follow how light that background really is
+      (`EditorTheme::from_preset`). egui's widgets use the same palette
+      (`EditorTheme::visuals`); the warning color is egui's warning text
+      color and the color of a bar in the timeline that a drag would cut
+      from a tied neighbour.
+- [x] **Presets**: 8 built-in (BetterWriter, Nordic Night, Sunset Jazz, Forest
+      Floor, Ocean Deep, Rose Quartz, Graphite and Gold, Midnight Violet).
+      They cannot be changed or deleted; rename a copy and `Save as new`.
+      Saved presets can be updated, reverted and deleted. The theme in use,
+      the mode and the saved presets live in `betterwriter_theme.txt` next
+      to the executable (plain text, `ThemeStore`).
+- [x] **Background image** (PNG or JPEG, scaled to at most 2048 points a
+      side): behind the score, which shows it through by the visibility
+      setting, and behind the start screen.
+- [ ] Missing: the image is not drawn behind the toolbars and panels.
+      Accent 2 colors repeated bars in the timeline and Warning marks a bar
+      whose tie a drag would break (16.11.2026 items 12 and 13).
+
+### 5. Note menu works on a multi-selection; octave shift
+- [x] The RMB Note and Effects entries (dynamics, effects, tie, duration,
+      semitone shifts) are enabled for an area selection, not only for a
+      single note.
+- [x] **One Octave Up/Down** (`Alt+Shift+Up/Down`) shifts the selection by
+      12 frets through the same path as the semitone shift, so the neck
+      limit check applies. The menu shows the shortcuts that exist
+      (`Shift+Up/Down` for a semitone).
+
+### 6. Tab view shows note lengths like MuseScore
+- [x] Rhythm marks under the strings: a longer stem, beams that keep their
+      spacing and flags for short values, in tab view with or without the
+      classic staff. The playback line runs down over them
+      (`tab_rhythm_depth`) and the "P.M." label sits below them.
+
+### 7. Plug-in scan at launch
+- [x] `src/plugins/scan.rs` (was `vst_scan.rs`) looks for plug-ins in the
+      standard folders of the platform on a background thread: VST3 (`.vst3`),
+      VST2 (`.dll`/`.so`/`.vst`), CLAP, LV2 bundles and, on macOS, AU. A VST3
+      bundle's classes, kind (instrument or effect) and developer come from
+      its `moduleinfo.json` when it has one, otherwise from the plug-in's
+      factory read in a short-lived child process (`betterwriter
+      --probe-vst3 <bundle>`, 20 s limit), so a plug-in that crashes on load
+      costs only that process. Other formats take the developer from the
+      folder they sit in. The result is cached by path and modification time
+      in `betterwriter_plugins.txt` and read back at the next start.
+- [x] VST3 instruments are listed apart from VST3 effects ("VST3i: Name"
+      against "VST3: Name"); the "?" kind label is gone.
+- [ ] Missing: VST2, CLAP, LV2 and AU are only listed; they cannot be loaded
+      into a chain yet (item 17).
+
+### 8. Soundchain (FX)
+- [x] An **FX** button at the left of the bottom status bar opens a window
+      with the tracks table (name and chain summary) and, for the picked
+      track, its plug-in chain: add from the scanned list, remove, move up
+      and down, bypass. Rescan is a button there. The chain is saved in the
+      `.bwx` file (`InstrumentTrack::sound_chain`) and edits are undoable.
+- [x] Each track also has its own **FX** button in the tracks table, between
+      M and Name. It selects that track and opens the Soundchain window on
+      its chain (click again to close); the tooltip says how many plug-ins it
+      holds. The **Global FX** pair (same window) sits in the bottom-left panel.
+- [x] The FX button is a Reaper-style pair: **FX** (opens the chain) joined
+      to a power button on its right that bypasses the whole chain
+      (`InstrumentTrack::fx_bypassed`, saved in the `.bwx`, one undo step).
+      Both stay plain until the track has plug-ins; then FX is filled with
+      Accent 1 and the power icon is Accent 1; while bypassed both are
+      **Warning 2**. The power button is inert while the chain is empty.
+- [x] **Warning 2** is a new theme color (`ThemePreset::warning2`, a red,
+      shown in the theme editor, saved in the theme file; files without it
+      get the default). The mute button (M) is filled with it while a track
+      is muted.
+- [x] Superseded by item 17: the chain window, its contents and the hosting
+      were rebuilt there.
+
+### 9. Tracks can be renamed
+- [x] Double-click a track's name, or right-click > Rename: Enter or
+      leaving the field keeps the name, Escape cancels, an empty name keeps
+      the old one. One undo step.
+
+### 10. Selecting bars in the bar timeline
+- [x] Click selects a bar, Ctrl+click adds or removes one, Shift+click
+      selects a run on a track or, across tracks, every bar overlapping the
+      time between the two. Selection is kept apart from the cursor, and
+      clicking without a modifier still moves the cursor to the bar.
+      Selections that no longer exist after an edit are dropped.
+
+### 11. Bar differences on hover
+- [x] With bars selected on several tracks, hovering one of them marks its
+      start on every row and shows, on each other selected bar and in the
+      tooltip, how far it starts ahead of or behind the hovered one and
+      how much longer or shorter it is, in beats.
+
+### 12. Dragging bars
+- [x] Selected bars drag along their track and across tracks together, as
+      one undo step (`BwxProject::move_bars` in `src/core/bars.rs`). Time
+      signature and repeat signs travel with a bar; the target is marked
+      while dragging and `Esc` cancels. A bar moved onto a track with fewer
+      strings has its notes pulled to the lowest string.
+- [x] A bar that would lose a tie to a neighbour it no longer sits next to
+      shows in the Warning color while it is dragged (only that bar, also
+      when several move). The drop is still allowed; the tie is cut at the
+      bar edge and the status line says so.
+- [ ] Missing: a bar dragged to the right of a track's last bar has no
+      empty space to land in (it goes after the last bar).
+
+### 13. Repeats
+- [x] Repeat Open (`[`) and Repeat Close (`]`, played 2 to 8 times in the
+      Bar menu) on the bar at the cursor (`BarMark`, saved with the track,
+      kept on its bar by insert, delete and move). Close without an open
+      repeats from the start or the previous close; nested regions replay
+      the inner one on every pass. The score draws the signs and an "xN"
+      label.
+- [x] The bar timeline shows each extra play as a copy in Accent 2 after the
+      region. Selecting a copy selects the bar it copies, so the original
+      and all its copies highlight and move together. The copies exist in
+      the timeline only, not in the score.
+- [x] Playback runs through the repeats (`unrolled_for_playback`): the
+      shadow timeline and the song length follow playback order, and the
+      playback line in the score jumps back on every pass
+      (`score_tick_at_playback`).
+- [ ] Missing: alternate endings, Simile marks and a repeat count shown in
+      the timeline copies.
+
+### 14. Selected rows and toggles are softer, the rest stays see-through
+- [x] Selected rows and toggled buttons (the track list, the Notation and
+      similar toggles) were a solid accent, much brighter than the cursor and
+      the timeline's selected bars, which are see-through tints of it. They
+      are now a half mix of the selection color with the panel behind
+      (`SELECTION_STRENGTH`), about the weight of a selected timeline bar,
+      with text that follows `contrast_text`. The cursor, the timeline bars
+      and the active sidebar tool keep their see-through accent fills and
+      plain accent outlines.
+- [x] The Highlight color only outlines the bar being played; it no longer
+      fills it. Supersedes the filled playing bar of item 4.
+
+### 15. Whole and half rests lose their extra line
+- [x] Whole and half rests drew a thin line across the staff line they hang
+      from or sit on, wider than the block itself, which read as a stray
+      line above them. Only the block is drawn now (`paint_rest_symbol`).
+
+### 16. Bottom panel tidy-up
+- [x] The bottom-left panel is compact (about 110 px): track name, a short
+      velocity slider ("Vel 108"), the **Global FX** pair and **+ Track**. The
+      FX button left the status bar. Global FX looks like a track's FX pair:
+      its button opens the Global FX chain (item 17) and its power button
+      bypasses it. It is plain while that chain is empty, accent while it is in
+      use, Warning 2 while bypassed.
+- [x] The tracks table sizes its Name, Instrument and Sound columns to their
+      longest entry (up to a cap), so every row lines up under the
+      headings (`track_column_widths`).
+- [x] Fret numbers in the fretboard markers use the proportional font, so a
+      0 no longer shows the monospace face's dotted zero as a dark mark
+      inside the circle.
+
+### 17. Repeat buttons, FX Chain, plug-in hosting, scrolling (17.11.2026)
+- [x] **Repeat Open / Repeat Close** in the side palette and the Bar menu are
+      live. Close opens a small picker like the time-signature one: a drag
+      value "Play N times" (2 and up, no upper list; `MAX_REPEAT_COUNT` 998),
+      Apply and Remove. `BarMark::repeat_close` is a `u16`; older files read
+      back unchanged.
+- [x] One shared refresh rate: the window presents with `vsync: true` at the
+      monitor's rate and nothing caps the bottom menu or the notation. The dev
+      profile now optimises all dependencies (opt-level 3) and keeps the
+      program's own code at 1, which is what held the UI below the refresh
+      rate. Not measurable here (no monitor).
+- [x] **Loops in the Block Timeline**: clicking, Ctrl+clicking or dragging a
+      bar of a loop of more than one bar selects every bar of the loop
+      (`InstrumentTrack::loop_bars`: the smallest multi-bar repeat region that
+      holds the bar), and a drag moves the selected bars of a row as one block,
+      keeping their order and gaps.
+- [x] **One scroll speed**: the track table and the bar timeline are driven
+      by a single wheel handler (`show_track_table`), so they cannot differ.
+- [x] **FX Chain** (was "Soundchain"). Every FX button, one per track and
+      **Global FX**, opens a window of its own for its own chain
+      (`src/app/fx_chain.rs`); a chain starts empty and adding to one never
+      touches another. Layout after Reaper: menu bar (FX: Add, Replace,
+      Remove, Open FX window, bypass all; Options: Rescan), the chain on the
+      left (checkbox = active, "VST3i: Name"), the picked plug-in on the right.
+      Left click picks and shows it (replacing what the window showed), Remove
+      is available once one is picked, right click opens the Reaper-style
+      instance menu (open, bypass, rename, replace, move up/down, remove).
+      A plug-in that is added opens at once; reopening a chain opens the one it
+      showed last. The window fills its height, so it stretches from the bottom
+      edge (checked under a virtual display).
+- [x] **Add FX** is a window of its own with the installed plug-ins in a
+      folder per developer, a search box (names and developers), Rescan,
+      Add / Cancel, double click adds. The global chain is offered effects only.
+- [x] **Global FX** is a chain on the whole mix (`master_chain`,
+      `master_fx_bypassed` in the `.bwx`), independent of the tracks.
+- [x] **Hosting** (`src/plugins/vst3.rs`, `host.rs`): VST3 bundles load
+      through `libloading` and the `vst3` bindings: factory classes, component,
+      controller (also a separate one), processing in 64-frame blocks, note
+      events, parameter edits, saved state (stored in the slot and written on
+      save). Each plug-in has a stable slot id; the host keeps instances while
+      slots exist.
+- [x] **Audio routing** (`src/audio/mod.rs`): the vendored `vendor/oxisynth`
+      (one added method, `render_groups`) renders every MIDI channel to its
+      own buffer. Track chain: soundfont, then the plug-ins in order, into the
+      mix; Global chain on the mix. A **VST3 instrument** in a track's chain
+      takes that track's notes and replaces the sound: the soundfont does not
+      play the track at all (no leak, reverb send included; tested against the
+      real soundfont), the track's mute/solo/volume/pan apply to the plug-in's
+      output. Bypassed slots and chains drop out of the graph.
+- [x] **Editor windows**: Windows opens the plug-in's own editor in a window of
+      its own (`native_window.rs`, plain Win32 calls). Everywhere, the right
+      half lists the plug-in's parameters with sliders as a fallback.
+- [ ] Not hosted yet: VST2, CLAP, LV2, AU (listed, with a message when added);
+      macOS loading; plug-in latency compensation, tempo/transport info for
+      plug-ins, MIDI controllers other than notes, multi-output instruments,
+      instruments in the global chain.
+- [ ] **Not tested here**: any real-world plug-in (only the `vst3` crate's
+      gain example and a small instrument built from it), the Windows editor
+      window and the Windows loader (no Windows here; the Windows-only code
+      is type-checked, not run), audio on a device.
+- [x] Tests: `cargo test` 229 passed with the two test plug-ins built from the
+      vst3 crate (`BW_TEST_GAIN_VST3`, `BW_TEST_SYNTH_VST3`, `BW_TEST_VST3`
+      name the bundles; without them those tests pass quietly), 2 ignored (the
+      soundfont tests, run by hand and passing).
+
+- [x] Tests (before item 17): `cargo test`: 214 passed, 1 ignored (the real-soundfont render,
+      not run). Exercised in the running app under a virtual display: the
+      tab rhythm marks with the staff shown, repeat signs and the "x2" label,
+      the repeat copy in the timeline, Ctrl+click selection across two
+      tracks and the hover comparison, a bar drag with its target mark and
+      Warning color, the drop with the tie cut and the status message,
+      renaming a track, the FX window and the scan result (0 plug-ins: none
+      installed there). Not exercised in the app: the multi-selection RMB
+      menu and the octave shift, Shift+click, `Esc` during a drag, dragging
+      across tracks, repeats during playback (no audio device; covered by
+      unit tests), the scan on real plug-in bundles (unit-tested on made-up
+      ones), the playback line over the rhythm marks.
+      Item 14 and the theme items, from the parallel UI work: exercised under a virtual display: every
+      theme item above in dark and bright, a user preset saved and written to
+      the file, a background image loaded from the file, right-click keeping
+      a selected note, Shift+Up on an area selection moving all four notes.
+      The fretboard during playback and the cursor-less neck were drawn from
+      a fixed test position (no audio device there). Not exercised in the
+      app: the file picker for the image, deleting and reverting presets.
 
 ---
 
@@ -915,12 +1331,6 @@ right-click submenus and the move / stretch drag previews.
       equivalent for *stretching* a note's edges across strings (stretching
       only ever changes duration/start on the note's current string) — not
       requested, just noting the asymmetry.
-- [x] ~~Drag-to-stretch can't cross a bar boundary~~ — relaxed 18.08.2026,
-      item 2, consistent with `insert_note`/`move_note`. `Shift+→` resizing
-      (`set_note_duration_fluid`) is the one place that still can't cross a
-      bar boundary — worth a dedicated pass, since its "shift/delete
-      subsequent notes" logic gets meaningfully more complex once resizing
-      can reach into a neighboring bar's own, unrelated notes.
 - [ ] Note dragging (18.08.2026, item 6) only moves notes in time
       (horizontally) — it doesn't support dragging a note to a different
       string (vertically). Not requested yet, but a natural next step if
@@ -938,7 +1348,7 @@ right-click submenus and the move / stretch drag previews.
       notes) is the faithful path. Unverified against TuxGuitar itself.
 
 ### Core notation engine (Phase 2)
-- [x] Right mouse click (RMB) in an area to open context menu with options:
+- Right mouse click (RMB) in an area to open context menu with options:
 
 - [ ] Cut (`Ctrl+X`)
 - [ ] Copy (`Ctrl+C`)
@@ -946,21 +1356,17 @@ right-click submenus and the move / stretch drag previews.
 - [ ] All-Track Cut (`Ctrl+Shift+X`)
 - [ ] All-Track Copy (`Ctrl+Shift+C`)
 - [ ] Special Paste... (`Ctrl+Shift+V`)
-- [x] Bar
+- Bar
     
-    - [x] Insert Bar (to the left of selected bar) (`Ctrl+Ins` and `Ctrl+Shift+B`)
-    - [x] Add a Bar (to the right of selected bar) (`Ctrl+B`)
-    - [x] Delete Bar (`Ctrl+Del`)
     - [ ] Clef... (`K`)
     - [ ] Key Signature... (`Ctrl+K`)
-    - [x] Time Signature... (`Ctrl+T`)
     - [ ] Triplet Feel... (`Ctrl+/`)
     - [ ] Free Time (`|`)
     - [ ] Double Barline
     - [ ] Anacrusis (Pickup Bar)
-    - [ ] Repeat Open (`[`)
+    - [x] Repeat Open (`[`)
     - [ ] Alternate Endings...
-    - [ ] Repeat Close... (`]`)
+    - [x] Repeat Close... (`]`)
     - [ ] Directions... (`D`)
     - [ ] Simile Marks
     - [ ] Multirest (`Ctrl+R`)
@@ -968,28 +1374,19 @@ right-click submenus and the move / stretch drag previews.
     - [ ] Prevent Break Line
     - [ ] System Layout...
     
-- [x] Note
+- Note
     
     - [ ] Insert a Beat (`Ins`)
     - [ ] Delete the Beats (`Shift+Del`)
     - [ ] Copy Beats at the End (`C`)
-    - [x] Duration
-    - [x] Dynamic
-    - [x] Ghost Note (`O`)
-    - [x] Accented Note (`;`)
-    - [x] Heavily Accented Note (`:`)
-    - [x] Staccato (`!`)
     - [ ] Staccatissimo
     - [ ] Tenuto
-    - [x] Tie Note (`L`)
     - [ ] Tie Beat (`Shift+L`)
     - [ ] Rest (`R`)
     - [ ] Fermata... (`F`)
     - [ ] Accidentals
-    - [x] One Semitone Down (`Alt+Shift+Down`)
-    - [x] One Semitone Up (`Alt+Shift+Up`)
-    - [ ] One Octave Down (`Alt+Shift+PgDown`)
-    - [ ] One Octave Up (`Alt+Shift+PgUp`)
+    - [x] One Octave Down (`Alt+Shift+Down`)
+    - [x] One Octave Up (`Alt+Shift+Up`)
     - [ ] Left Hand Fingering...
     - [ ] Right Hand Fingering...
     - [ ] String Number
@@ -1007,30 +1404,21 @@ right-click submenus and the move / stretch drag previews.
     - [ ] Design
     - [ ] Audio Note Settings... (`Shift+F`)
     
-- [x] Effects
+- Effects
     
     - [ ] Grace Note
     - [ ] Trill... (`N`)
     - [ ] Ornament
     - [ ] Tremolo
-    - [x] Let Ring (`I`)
     - [ ] Sustain Pedal
     - [ ] Legato (`Shift+H`)
-    - [x] Hammer On / Pull Off (`H`)
     - [ ] Left Hand Tapping (`(`)
-    - [x] Tapping (`)`)
-    - [x] Slap (`S`)
-    - [x] Pop (`Ctrl+S`)
     - [ ] Dead Slapped
-    - [x] Dead Note (`X`)
-    - [x] Palm Mute on Note (`P`)
     - [ ] Palm Mute on Beat (`Shift+P`)
     - [ ] Pick Scrape Out Downwards
     - [ ] Pick Scrape Out Upwards
     - [ ] Bend... (`B`)
-    - [x] Slide
     - [ ] Tremolo Bar... (`Shift+W`)
-    - [x] Vibrato
     - [ ] Vibrato w/ Trem. Bar
     - [ ] Natural Harmonic (`Y`)
     - [ ] Artificial Harmonic... (`Ctrl+Alt+Y`)
@@ -1041,7 +1429,6 @@ right-click submenus and the move / stretch drag previews.
     - [ ] Rasgueado... (`Shift+R`)
     - [ ] Golpe Finger
     - [ ] Golpe Thumb
-    - [x] Fade In (`<`)
     - [ ] Fade Out (`>`)
     - [ ] Volume Swell (`Alt+<`)
     - [ ] Wah Open (`Ctrl+Alt+O`)
@@ -1058,10 +1445,8 @@ right-click submenus and the move / stretch drag previews.
       no paste into another track's bar grid beyond the cursor rule, and not
       between two running copies of the app.
 - [ ] Real chord detection (multiple notes on one tick drawn as a chord block).
-- [ ] Instruments adding/deleting
+- [ ] Deleting and reordering tracks (`Add Track` exists).
 - [ ] Bar adding/deleting
-- [x] ~~Some kind of bar scrolling~~ - implemented 12.11.2026, item 3
-      (`Shift`+wheel; the wheel zooms).
 - [ ] Vertical bar placement to fill the screen efficiently
 - [ ] Brick note length manual editing with pulling it left or right as in piano rolls.
 - [ ] Virtual guitar neck/Fretboard panel: tuning changable from the panel.
@@ -1091,11 +1476,10 @@ right-click submenus and the move / stretch drag previews.
       and there is no drum track type yet.
 - [ ] Track table: instrument type (which sound list a track gets) can't be
       changed after creation, and channel assignment is not editable.
-- [ ] Real **VST3 hosting** via `vst3` crate (the `Vst3HostSlot` is currently a
-      pass-through stub that only records loaded paths). Requires implementation of VST3 folder scanning (`C:\Program Files\Common Files\VST3`).
+- [x] Real **VST3 hosting**: done in 17.11.2026 item 17 (the stub is gone).
+- [ ] Hosting for VST2, CLAP, LV2 and AU, and VST3 loading on macOS.
 
 ### File formats (Phase 4)
-- [x] **Native `.bwx` save/load round-trip** tested through the UI. Works good at the state of 19.06.2026
 - [ ] **`.tg` import/export** beyond the current TuxGuitar subset reader. Export can't be tested, blocked due to inability to delete test instrument with polythithms
 - [ ] **`.gp` (Guitar Pro)** reader/writer (export path is a placeholder text
       bundle today).
@@ -1105,8 +1489,6 @@ right-click submenus and the move / stretch drag previews.
 ### UI / UX
 - [ ] **Custom theme palette editor** (`EditorTheme` exists but is not
       user-editable at runtime).
-- [x] ~~Scrollable / paginated score view beyond the 8-system cap~~ - the cap
-      is gone and the score scrolls (12.11.2026, item 3).
 - [ ] Score scrollbar widget (`Shift`+wheel is the only way to scroll) and a
       paged layout.
 - [ ] Zoom holds only the row under the pointer in place; its horizontal

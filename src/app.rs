@@ -1,22 +1,32 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::{
-    audio::{AudioRuntime, Vst3HostSlot, VstHost},
+    audio::AudioRuntime,
     core::{
         BwxProject, CompatibilityReport, DurationChoice, InstrumentFamily, InstrumentTrack,
-        MidiEventKind, MidiPlaybackEvent, NoteClip, NoteEffects, RestFill, ShadowTimeline,
+        MidiEventKind, NoteClip, NoteEffects, RestFill, ShadowTimeline, SoundChainSlot,
         StandardExportFormat, StretchEdge, StringedVariant, TICKS_PER_QUARTER, TempoTransition,
         Tick, TimeSignature,
+        bars::{BarMove, BarRef},
         sounds::{sound_choices, sound_name},
     },
     format,
     fretboard::{self, FretboardFrame, Inlay},
     icons::{self, PaletteIcon},
     notation::{self, Clef},
-    theme::EditorTheme,
+    symbols::Symbols,
+    theme::{
+        AppThemeMode, ColorSource, EditorTheme, ThemeElement, ThemePreset, ThemeStore,
+        built_in_presets,
+    },
+    plugins::{PluginKind, PluginScanner, ScannedPlugin, host::PluginHost},
 };
+
+mod fx_chain;
+mod timeline;
 
 /// The keyboard-driven write cursor. It points at a `(tick, string)` cell on
 /// the active track's tab staff - exactly the cell the next typed fret will
@@ -125,6 +135,14 @@ impl StaffSystem {
         x0 + (x1 - x0) * (tick - t0) as f32 / (t1 - t0).max(1) as f32
     }
 
+    /// Like `x_of` for a position between two ticks.
+    fn x_of_position(&self, tick: f64, pixels_per_tick: f32) -> f32 {
+        let whole = tick.floor();
+        let x0 = self.x_of(whole as Tick, pixels_per_tick);
+        let x1 = self.x_of(whole as Tick + 1, pixels_per_tick);
+        x0 + (x1 - x0) * (tick - whole) as f32
+    }
+
     /// Left edge of bar `index` relative to the system's left edge.
     fn bar_x(&self, index: usize, pixels_per_tick: f32) -> f32 {
         match self.beat_bars.get(index) {
@@ -177,6 +195,8 @@ enum EditorViewMode {
     TabNumbers,
 }
 
+/// Frets in one octave on a fretted instrument.
+const OCTAVE_FRETS: i16 = 12;
 /// Score zoom limits. They match the toolbar slider and the clamp that tab
 /// view applies to its beat widths.
 const MIN_PIXELS_PER_TICK: f32 = 0.035;
@@ -235,7 +255,9 @@ struct SystemMetrics {
 }
 
 impl SystemMetrics {
-    const STRING_GAP: f32 = 9.0;
+    /// Distance between tab strings, equal to the height of a brick so notes
+    /// on neighboring strings never overlap.
+    const STRING_GAP: f32 = 14.0;
     /// Gap between adjacent classic staff lines.
     const STAFF_LINE_GAP: f32 = 7.0;
     /// Height of the five-line staff.
@@ -461,33 +483,6 @@ enum AppScreen {
     Editor,
 }
 
-/// The user's theme preference (View menu). Resolved to an actual
-/// `EditorTheme` + `egui::Theme` every frame in `resolve_theme`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AppThemeMode {
-    /// Follow the OS's light/dark preference; falls back to Dark if egui
-    /// can't determine it (some platforms/window managers don't report it).
-    System,
-    Dark,
-    Bright,
-}
-
-impl AppThemeMode {
-    const ALL: [AppThemeMode; 3] = [
-        AppThemeMode::System,
-        AppThemeMode::Dark,
-        AppThemeMode::Bright,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            AppThemeMode::System => "System",
-            AppThemeMode::Dark => "Dark",
-            AppThemeMode::Bright => "Bright",
-        }
-    }
-}
-
 /// A copy, cut or paste request read from the keyboard.
 enum ClipboardAction {
     Copy,
@@ -500,11 +495,13 @@ enum ClipboardAction {
 /// controls.
 #[derive(Clone, Copy)]
 enum MixEdit {
+    Variant(StringedVariant),
     Program(u8),
     Volume(u8),
     Pan(i8),
     Solo(bool),
     Mute(bool),
+    FxBypass(bool),
 }
 
 /// `edit` is `None` for the frame a drag ends on, which only closes the undo
@@ -540,7 +537,23 @@ pub struct BetterWriterApp {
     project: BwxProject,
     theme: EditorTheme,
     theme_mode: AppThemeMode,
+    /// The theme in use and being edited; `user_presets` are the saved ones.
+    theme_draft: ThemePreset,
+    user_presets: Vec<ThemePreset>,
+    theme_window_open: bool,
+    /// What the theme file holds now, to write it only when something changed.
+    theme_saved: ThemeStore,
+    background_image: Option<BackgroundImage>,
     shadow_timeline: ShadowTimeline,
+    /// Clef and rest outlines, rasterized on the first editor frame.
+    symbols: Option<Symbols>,
+    /// Song position in ticks while playing, polled once per frame.
+    playback_tick: Option<f64>,
+    /// `playback_tick` mapped back to a position in the selected track's
+    /// score: a repeated region shows the playback line on every pass.
+    playback_score_tick: Option<f64>,
+    /// The score row the view last scrolled to while following playback.
+    playback_follow_row: Option<usize>,
     audio: AudioRuntime,
     /// A Play request is waiting for the soundfont to finish loading.
     audio_wait: bool,
@@ -552,13 +565,28 @@ pub struct BetterWriterApp {
     /// with them. egui only reports a paste while the system clipboard holds
     /// text, and the text doubles as the check that it is still our copy.
     note_clipboard: Option<(NoteClip, String)>,
+    /// Vertical scroll of the track table and the bar timeline beside it.
+    track_rows_scroll: f32,
     /// Counts copies so each puts different text on the system clipboard.
     copy_serial: u32,
     /// Project as it was before the volume or pan control being dragged
     /// started, so the whole drag becomes one undo step.
     mixer_edit_before: Option<BwxProject>,
     show_fretboard: bool,
-    vst_slot: Vst3HostSlot,
+    plugin_scanner: PluginScanner,
+    /// The audio thread was last given no plug-ins at all.
+    audio_graph_empty: bool,
+    /// The plug-ins of the open project, running.
+    plugin_host: PluginHost,
+    /// The FX Chain windows and the plug-in browser.
+    fx: fx_chain::FxChainState,
+    /// Track being renamed in the track table and its text so far.
+    renaming_track: Option<(u64, String)>,
+    /// Bars selected in the bar timeline. A repeated copy of a bar selects
+    /// as the bar it copies.
+    timeline_selection: BTreeSet<BarRef>,
+    timeline_anchor: Option<BarRef>,
+    timeline_drag: Option<timeline::TimelineDrag>,
     current_file: Option<PathBuf>,
     selected_track_id: u64,
     selected_note_id: Option<u64>,
@@ -584,12 +612,14 @@ pub struct BetterWriterApp {
     selected_dots: u8,
     active_effects: NoteEffects,
     active_velocity: u8,
-    fret_to_insert: u8,
+    last_fret: u8,
     pixels_per_tick: f32,
     /// How far the score is scrolled up, in screen points.
     scroll_y: f32,
     /// Scroll the edit cursor's row into view on the next frame.
     reveal_cursor: bool,
+    /// Scroll the track table to the selected track on the next frame.
+    reveal_selected_track: bool,
     status: String,
     compatibility: CompatibilityReport,
     cursor: EditCursor,
@@ -599,6 +629,8 @@ pub struct BetterWriterApp {
     undo_stack: Vec<BwxProject>,
     redo_stack: Vec<BwxProject>,
     time_signature_numerator: u8,
+    /// Play count being typed for the repeat close at (track, bar start).
+    repeat_picker: Option<(u64, Tick, u16)>,
     time_signature_denominator: u8,
     screen: AppScreen,
     /// Most-recently-opened/saved project paths, newest first. Persisted to
@@ -615,6 +647,7 @@ pub struct BetterWriterApp {
 impl BetterWriterApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let project = BwxProject::demo();
+        let theme_store = load_theme_store();
         let shadow_timeline = ShadowTimeline::default();
         shadow_timeline.rebuild_all(&project);
         let compatibility = CompatibilityReport::analyze(&project, horizon_tick(&project));
@@ -628,8 +661,17 @@ impl BetterWriterApp {
             selected_track_id: project.tracks.first().map(|track| track.id).unwrap_or(1),
             project,
             theme: EditorTheme::default(),
-            theme_mode: AppThemeMode::System,
+            theme_mode: theme_store.mode,
+            theme_draft: theme_store.current.clone(),
+            user_presets: theme_store.presets.clone(),
+            theme_window_open: false,
+            theme_saved: theme_store,
+            background_image: None,
             shadow_timeline,
+            symbols: None,
+            playback_tick: None,
+            playback_score_tick: None,
+            playback_follow_row: None,
             audio: AudioRuntime::new(default_soundfont_path()),
             audio_wait: false,
             audio_preloaded: false,
@@ -638,7 +680,14 @@ impl BetterWriterApp {
             copy_serial: 0,
             mixer_edit_before: None,
             show_fretboard: true,
-            vst_slot: Vst3HostSlot::default(),
+            plugin_scanner: PluginScanner::start(),
+            audio_graph_empty: true,
+            plugin_host: PluginHost::new(),
+            fx: fx_chain::FxChainState::default(),
+            renaming_track: None,
+            timeline_selection: BTreeSet::new(),
+            timeline_anchor: None,
+            timeline_drag: None,
             current_file: None,
             selected_note_id: None,
             area_selected_note_ids: Vec::new(),
@@ -651,10 +700,12 @@ impl BetterWriterApp {
             selected_dots: 0,
             active_effects: NoteEffects::default(),
             active_velocity: 108,
-            fret_to_insert: 3,
+            last_fret: 0,
             pixels_per_tick: 0.07,
             scroll_y: 0.0,
+            track_rows_scroll: 0.0,
             reveal_cursor: false,
+            reveal_selected_track: false,
             status: "Type 0-9 to enter a fret, arrows to move, Enter to advance. \
                 See Help > Keyboard for all shortcuts."
                 .to_owned(),
@@ -663,6 +714,7 @@ impl BetterWriterApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             time_signature_numerator: 4,
+            repeat_picker: None,
             time_signature_denominator: 4,
             screen: AppScreen::StartMenu,
             recent_projects: load_recent_projects(),
@@ -689,16 +741,292 @@ impl BetterWriterApp {
                 !matches!(ctx.input(|input| input.raw.system_theme), Some(egui::Theme::Light))
             }
         };
-        self.theme = if dark {
-            EditorTheme::dark()
-        } else {
-            EditorTheme::bright()
-        };
-        ctx.set_theme(if dark {
+        self.theme = EditorTheme::from_preset(&self.theme_draft, !dark);
+        let egui_theme = if self.theme.dark {
             egui::Theme::Dark
         } else {
             egui::Theme::Light
+        };
+        ctx.set_visuals_of(egui_theme, self.theme.visuals());
+        ctx.set_theme(egui_theme);
+        self.sync_background_image(ctx);
+        self.save_theme_if_changed();
+    }
+
+    /// Keeps the loaded background image in step with the theme's path.
+    fn sync_background_image(&mut self, ctx: &egui::Context) {
+        let wanted = self.theme_draft.background_image.clone();
+        if self.background_image.as_ref().map(|image| &image.path) == wanted.as_ref() {
+            return;
+        }
+        self.background_image = wanted.map(|path| {
+            let loaded = match load_background_image(ctx, &path) {
+                Ok(loaded) => Some(loaded),
+                Err(error) => {
+                    self.status = format!("Could not load the background image: {error}");
+                    None
+                }
+            };
+            BackgroundImage { path, loaded }
         });
+    }
+
+    fn theme_store(&self) -> ThemeStore {
+        ThemeStore {
+            mode: self.theme_mode,
+            current: self.theme_draft.clone(),
+            presets: self.user_presets.clone(),
+        }
+    }
+
+    fn save_theme_if_changed(&mut self) {
+        let store = self.theme_store();
+        if store != self.theme_saved {
+            save_theme_store(&store);
+            self.theme_saved = store;
+        }
+    }
+
+    /// The image behind the score, scaled to cover `rect`.
+    fn paint_background_image(&self, painter: &egui::Painter, rect: Rect) {
+        let Some((texture, size)) = self
+            .background_image
+            .as_ref()
+            .and_then(|image| image.loaded.as_ref())
+        else {
+            return;
+        };
+        painter.image(texture.id(), rect, cover_uv(rect.size(), *size), egui::Color32::WHITE);
+    }
+
+    /// The sheet's fill: solid, or see-through by the image's visibility
+    /// when a background image is showing.
+    fn sheet_fill(&self) -> egui::Color32 {
+        let showing_image = self
+            .background_image
+            .as_ref()
+            .is_some_and(|image| image.loaded.is_some());
+        if showing_image {
+            self.theme
+                .sheet_background
+                .gamma_multiply(1.0 - self.theme_draft.image_visibility)
+        } else {
+            self.theme.sheet_background
+        }
+    }
+
+    fn show_theme_window(&mut self, ctx: &egui::Context) {
+        if !self.theme_window_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Theme")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| self.theme_editor_ui(ui));
+        self.theme_window_open = open;
+    }
+
+    fn theme_editor_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            for mode in AppThemeMode::ALL {
+                ui.radio_value(&mut self.theme_mode, mode, mode.label());
+            }
+        });
+        ui.separator();
+
+        let built_in = built_in_presets();
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            ui.label("Preset");
+            egui::ComboBox::from_id_salt("theme_preset")
+                .selected_text(self.theme_draft.name.as_str())
+                .show_ui(ui, |ui| {
+                    for preset in built_in.iter().chain(&self.user_presets) {
+                        if ui
+                            .selectable_label(preset.name == self.theme_draft.name, &preset.name)
+                            .clicked()
+                        {
+                            chosen = Some(preset.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(preset) = chosen {
+            self.apply_theme_preset(&preset);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut self.theme_draft.name);
+        });
+        let name = self.theme_draft.name.trim().to_owned();
+        let is_built_in = built_in.iter().any(|preset| preset.name.eq_ignore_ascii_case(&name));
+        let saved_index = self
+            .user_presets
+            .iter()
+            .position(|preset| preset.name.eq_ignore_ascii_case(&name));
+        let stored: Option<ThemePreset> = saved_index
+            .map(|index| &self.user_presets[index])
+            .or_else(|| built_in.iter().find(|preset| preset.name.eq_ignore_ascii_case(&name)))
+            .cloned();
+        let modified = stored.as_ref().is_some_and(|stored| *stored != self.theme_draft);
+        ui.horizontal(|ui| {
+            let can_save_new = !name.is_empty() && !is_built_in && saved_index.is_none();
+            if ui
+                .add_enabled(can_save_new, egui::Button::new("Save as new"))
+                .on_hover_text("Save these colors as a preset under this name")
+                .clicked()
+            {
+                self.theme_draft.name = name.clone();
+                self.user_presets.push(self.theme_draft.clone());
+                self.status = format!("Saved theme preset \"{name}\".");
+            }
+            if ui
+                .add_enabled(saved_index.is_some() && modified, egui::Button::new("Update"))
+                .on_hover_text("Overwrite the saved preset with these colors")
+                .clicked()
+                && let Some(index) = saved_index
+            {
+                self.theme_draft.name = self.user_presets[index].name.clone();
+                self.user_presets[index] = self.theme_draft.clone();
+                self.status = format!("Updated theme preset \"{name}\".");
+            }
+            if ui
+                .add_enabled(modified, egui::Button::new("Revert"))
+                .on_hover_text("Go back to the saved colors of this preset")
+                .clicked()
+                && let Some(stored) = stored.clone()
+            {
+                self.theme_draft = stored;
+            }
+            if ui
+                .add_enabled(saved_index.is_some(), egui::Button::new("Delete"))
+                .on_hover_text("Delete this saved preset (the colors stay in use)")
+                .clicked()
+                && let Some(index) = saved_index
+            {
+                let removed = self.user_presets.remove(index);
+                self.status = format!("Deleted theme preset \"{}\".", removed.name);
+            }
+        });
+        if is_built_in {
+            ui.label(
+                egui::RichText::new("Built-in preset: rename it to save your changes.")
+                    .small()
+                    .color(self.theme.muted_foreground),
+            );
+        }
+        ui.separator();
+
+        egui::Grid::new("theme_colors")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                let draft = &mut self.theme_draft;
+                for (label, color) in [
+                    ("Bright background", &mut draft.bright_background),
+                    ("Dark background", &mut draft.dark_background),
+                    ("Accent 1", &mut draft.accent),
+                    ("Accent 2", &mut draft.accent2),
+                    ("Highlight (bars being played)", &mut draft.highlight),
+                    ("Warning", &mut draft.warning),
+                    ("Warning 2 (mute, bypassed FX)", &mut draft.warning2),
+                ] {
+                    ui.label(label);
+                    ui.color_edit_button_srgba(color);
+                    ui.end_row();
+                }
+            });
+        ui.separator();
+
+        ui.label(egui::RichText::new("Background image").strong());
+        ui.horizontal(|ui| {
+            let shown = self
+                .theme_draft
+                .background_image
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "None".to_owned());
+            ui.label(shown);
+            if ui.button("Choose...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg"])
+                    .pick_file()
+            {
+                self.theme_draft.background_image = Some(path);
+            }
+            if ui
+                .add_enabled(self.theme_draft.background_image.is_some(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                self.theme_draft.background_image = None;
+            }
+        });
+        ui.add_enabled(
+            self.theme_draft.background_image.is_some(),
+            egui::Slider::new(&mut self.theme_draft.image_visibility, 0.0..=1.0)
+                .text("Visibility"),
+        );
+        ui.separator();
+
+        egui::CollapsingHeader::new("Advanced: color per element").show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Each part follows Accent 1, Accent 2 or its own color.")
+                    .small()
+                    .color(self.theme.muted_foreground),
+            );
+            egui::Grid::new("theme_elements")
+                .num_columns(3)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    for element in ThemeElement::ALL {
+                        ui.label(element.label());
+                        let source = self.theme_draft.source(element);
+                        let current = self.theme_draft.color_of(element);
+                        let text = match source {
+                            ColorSource::Accent => "Accent 1",
+                            ColorSource::Accent2 => "Accent 2",
+                            ColorSource::Custom(_) => "Own color",
+                        };
+                        egui::ComboBox::from_id_salt(("theme_element", element.label()))
+                            .selected_text(text)
+                            .show_ui(ui, |ui| {
+                                let mut pick = None;
+                                if ui.selectable_label(source == ColorSource::Accent, "Accent 1").clicked() {
+                                    pick = Some(ColorSource::Accent);
+                                }
+                                if ui.selectable_label(source == ColorSource::Accent2, "Accent 2").clicked() {
+                                    pick = Some(ColorSource::Accent2);
+                                }
+                                if ui
+                                    .selectable_label(matches!(source, ColorSource::Custom(_)), "Own color")
+                                    .clicked()
+                                    && !matches!(source, ColorSource::Custom(_))
+                                {
+                                    pick = Some(ColorSource::Custom(current));
+                                }
+                                if let Some(pick) = pick {
+                                    self.theme_draft.set_source(element, pick);
+                                }
+                            });
+                        if let ColorSource::Custom(mut color) = source
+                            && ui.color_edit_button_srgba(&mut color).changed()
+                        {
+                            self.theme_draft.set_source(element, ColorSource::Custom(color));
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn apply_theme_preset(&mut self, preset: &ThemePreset) {
+        self.theme_draft = preset.clone();
+        self.status = format!("Theme: {}.", preset.name);
     }
 
     fn refresh_after_edit(&mut self, track_id: u64) {
@@ -716,6 +1044,7 @@ impl BetterWriterApp {
     /// Save a previous project state only when an operation actually changed
     /// the score. A new edit always starts a new undo branch, so redo history
     /// is then no longer meaningful.
+
     fn record_project_edit(&mut self, before: BwxProject) {
         if before == self.project {
             return;
@@ -926,9 +1255,6 @@ impl BetterWriterApp {
         self.refresh_after_edit(track_id);
 
         let pasted = self.with_barline_fragments(track_id, outcome.note_ids);
-        self.cursor.tick = outcome.start_tick;
-        self.cursor.pending_fret = None;
-        self.cursor.pending_at = None;
         let count = pasted.len();
         match pasted[..] {
             [note_id] => self.select_single_note(note_id),
@@ -937,6 +1263,13 @@ impl BetterWriterApp {
                 self.area_selected_note_ids = pasted;
             }
         }
+        // The cursor lands right after what was pasted, ready for the next
+        // paste or note. Selecting a note moves the cursor onto it, so this
+        // comes last.
+        self.advance_cursor_past(outcome.end_tick);
+        self.cursor.pending_fret = None;
+        self.cursor.pending_at = None;
+        self.reveal_cursor = true;
         self.status = if outcome.bars_added > 0 {
             format!(
                 "Pasted {} into {} new bar(s) at the end.",
@@ -984,6 +1317,10 @@ impl BetterWriterApp {
                 return;
             };
             match edit {
+                MixEdit::Variant(variant) => {
+                    track.set_stringed_variant(variant);
+                    self.status = format!("{}: {}", track.name, variant.label());
+                }
                 MixEdit::Program(program) => {
                     track.program = program;
                     self.status = format!("{}: {}", track.name, sound_name(program));
@@ -992,6 +1329,14 @@ impl BetterWriterApp {
                 MixEdit::Pan(pan) => track.pan = pan,
                 MixEdit::Solo(solo) => track.solo = solo,
                 MixEdit::Mute(mute) => track.mute = mute,
+                MixEdit::FxBypass(bypassed) => {
+                    track.fx_bypassed = bypassed;
+                    self.status = format!(
+                        "{}: effects {}.",
+                        track.name,
+                        if bypassed { "bypassed" } else { "in use" }
+                    );
+                }
             }
         }
         if event.commit
@@ -1002,7 +1347,13 @@ impl BetterWriterApp {
     }
 
     fn play(&mut self) {
-        let start_tick = self.playback_start_tick();
+        let score_start = self.playback_start_tick();
+        // Repeats make playback longer than the score, so the audio runs on
+        // the unrolled axis; the first pass of a bar is where playback starts.
+        let start_tick = self
+            .project
+            .track(self.selected_track_id)
+            .map_or(score_start, |track| track.playback_tick_for(score_start));
         let events = self.shadow_timeline.snapshot();
         let has_note_to_play = events
             .iter()
@@ -1014,7 +1365,7 @@ impl BetterWriterApp {
         let bar_number = self
             .project
             .track(self.selected_track_id)
-            .map_or(1, |track| track.bar_index_at(start_tick) + 1);
+            .map_or(1, |track| track.bar_index_at(score_start) + 1);
         match self.audio.play(&self.project, events, start_tick) {
             Ok(()) if self.audio.is_loading() => {
                 self.audio_wait = true;
@@ -1044,6 +1395,23 @@ impl BetterWriterApp {
         }
     }
 
+    /// Starts the plug-ins the chains name and hands the audio thread the
+    /// chains as they are now. Cheap when nothing changed.
+    fn sync_plugin_graph(&mut self) {
+        if self.audio_preloaded && self.audio.sample_rate() > 0.0 {
+            self.plugin_host.set_sample_rate(f64::from(self.audio.sample_rate()));
+        }
+        let any_slots = self.project.tracks.iter().any(|track| !track.sound_chain.is_empty())
+            || !self.project.master_chain.is_empty();
+        if !any_slots && self.audio_graph_empty {
+            return;
+        }
+        self.plugin_host.collect_garbage(&self.project);
+        let graph = self.plugin_host.build_graph(&self.project);
+        self.audio_graph_empty = graph.is_empty();
+        self.audio.set_graph(graph);
+    }
+
     /// Per-frame audio housekeeping: hands a finished soundfont load to the
     /// audio thread and reports how a deferred Play request turned out.
     fn poll_audio(&mut self, ctx: &egui::Context) {
@@ -1053,6 +1421,7 @@ impl BetterWriterApp {
         }
         let busy = self.audio.poll();
         self.audio.sync_mix(&self.project);
+        self.sync_plugin_graph();
         if self.audio_wait && !self.audio.is_loading() {
             self.audio_wait = false;
             self.status = if self.audio.is_playing() {
@@ -1061,7 +1430,21 @@ impl BetterWriterApp {
                 self.audio.status().to_owned()
             };
         }
-        if busy {
+        self.playback_tick = self.audio.playback_tick();
+        self.playback_score_tick = self.playback_tick.map(|position| {
+            self.project
+                .track(self.selected_track_id)
+                .map_or(position, |track| track.score_tick_at_playback(position))
+        });
+        if self.plugin_scanner.poll() {
+            self.status = format!(
+                "Plug-in scan found {} plug-in(s).",
+                self.plugin_scanner.plugins().len()
+            );
+        }
+        if self.playback_tick.is_some() {
+            ctx.request_repaint();
+        } else if busy || self.plugin_scanner.is_scanning() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1171,6 +1554,7 @@ impl BetterWriterApp {
     }
 
     fn save_to_path(&mut self, path: &Path) {
+        self.plugin_host.capture_states(&mut self.project);
         match format::save_project(path, &self.project) {
             Ok(()) => {
                 self.current_file = Some(path.to_path_buf());
@@ -1193,19 +1577,6 @@ impl BetterWriterApp {
     fn return_to_start_menu(&mut self) {
         self.recent_projects = load_recent_projects();
         self.screen = AppScreen::StartMenu;
-    }
-
-    fn load_vst3(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("VST3", &["vst3"])
-            .pick_file()
-        else {
-            return;
-        };
-        match self.vst_slot.load_plugin(&path) {
-            Ok(()) => self.status = format!("Loaded VST3 host slot {}", path.display()),
-            Err(err) => self.status = format!("VST3 load failed: {err}"),
-        }
     }
 
     fn export_bundle(&mut self, format_kind: StandardExportFormat) {
@@ -1344,6 +1715,113 @@ impl BetterWriterApp {
         }
     }
 
+    /// Appends an empty track shaped like the selected one and selects it.
+    /// Runs one edit of the cursor bar's repeat signs as an undo step.
+    fn edit_cursor_bar_marks(
+        &mut self,
+        edit: impl FnOnce(&mut InstrumentTrack, Tick),
+        message: impl FnOnce(&InstrumentTrack, Tick) -> String,
+    ) -> bool {
+        let track_id = self.selected_track_id;
+        let Some(track) = self.project.track(track_id) else {
+            return false;
+        };
+        let bar_start = track.measure_bounds_at(self.cursor.tick).0;
+        let before = self.project.clone();
+        if let Some(track) = self.project.track_mut(track_id) {
+            edit(track, bar_start);
+        }
+        if self.project == before {
+            return false;
+        }
+        self.record_project_edit(before);
+        self.refresh_after_edit(track_id);
+        if let Some(track) = self.project.track(track_id) {
+            self.status = message(track, bar_start);
+        }
+        true
+    }
+
+    fn toggle_repeat_open(&mut self) -> bool {
+        self.edit_cursor_bar_marks(
+            |track, bar| {
+                let open = track.bar_mark_at(bar).repeat_open;
+                track.set_repeat_open(bar, !open);
+            },
+            |track, bar| {
+                let number = track.bar_index_at(bar) + 1;
+                if track.bar_mark_at(bar).repeat_open {
+                    format!("Repeat open at bar {number}.")
+                } else {
+                    format!("Repeat open removed from bar {number}.")
+                }
+            },
+        )
+    }
+
+    /// `]` adds a close that plays the region twice, or removes the close.
+    fn toggle_repeat_close(&mut self) -> bool {
+        let existing = self.project.track(self.selected_track_id).is_some_and(|track| {
+            track
+                .bar_mark_at(track.measure_bounds_at(self.cursor.tick).0)
+                .repeat_close
+                > 0
+        });
+        self.set_repeat_close_at_cursor(if existing { 0 } else { 1 })
+    }
+
+    fn set_repeat_close_at_cursor(&mut self, repeats: u16) -> bool {
+        self.edit_cursor_bar_marks(
+            |track, bar| track.set_repeat_close(bar, repeats),
+            |track, bar| {
+                let number = track.bar_index_at(bar) + 1;
+                match track.bar_mark_at(bar).repeat_close {
+                    0 => format!("Repeat close removed from bar {number}."),
+                    extra => format!("Repeat close at bar {number}: played {} times.", extra + 1),
+                }
+            },
+        )
+    }
+
+    /// Renames a track as one undo step. An empty name keeps the old one.
+    fn rename_track(&mut self, track_id: u64, name: String) {
+        let name = name.trim().to_owned();
+        let Some(track) = self.project.track(track_id) else {
+            return;
+        };
+        if name.is_empty() || track.name == name {
+            return;
+        }
+        let before = self.project.clone();
+        if let Some(track) = self.project.track_mut(track_id) {
+            track.name = name.clone();
+        }
+        self.record_project_edit(before);
+        self.status = format!("Renamed track to \"{name}\".");
+    }
+
+    fn add_track(&mut self) {
+        let previous_project = self.project.clone();
+        let Some(track_id) = self.project.add_track_like(self.selected_track_id) else {
+            self.status = "No track to base the new one on.".to_owned();
+            return;
+        };
+        self.record_project_edit(previous_project);
+        self.selected_track_id = track_id;
+        self.selected_note_id = None;
+        self.area_selected_note_ids.clear();
+        self.reset_cursor_for_track(track_id);
+        self.reveal_cursor = true;
+        self.reveal_selected_track = true;
+        self.refresh_after_edit(track_id);
+        let name = self
+            .project
+            .track(track_id)
+            .map(|track| track.name.clone())
+            .unwrap_or_default();
+        self.status = format!("Added track \"{name}\".");
+    }
+
     fn delete_selected_note(&mut self) -> bool {
         let Some(note_id) = self.selected_note_id else {
             return false;
@@ -1360,28 +1838,30 @@ impl BetterWriterApp {
         }
     }
 
+    /// Moves every selected note by `delta` frets (a semitone each) on its own
+    /// string; none moves if one would leave the neck.
     fn adjust_selected_fret(&mut self, delta: i16) -> bool {
-        let Some(note_id) = self.selected_note_id else {
-            return false;
+        let ids: Vec<u64> = match self.selected_note_id {
+            Some(id) => vec![id],
+            None => self.area_selected_note_ids.clone(),
         };
         let previous_project = self.project.clone();
-        let changed = self
-            .project
-            .track(self.selected_track_id)
-            .and_then(|track| {
-                let note = track.notes.iter().find(|note| note.id == note_id)?;
-                let fret = (note.fret as i16 + delta).clamp(0, track.fret_count as i16) as u8;
-                (fret != note.fret).then_some(fret)
-            });
-        if let Some(fret) = changed {
-            self.project
-                .set_note_fret(self.selected_track_id, note_id, fret);
-            self.record_project_edit(previous_project);
-            self.refresh_after_edit(self.selected_track_id);
-            self.status = format!("Changed selected note to fret {fret}.");
-            true
-        } else {
-            false
+        match self.project.shift_note_frets(self.selected_track_id, &ids, delta) {
+            None => {
+                self.status = "A selected note is already at the end of the neck.".to_owned();
+                false
+            }
+            Some(0) => false,
+            Some(count) => {
+                self.record_project_edit(previous_project);
+                self.refresh_after_edit(self.selected_track_id);
+                self.status = if delta.abs() == OCTAVE_FRETS {
+                    format!("Moved {count} selected note(s) {} an octave.", if delta > 0 { "up" } else { "down" })
+                } else {
+                    format!("Moved {count} selected note(s) by {delta:+} fret.")
+                };
+                true
+            }
         }
     }
 
@@ -1601,7 +2081,7 @@ impl BetterWriterApp {
             .cursor
             .string_index
             .min(track.tuning.len().saturating_sub(1));
-        let fret = self.cursor.pending_fret.unwrap_or(self.fret_to_insert);
+        let fret = self.cursor.pending_fret.unwrap_or(self.last_fret);
         let mut duration = self.entry_ticks();
         let mut shortened_to: Option<String> = None;
         if self.view_mode == EditorViewMode::TabNumbers {
@@ -1640,6 +2120,7 @@ impl BetterWriterApp {
                 }
             }
         }
+        self.last_fret = fret;
         let mut advance_to = tick + duration;
         let previous_project = self.project.clone();
 
@@ -1722,8 +2203,8 @@ impl BetterWriterApp {
         self.write_fret_at_cursor(!stay_on_beat);
     }
 
-    /// Delete the note sitting under the cursor (if any) and pull the caret
-    /// back to that tick so the next entry fills the gap.
+    /// Delete the note sitting under the cursor. With no note there, tab view
+    /// deletes the rest under the cursor instead.
     fn delete_at_cursor(&mut self) {
         let track_id = self.selected_track_id;
         let Some(track) = self.project.track(track_id) else {
@@ -1744,6 +2225,41 @@ impl BetterWriterApp {
             self.selected_note_id = None;
             self.refresh_after_edit(track_id);
             self.status = format!("Deleted note {id} at tick {tick}.");
+        } else if self.view_mode == EditorViewMode::TabNumbers {
+            self.delete_rest_at_cursor();
+        }
+    }
+
+    /// Removes the rest under the cursor, closing the gap by pulling the
+    /// notes after it in the bar to the left.
+    fn delete_rest_at_cursor(&mut self) {
+        let track_id = self.selected_track_id;
+        let tick = self.cursor.tick;
+        let fill = self.tab_rest_fill();
+        let on_a_rest = self
+            .project
+            .bar_rests(track_id, tick, fill)
+            .iter()
+            .any(|rest| rest.abs_tick <= tick && tick < rest.abs_tick + rest.duration_ticks);
+        if !on_a_rest {
+            return;
+        }
+        let previous_project = self.project.clone();
+        match self.project.delete_rest(track_id, tick, fill) {
+            Some(length) => {
+                self.record_project_edit(previous_project);
+                self.selected_note_id = None;
+                self.refresh_after_edit(track_id);
+                self.status = match DurationChoice::detect(length) {
+                    Some((choice, dots)) => {
+                        format!("Deleted the {} rest.", choice.label_dotted(dots))
+                    }
+                    None => "Deleted the rest.".to_owned(),
+                };
+            }
+            None => {
+                self.status = "Nothing after this rest to move into its place.".to_owned();
+            }
         }
     }
 
@@ -1784,7 +2300,10 @@ impl BetterWriterApp {
     ///   - Digits 0-9: build the fret number (multi-digit allowed)
     ///   - Enter: place the buffered (or default) fret at the cursor
     ///   - Space: play from the selection or cursor, or stop when already playing
-    ///   - Backspace / Delete: remove the note under the cursor
+    ///   - Backspace / Delete: remove the note under the cursor, or in tab
+    ///     view the rest there
+    ///
+    /// None of these act while a text field has focus.
     ///   - Left / Right: move by the selected duration (or one grid cell)
     ///   - Up / Down: change the active string
     ///   - + / = / -: cycle note duration shorter / longer
@@ -1813,6 +2332,12 @@ impl BetterWriterApp {
                         _ => {}
                     }
                 }
+            }
+            // A focused text field (a value box in the toolbar or track
+            // table) owns every key below: digits, arrows, Enter and Delete
+            // must not reach the score while the user types a value.
+            if typing_in_text_field {
+                return;
             }
             // Use egui's platform-aware `command` modifier: Ctrl on Windows
             // and Linux, Command on macOS.
@@ -1891,27 +2416,38 @@ impl BetterWriterApp {
                 self.selected_note_id = None;
                 changed = true;
             }
-            if adjust_selected_note && i.key_pressed(egui::Key::ArrowUp) {
-                changed |= self.adjust_selected_fret(1);
+            // Shift+Up/Down moves every selected note, single or area.
+            let adjust_selection_fret = i.modifiers.shift
+                && (self.selected_note_id.is_some() || !self.area_selected_note_ids.is_empty());
+            // Alt+Shift moves a whole octave instead of a semitone.
+            let fret_step = if i.modifiers.alt { OCTAVE_FRETS } else { 1 };
+            if adjust_selection_fret && i.key_pressed(egui::Key::ArrowUp) {
+                changed |= self.adjust_selected_fret(fret_step);
             } else if i.key_pressed(egui::Key::ArrowUp) {
                 self.move_cursor_string(1);
                 changed = true;
             }
-            if adjust_selected_note && i.key_pressed(egui::Key::ArrowDown) {
-                changed |= self.adjust_selected_fret(-1);
+            if adjust_selection_fret && i.key_pressed(egui::Key::ArrowDown) {
+                changed |= self.adjust_selected_fret(-fret_step);
             } else if i.key_pressed(egui::Key::ArrowDown) {
                 self.move_cursor_string(-1);
                 changed = true;
             }
 
+            if !i.modifiers.command && !i.modifiers.alt {
+                if i.key_pressed(egui::Key::OpenBracket) {
+                    changed |= self.toggle_repeat_open();
+                }
+                if i.key_pressed(egui::Key::CloseBracket) {
+                    changed |= self.toggle_repeat_close();
+                }
+            }
             // Commit / delete
             if i.key_pressed(egui::Key::Enter) {
                 self.commit_fret_at_cursor();
                 changed = true;
             }
-            // Space is the transport shortcut. It is ignored while a text
-            // field owns the keyboard, so typing a space never starts playback.
-            if !typing_in_text_field && i.key_pressed(egui::Key::Space) {
+            if i.key_pressed(egui::Key::Space) {
                 self.toggle_playback();
             }
             if i.key_pressed(egui::Key::Backspace)
@@ -1971,7 +2507,6 @@ impl BetterWriterApp {
                     modifiers,
                     ..
                 } = event
-                    && !typing_in_text_field
                     && !modifiers.alt
                 {
                     self.toggle_dots(if modifiers.command { 2 } else { 1 });
@@ -2040,6 +2575,10 @@ impl eframe::App for BetterWriterApp {
                     self.reveal_cursor = true;
                 }
                 self.poll_audio(root.ctx());
+                self.show_theme_window(root.ctx());
+                if self.symbols.is_none() {
+                    self.symbols = Some(Symbols::new(root.ctx()));
+                }
 
                 egui::Panel::top("menu")
                     .exact_size(26.0)
@@ -2089,9 +2628,10 @@ impl eframe::App for BetterWriterApp {
                             ui.separator();
                             ui.label(self.audio.status());
                             ui.separator();
-                            let mut vst_probe = [0.0_f32; 2];
-                            self.vst_slot.process_replacing(&[0.0, 0.0], &mut vst_probe);
-                            ui.label(self.vst_slot.status());
+                            ui.label(format!(
+                                "{} plug-in(s) found",
+                                self.plugin_scanner.plugins().len()
+                            ));
                         });
                     });
 
@@ -2105,6 +2645,7 @@ impl eframe::App for BetterWriterApp {
         // Project..." button as well as the Editor's File > New Project...
         self.show_new_project_dialog(root.ctx());
         self.show_automation_editor(root.ctx());
+        self.show_fx_windows(root.ctx());
     }
 }
 
@@ -2204,15 +2745,30 @@ impl BetterWriterApp {
                 }
             });
             ui.menu_button("View", |ui| {
-                ui.label(egui::RichText::new("Theme").strong());
-                for mode in AppThemeMode::ALL {
-                    if ui
-                        .radio_value(&mut self.theme_mode, mode, mode.label())
-                        .clicked()
-                    {
+                submenu(ui, "Theme", |ui| {
+                    ui.label(egui::RichText::new("Mode").strong());
+                    for mode in AppThemeMode::ALL {
+                        ui.radio_value(&mut self.theme_mode, mode, mode.label());
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Presets").strong());
+                    let mut chosen = None;
+                    for preset in built_in_presets().iter().chain(&self.user_presets) {
+                        let active = preset.name == self.theme_draft.name;
+                        if ui.selectable_label(active, &preset.name).clicked() {
+                            chosen = Some(preset.clone());
+                        }
+                    }
+                    if let Some(preset) = chosen {
+                        self.apply_theme_preset(&preset);
                         ui.close();
                     }
-                }
+                    ui.separator();
+                    if ui.button("Customize theme...").clicked() {
+                        self.theme_window_open = true;
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 ui.label(egui::RichText::new("Notes").strong());
                 if ui
@@ -2308,6 +2864,7 @@ impl BetterWriterApp {
     /// Menu... / the toolbar's Home button. Lists recently opened projects
     /// (double-click to open) alongside New Project / Demo Project actions.
     fn show_start_menu(&mut self, ui: &mut egui::Ui) {
+        self.paint_background_image(ui.painter(), ui.max_rect());
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.heading(egui::RichText::new("BetterWriter").size(32.0));
@@ -2961,13 +3518,13 @@ impl BetterWriterApp {
                         TempoTransition::Progressive => {
                             painter.line_segment(
                                 [Pos2::new(ax, ay), Pos2::new(bx, by)],
-                                Stroke::new(2.0, self.theme.accent_color),
+                                Stroke::new(2.0, self.theme.automation_color),
                             );
                         }
                         TempoTransition::Constant => {
                             painter.line_segment(
                                 [Pos2::new(ax, ay), Pos2::new(bx, ay)],
-                                Stroke::new(2.0, self.theme.accent_color),
+                                Stroke::new(2.0, self.theme.automation_color),
                             );
                             painter.line_segment(
                                 [Pos2::new(bx, ay), Pos2::new(bx, by)],
@@ -2991,7 +3548,7 @@ impl BetterWriterApp {
                         center,
                         POINT_DRAW_RADIUS,
                         if selected {
-                            self.theme.accent_color
+                            self.theme.automation_color
                         } else {
                             egui::Color32::from_rgb(224, 224, 224)
                         },
@@ -3306,21 +3863,12 @@ impl BetterWriterApp {
                     self.selected_dots = if self.selected_dots == dots { 0 } else { dots };
                 }
             }
-            ui.add(
-                egui::DragValue::new(&mut self.fret_to_insert)
-                    .range(0..=36)
-                    .prefix("default fret "),
-            )
-            .on_hover_text("Fret used when you press Enter without typing a number first");
             ui.add(egui::Slider::new(
                     &mut self.pixels_per_tick,
                     MIN_PIXELS_PER_TICK..=MAX_PIXELS_PER_TICK,
                 )
                 .text("scale"));
             ui.separator();
-            if small_tool_button(ui, "VST3", "Load VST3 plug-in").clicked() {
-                self.load_vst3();
-            }
             if self.selected_note_mut().is_some() {
                 if small_tool_button(ui, "Dur", "Apply selected duration to note").clicked() {
                     self.apply_selected_duration();
@@ -3376,11 +3924,31 @@ impl BetterWriterApp {
                         (PaletteIcon::KeySignature, "Key signature"),
                         (PaletteIcon::Clef, "Clef"),
                         (PaletteIcon::TripletFeel, "Triplet feel"),
-                        (PaletteIcon::RepeatOpen, "Open repeat"),
-                        (PaletteIcon::RepeatClose, "Close repeat"),
                     ] {
                         planned_palette_button(ui, &theme, icon, name);
                     }
+                    let (repeat_open, repeat_close) = self.repeat_marks_at_cursor();
+                    if palette_button(
+                        ui,
+                        &theme,
+                        PaletteIcon::RepeatOpen,
+                        repeat_open,
+                        true,
+                        "Open repeat  ([)",
+                    )
+                    .clicked()
+                    {
+                        self.toggle_repeat_open();
+                    }
+                    let close = palette_button(
+                        ui,
+                        &theme,
+                        PaletteIcon::RepeatClose,
+                        repeat_close > 0,
+                        true,
+                        "Close repeat  (])",
+                    );
+                    egui::Popup::menu(&close).show(|ui| self.show_repeat_close_picker(ui));
                 });
                 palette_row(ui, |ui| {
                     if palette_button(
@@ -3546,6 +4114,54 @@ impl BetterWriterApp {
         );
     }
 
+    /// The repeat signs on the bar under the cursor: (open, extra plays).
+    fn repeat_marks_at_cursor(&self) -> (bool, u16) {
+        self.project
+            .track(self.selected_track_id)
+            .map_or((false, 0), |track| {
+                let mark = track.bar_mark_at(track.measure_bounds_at(self.cursor.tick).0);
+                (mark.repeat_open, mark.repeat_close)
+            })
+    }
+
+    /// How many times the region closed at the cursor's bar is played, typed
+    /// or dragged freely. Shared by the context menu and the palette.
+    fn show_repeat_close_picker(&mut self, ui: &mut egui::Ui) {
+        let Some(track) = self.project.track(self.selected_track_id) else {
+            return;
+        };
+        let bar = track.measure_bounds_at(self.cursor.tick).0;
+        let existing = track.bar_mark_at(bar).repeat_close;
+        let key = (self.selected_track_id, bar);
+        let mut plays = match self.repeat_picker {
+            Some((id, at, plays)) if (id, at) == key => plays,
+            _ if existing > 0 => existing + 1,
+            _ => 2,
+        };
+        ui.label("Closes the repeat at the bar containing the cursor");
+        ui.horizontal(|ui| {
+            ui.label("Play");
+            ui.add(
+                egui::DragValue::new(&mut plays)
+                    .range(2..=crate::core::bars::MAX_REPEAT_COUNT + 1)
+                    .suffix(" times"),
+            );
+        });
+        self.repeat_picker = Some((key.0, key.1, plays));
+        ui.horizontal(|ui| {
+            if ui.button("Apply").clicked() {
+                self.set_repeat_close_at_cursor(plays - 1);
+                self.repeat_picker = None;
+                ui.close();
+            }
+            if existing > 0 && ui.button("Remove").clicked() {
+                self.set_repeat_close_at_cursor(0);
+                self.repeat_picker = None;
+                ui.close();
+            }
+        });
+    }
+
     /// Numerator and denominator of the time signature applied to the bar
     /// under the edit cursor. Shared by the context menu and the palette.
     fn show_time_signature_picker(&mut self, ui: &mut egui::Ui) {
@@ -3581,6 +4197,7 @@ impl BetterWriterApp {
 
     fn show_track_table(&mut self, ui: &mut egui::Ui) {
         let show_all_sounds = self.show_all_sounds;
+        let widths = track_column_widths(ui, &self.project.tracks);
         let mut mix_events: Vec<MixEvent> = Vec::new();
         let full_size = ui.available_size();
         // The content gets the panel's whole height (a plain `horizontal`
@@ -3591,20 +4208,53 @@ impl BetterWriterApp {
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
                 ui.vertical(|ui| {
+                    ui.set_max_width(112.0);
+                    ui.spacing_mut().slider_width = 52.0;
                     if let Some(track) = self.project.track(self.selected_track_id) {
-                        ui.label(format!("{} {}", track.name, track.program));
                         ui.add(
-                            egui::Slider::new(&mut self.active_velocity, 1..=127).text("velocity"),
+                            egui::Label::new(format!("{} {}", track.name, track.program))
+                                .truncate(),
                         );
+                        ui.add(
+                            egui::Slider::new(&mut self.active_velocity, 1..=127).prefix("Vel "),
+                        )
+                        .on_hover_text("Velocity of new notes and of the selected notes");
+                    }
+                    let global_state = self.fx_state(fx_chain::FxTarget::Master);
+                    let (fx, power) = fx_button_pair(
+                        ui,
+                        egui::Id::new("global_fx"),
+                        "Global FX",
+                        global_state,
+                        self.theme.accent,
+                        self.theme.warning2_color,
+                    );
+                    if fx
+                        .on_hover_text("FX Chain on the whole mix, after every track")
+                        .clicked()
+                    {
+                        self.toggle_fx_window(fx_chain::FxTarget::Master);
+                    }
+                    let power = power.on_hover_text(match global_state {
+                        FxState::Empty => "The global chain is empty",
+                        FxState::Active => "Bypass the global FX",
+                        FxState::Bypassed => "Use the global FX again",
+                    });
+                    if global_state != FxState::Empty && power.clicked() {
+                        self.toggle_fx_power(fx_chain::FxTarget::Master);
+                    }
+                    if ui
+                        .button("+ Track")
+                        .on_hover_text("Add an empty track like the selected one")
+                        .clicked()
+                    {
+                        self.add_track();
                     }
                 });
                 ui.separator();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.x = TRACK_COLUMN_GAP;
-                    let sound_column_start: f32 = TRACK_COLUMNS[..SOUND_COLUMN]
-                        .iter()
-                        .map(|(_, width)| width)
-                        .sum::<f32>()
+                    let sound_column_start: f32 = widths[..SOUND_COLUMN].iter().sum::<f32>()
                         + TRACK_COLUMN_GAP * (SOUND_COLUMN as f32 - 1.0);
                     ui.horizontal(|ui| {
                         ui.add_space(sound_column_start);
@@ -3612,19 +4262,47 @@ impl BetterWriterApp {
                             .on_hover_text("List every sound, not only those for the instrument type");
                     });
                     ui.horizontal(|ui| {
-                        for (heading, width) in TRACK_COLUMNS {
-                            table_cell(ui, width, |ui| ui.strong(heading));
+                        for (index, (heading, _)) in TRACK_COLUMNS.iter().enumerate() {
+                            table_cell(ui, widths[index], |ui| ui.strong(*heading));
                         }
                     });
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                        .show(ui, |ui| {
-                            let mut selected_after = None;
+                    let mut selected_after = None;
+                    let mut rename_started: Option<u64> = None;
+                    let mut fx_toggled: Option<u64> = None;
+                    let mut rename_committed: Option<(u64, String)> = None;
+                    let mut rename_cancelled = false;
+                    let reveal = std::mem::take(&mut self.reveal_selected_track);
+                    let table_width = widths.iter().sum::<f32>()
+                        + TRACK_COLUMN_GAP * (TRACK_COLUMNS.len() as f32 - 1.0);
+                    let rows_height = ui.available_height();
+                    let timeline_width = ui.available_width() - table_width - 14.0;
+                    // The wheel drives one shared offset wherever the pointer
+                    // is over the table or the timeline, so both always move
+                    // by the same amount; the two areas only follow it.
+                    if ui.rect_contains_pointer(ui.max_rect()) && ui.ctx().dragged_id().is_none() {
+                        let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+                        if wheel != 0.0 {
+                            self.track_rows_scroll = (self.track_rows_scroll - wheel).max(0.0);
+                            ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
+                        }
+                    }
+                    // The track columns scroll vertically without a bar of their
+                    // own; the timeline beside them shows the bars, so its
+                    // horizontal bar sits at the bottom of the panel. The two
+                    // areas share one vertical offset.
+                    ui.horizontal_top(|ui| {
+                            let rows = egui::ScrollArea::vertical()
+                                .id_salt("track_rows")
+                                .max_height(rows_height)
+                                .auto_shrink([true, false])
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                .vertical_scroll_offset(self.track_rows_scroll)
+                                .show(ui, |ui| {
+                            ui.vertical(|ui| {
                             for track in &self.project.tracks {
-                                ui.horizontal(|ui| {
+                                let row = ui.horizontal(|ui| {
                                     let selected = track.id == self.selected_track_id;
-                                    table_cell(ui, TRACK_COLUMNS[0].1, |ui| {
+                                    table_cell(ui, widths[0], |ui| {
                                         if ui
                                             .selectable_label(selected, track.id.to_string())
                                             .clicked()
@@ -3632,7 +4310,7 @@ impl BetterWriterApp {
                                             selected_after = Some(track.id);
                                         }
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[1].1, |ui| {
+                                    table_cell(ui, widths[1], |ui| {
                                         if ui
                                             .selectable_label(track.solo, "S")
                                             .on_hover_text("Solo")
@@ -3645,9 +4323,8 @@ impl BetterWriterApp {
                                             });
                                         }
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[2].1, |ui| {
-                                        if ui
-                                            .selectable_label(track.mute, "M")
+                                    table_cell(ui, widths[2], |ui| {
+                                        if warning_toggle(ui, "M", track.mute, self.theme.warning2_color)
                                             .on_hover_text("Mute")
                                             .clicked()
                                         {
@@ -3658,15 +4335,122 @@ impl BetterWriterApp {
                                             });
                                         }
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[3].1, |ui| {
-                                        if ui.selectable_label(selected, &track.name).clicked() {
-                                            selected_after = Some(track.id);
+                                    table_cell(ui, widths[3], |ui| {
+                                        let state = if track.sound_chain.is_empty() {
+                                            FxState::Empty
+                                        } else if track.fx_bypassed {
+                                            FxState::Bypassed
+                                        } else {
+                                            FxState::Active
+                                        };
+                                        let (fx, power) = fx_button_pair(
+                                            ui,
+                                            egui::Id::new(("track_fx", track.id)),
+                                            "FX",
+                                            state,
+                                            self.theme.accent,
+                                            self.theme.warning2_color,
+                                        );
+                                        let hover = if track.sound_chain.is_empty() {
+                                            "FX Chain: empty (click to open)".to_owned()
+                                        } else {
+                                            format!(
+                                                "FX Chain: {} plug-in(s)",
+                                                track.sound_chain.len()
+                                            )
+                                        };
+                                        if fx.on_hover_text(hover).clicked() {
+                                            if !selected {
+                                                selected_after = Some(track.id);
+                                            }
+                                            fx_toggled = Some(track.id);
+                                        }
+                                        let power = power.on_hover_text(match state {
+                                            FxState::Empty => "No effects to bypass",
+                                            FxState::Active => "Effects in use (click to bypass)",
+                                            FxState::Bypassed => {
+                                                "Effects bypassed (click to use them)"
+                                            }
+                                        });
+                                        if state != FxState::Empty && power.clicked() {
+                                            mix_events.push(MixEvent {
+                                                track_id: track.id,
+                                                edit: Some(MixEdit::FxBypass(!track.fx_bypassed)),
+                                                commit: true,
+                                            });
                                         }
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[4].1, |ui| {
+                                    table_cell(ui, widths[4], |ui| {
+                                        let editing = matches!(
+                                            &self.renaming_track,
+                                            Some((id, _)) if *id == track.id
+                                        );
+                                        if editing {
+                                            if let Some((_, text)) = &mut self.renaming_track {
+                                                let edit = ui.add(
+                                                    egui::TextEdit::singleline(text)
+                                                        .desired_width(widths[4] - 8.0),
+                                                );
+                                                if !edit.has_focus() && !edit.lost_focus() {
+                                                    edit.request_focus();
+                                                }
+                                                let escaped = ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Escape)
+                                                });
+                                                if escaped {
+                                                    rename_cancelled = true;
+                                                } else if edit.lost_focus() {
+                                                    rename_committed =
+                                                        Some((track.id, text.clone()));
+                                                }
+                                            }
+                                        } else {
+                                            let label =
+                                                ui.selectable_label(selected, &track.name);
+                                            if label.clicked() {
+                                                selected_after = Some(track.id);
+                                            }
+                                            let label = label.on_hover_text(
+                                                "Double-click or right-click to rename",
+                                            );
+                                            if label.double_clicked() {
+                                                selected_after = Some(track.id);
+                                                rename_started = Some(track.id);
+                                            }
+                                            label.context_menu(|ui| {
+                                                if ui.button("Rename").clicked() {
+                                                    rename_started = Some(track.id);
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
+                                    });
+                                    table_cell(ui, widths[5], |ui| {
+                                        egui::ComboBox::from_id_salt(("track_instrument", track.id))
+                                            .selected_text(track.stringed_variant.label())
+                                            .width(widths[5] - 8.0)
+                                            .show_ui(ui, |ui| {
+                                                for variant in StringedVariant::ALL {
+                                                    if ui
+                                                        .selectable_label(
+                                                            variant == track.stringed_variant,
+                                                            variant.label(),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        mix_events.push(MixEvent {
+                                                            track_id: track.id,
+                                                            edit: Some(MixEdit::Variant(variant)),
+                                                            commit: true,
+                                                        });
+                                                    }
+                                                }
+                                            });
+                                    });
+                                    table_cell(ui, widths[6], |ui| {
                                         egui::ComboBox::from_id_salt(("track_sound", track.id))
                                             .selected_text(sound_name(track.program))
-                                            .width(TRACK_COLUMNS[4].1 - 24.0)
+                                            .width(widths[6] - 8.0)
                                             .height(360.0)
                                             .show_ui(ui, |ui| {
                                                 for program in sound_choices(
@@ -3692,7 +4476,7 @@ impl BetterWriterApp {
                                                 }
                                             });
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[5].1, |ui| {
+                                    table_cell(ui, widths[7], |ui| {
                                         let mut volume = track.volume;
                                         let response = ui.add(
                                             egui::DragValue::new(&mut volume)
@@ -3706,7 +4490,7 @@ impl BetterWriterApp {
                                             MixEdit::Volume(volume),
                                         );
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[6].1, |ui| {
+                                    table_cell(ui, widths[8], |ui| {
                                         let mut pan = track.pan;
                                         let response = ui.add(
                                             egui::DragValue::new(&mut pan)
@@ -3724,17 +4508,53 @@ impl BetterWriterApp {
                                             MixEdit::Pan(pan),
                                         );
                                     });
-                                    table_cell(ui, TRACK_COLUMNS[7].1, |ui| {
+                                    table_cell(ui, widths[9], |ui| {
                                         ui.label((track.channel + 1).to_string())
                                     });
                                 });
+                                if reveal && track.id == self.selected_track_id {
+                                    ui.scroll_to_rect(row.response.rect, None);
+                                }
                             }
-                            if let Some(track_id) = selected_after {
-                                self.selected_track_id = track_id;
-                                self.selected_note_id = None;
-                                self.reset_cursor_for_track(track_id);
-                            }
-                        });
+                            });
+                            // The timeline's horizontal bar takes this much
+                            // room from its viewport; the columns match it so
+                            // both can scroll to the same last row.
+                            ui.add_space(ui.spacing().scroll.allocated_width());
+                                });
+                            self.track_rows_scroll = rows.state.offset.y;
+                            ui.separator();
+                            self.track_rows_scroll = self.show_bar_timeline(
+                                ui,
+                                timeline_width,
+                                rows_height,
+                                self.track_rows_scroll,
+                            );
+                    });
+                    if let Some(track_id) = selected_after {
+                        self.selected_track_id = track_id;
+                        self.selected_note_id = None;
+                        self.reset_cursor_for_track(track_id);
+                    }
+                    if let Some(track_id) = fx_toggled {
+                        // The track's own button opens its own FX Chain.
+                        self.toggle_fx_window(fx_chain::FxTarget::Track(track_id));
+                    }
+                    if let Some(track_id) = rename_started {
+                        let name = self
+                            .project
+                            .track(track_id)
+                            .map(|track| track.name.clone())
+                            .unwrap_or_default();
+                        self.renaming_track = Some((track_id, name));
+                    }
+                    if rename_cancelled {
+                        self.renaming_track = None;
+                    }
+                    if let Some((track_id, name)) = rename_committed {
+                        self.renaming_track = None;
+                        self.rename_track(track_id, name);
+                    }
                 });
             },
         );
@@ -3759,14 +4579,14 @@ impl BetterWriterApp {
         let theme = self.theme;
         let tuning = track.tuning.clone();
         let fret_count = track.fret_count.max(1);
-        let cursor_tick = self.cursor.tick;
         let cursor_string = self.cursor.string_index.min(tuning.len() - 1);
-        let markers: Vec<(usize, u8, bool)> = track
-            .notes
-            .iter()
-            .filter(|note| note.abs_tick <= cursor_tick && cursor_tick < note.end_tick())
-            .map(|note| (note.string_index, note.fret, note.abs_tick == cursor_tick))
-            .collect();
+        // While the song plays the neck shows what sounds now; otherwise it
+        // shows what is under the edit cursor.
+        let playing = self.playback_tick.map(|tick| tick as Tick);
+        let markers = match playing {
+            Some(tick) => fretboard::sounding_markers(track, tick, FRETBOARD_STRIKE_TICKS),
+            None => fretboard::sounding_markers(track, self.cursor.tick, 1),
+        };
 
         let frame = FretboardFrame::new(rect, tuning.len(), fret_count);
         let hovered = response.hover_pos().and_then(|pos| frame.hit(pos));
@@ -3791,17 +4611,19 @@ impl BetterWriterApp {
             }
         }
 
-        let band = frame.cell_rect(cursor_string, 0);
-        painter.rect_filled(
-            Rect::from_min_max(band.min, Pos2::new(frame.board.right(), band.max.y)),
-            0.0,
-            theme.accent_color.gamma_multiply(0.14),
-        );
+        if playing.is_none() {
+            let band = frame.cell_rect(cursor_string, 0);
+            painter.rect_filled(
+                Rect::from_min_max(band.min, Pos2::new(frame.board.right(), band.max.y)),
+                0.0,
+                theme.fretboard_color.gamma_multiply(0.14),
+            );
+        }
         if let Some((string, fret)) = hovered {
             painter.rect_filled(
                 frame.cell_rect(string, fret),
                 2.0,
-                theme.accent_color.gamma_multiply(0.3),
+                theme.fretboard_color.gamma_multiply(0.3),
             );
         }
 
@@ -3857,23 +4679,25 @@ impl BetterWriterApp {
         }
 
         let radius = frame.marker_radius();
-        let label_font = FontId::monospace((radius * 1.35).clamp(8.0, 11.0));
+        // Proportional: the monospace face draws a dotted zero that reads as
+        // a dark mark inside the circle.
+        let label_font = FontId::proportional((radius * 1.5).clamp(9.0, 12.0));
         for (string, fret, onset) in markers {
             if string >= strings {
                 continue;
             }
             let center = frame.cell_center(string, fret);
             if onset {
-                painter.circle_filled(center, radius, theme.accent_color);
+                painter.circle_filled(center, radius, theme.fretboard_color);
             } else {
-                painter.circle_stroke(center, radius, Stroke::new(1.5_f32, theme.accent_color));
+                painter.circle_stroke(center, radius, Stroke::new(1.5_f32, theme.fretboard_color));
             }
             painter.text(
                 center,
                 Align2::CENTER_CENTER,
                 fret.to_string(),
                 label_font.clone(),
-                if onset { theme.sheet_background } else { theme.accent_color },
+                if onset { theme.sheet_background } else { theme.fretboard_color },
             );
         }
 
@@ -4032,6 +4856,20 @@ impl BetterWriterApp {
             self.reveal_cursor = false;
             self.scroll_cursor_into_view(page);
         }
+        match self.playback_score_tick {
+            Some(position) => {
+                let tick = position as Tick;
+                let row = self
+                    .project
+                    .track(self.selected_track_id)
+                    .map(|track| self.page_geometry(track, page).system_index_of_tick(tick));
+                if row.is_some() && row != self.playback_follow_row {
+                    self.playback_follow_row = row;
+                    self.scroll_tick_into_view(page, tick);
+                }
+            }
+            None => self.playback_follow_row = None,
+        }
         if response.hovered() && matches!(self.canvas_drag, CanvasDragMode::Idle) {
             let (scroll, pinch, shift, pointer) = ui.input(|input| {
                 (
@@ -4061,18 +4899,76 @@ impl BetterWriterApp {
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
     }
 
+    /// A vertical scrollbar along the right edge of the score area. The
+    /// wheel zooms, so this and Shift+wheel are how the score scrolls.
+    fn show_score_scrollbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        page: Rect,
+    ) {
+        let Some(track) = self.project.track(self.selected_track_id) else {
+            return;
+        };
+        let max_scroll = self.max_scroll_y(track, page);
+        if max_scroll <= 0.0 {
+            return;
+        }
+        let lane = Rect::from_min_max(
+            Pos2::new(rect.right() - SCORE_SCROLLBAR_WIDTH - 4.0, page.top()),
+            Pos2::new(rect.right() - 4.0, page.bottom()),
+        );
+        let content = max_scroll + page.height();
+        let thumb_height = (lane.height() * page.height() / content).max(28.0).min(lane.height());
+        let travel = lane.height() - thumb_height;
+        let response = ui.interact(lane, ui.id().with("score_scrollbar"), Sense::click_and_drag());
+        if let Some(pos) = response.interact_pointer_pos()
+            && travel > 0.0
+            && (response.dragged() || response.clicked())
+        {
+            // The thumb follows the pointer, centered on it.
+            let fraction = ((pos.y - lane.top() - thumb_height * 0.5) / travel).clamp(0.0, 1.0);
+            self.scroll_y = fraction * max_scroll;
+        }
+        let top = lane.top() + travel * (self.scroll_y / max_scroll).clamp(0.0, 1.0);
+        let thumb = Rect::from_min_size(
+            Pos2::new(lane.left(), top),
+            Vec2::new(lane.width(), thumb_height),
+        );
+        let [r, g, b, _] = self.theme.muted_foreground.to_array();
+        let strength = if response.dragged() {
+            200
+        } else if response.hovered() {
+            150
+        } else {
+            100
+        };
+        painter.rect_filled(
+            lane,
+            lane.width() * 0.5,
+            egui::Color32::from_rgba_unmultiplied(r, g, b, 30),
+        );
+        painter.rect_filled(
+            thumb,
+            lane.width() * 0.5,
+            egui::Color32::from_rgba_unmultiplied(r, g, b, strength),
+        );
+    }
+
     fn show_editor(&mut self, ui: &mut egui::Ui) {
         let desired = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, self.theme.canvas_backdrop);
+        self.paint_background_image(&painter, rect);
 
         let page = rect.shrink2(Vec2::new(18.0, 18.0));
-        painter.rect_filled(page, 0.0, self.theme.sheet_background);
+        painter.rect_filled(page, 0.0, self.sheet_fill());
 
         self.handle_canvas_scroll(ui, &response, page);
+        self.show_score_scrollbar(ui, &painter, rect, page);
         let track_rect = self.paint_selected_track_page(&painter, page);
-        self.paint_shadow_overview(&painter, page);
 
         if response.drag_started() {
             // egui reports the start only after the pointer has already moved
@@ -4098,15 +4994,14 @@ impl BetterWriterApp {
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            self.handle_canvas_click(pos, track_rect);
+            self.handle_canvas_click(pos, track_rect, false);
         }
         if response.secondary_clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            // Right-click uses the same hit testing as a normal click, so the
-            // menu always operates on the exact staff position or selected
-            // note under the pointer.
-            self.handle_canvas_click(pos, track_rect);
+            // Right-click only places the cursor on empty space; whatever is
+            // selected stays selected, so the menu acts on that selection.
+            self.handle_canvas_click(pos, track_rect, true);
             self.sync_time_signature_picker();
         }
         // `PopupCloseBehavior::CloseOnClickOutside` keeps nested controls
@@ -4232,7 +5127,7 @@ impl BetterWriterApp {
         let painter = painter.with_clip_rect(page);
         let geometry = self.page_geometry(track, page);
         let changes = self.note_drag_changes(plan);
-        let accent = self.theme.accent_color;
+        let accent = self.theme.note_selection_color;
         let background = self.theme.sheet_background;
         let veil = egui::Color32::from_rgba_unmultiplied(
             background.r(),
@@ -4334,6 +5229,7 @@ impl BetterWriterApp {
         ui.separator();
         let has_selection = self.selected_note_id.is_some();
         let has_area_selection = !self.area_selected_note_ids.is_empty();
+        let has_any_selection = has_selection || has_area_selection;
         submenu(ui, "Bar", |ui| {
             if ui.button("Insert Bar  (Ctrl+Ins)").clicked() {
                 self.insert_bar_before_selected();
@@ -4352,14 +5248,22 @@ impl BetterWriterApp {
             submenu(ui, "Time Signature...  (Ctrl+T)", |ui| {
                 self.show_time_signature_picker(ui);
             });
+            let (repeat_open, _) = self.repeat_marks_at_cursor();
+            if ui
+                .selectable_label(repeat_open, "Repeat Open  ([)")
+                .on_hover_text("Start of a repeated region")
+                .clicked()
+            {
+                self.toggle_repeat_open();
+                ui.close();
+            }
+            submenu(ui, "Repeat Close  (])", |ui| self.show_repeat_close_picker(ui));
             for label in [
                 "Triplet Feel...  (Ctrl+/)",
                 "Free Time  (|)",
                 "Double Barline",
                 "Anacrusis (Pickup Bar)",
-                "Repeat Open  ([)",
                 "Alternate Endings...",
-                "Repeat Close...  (])",
                 "Directions...  (D)",
                 "Simile Marks",
                 "Multirest  (Ctrl+R)",
@@ -4471,7 +5375,7 @@ impl BetterWriterApp {
                 );
             });
             submenu(ui, "Dynamic", |ui| {
-                ui.add_enabled_ui(has_selection, |ui| {
+                ui.add_enabled_ui(has_any_selection, |ui| {
                     for (label, velocity) in [
                         ("ppp", 30),
                         ("pp", 42),
@@ -4493,7 +5397,7 @@ impl BetterWriterApp {
                     }
                 });
             });
-            ui.add_enabled_ui(has_selection, |ui| {
+            ui.add_enabled_ui(has_any_selection, |ui| {
                 note_effects_changed |= ui
                     .checkbox(&mut self.active_effects.ghost, "Ghost Note  (O)")
                     .changed();
@@ -4511,10 +5415,7 @@ impl BetterWriterApp {
                     .changed();
             });
             if ui
-                .add_enabled(
-                    has_selection || has_area_selection,
-                    egui::Button::new("Tie Note  (L)"),
-                )
+                .add_enabled(has_any_selection, egui::Button::new("Tie Note  (L)"))
                 .clicked()
             {
                 self.toggle_tie_on_selection();
@@ -4530,19 +5431,20 @@ impl BetterWriterApp {
             ] {
                 planned_menu_item(ui, label);
             }
-            ui.add_enabled_ui(has_selection, |ui| {
-                if ui.button("One Semitone Down  (Alt+Shift+Down)").clicked() {
-                    self.adjust_selected_fret(-1);
-                    ui.close();
-                }
-                if ui.button("One Semitone Up  (Alt+Shift+Up)").clicked() {
-                    self.adjust_selected_fret(1);
-                    ui.close();
+            ui.add_enabled_ui(has_any_selection, |ui| {
+                for (label, delta) in [
+                    ("One Semitone Down  (Shift+Down)", -1),
+                    ("One Semitone Up  (Shift+Up)", 1),
+                    ("One Octave Down  (Alt+Shift+Down)", -OCTAVE_FRETS),
+                    ("One Octave Up  (Alt+Shift+Up)", OCTAVE_FRETS),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.adjust_selected_fret(delta);
+                        ui.close();
+                    }
                 }
             });
             for label in [
-                "One Octave Down  (Alt+Shift+PgDown)",
-                "One Octave Up  (Alt+Shift+PgUp)",
                 "Left Hand Fingering...",
                 "Right Hand Fingering...",
                 "String Number",
@@ -4562,7 +5464,7 @@ impl BetterWriterApp {
             ] {
                 planned_menu_item(ui, label);
             }
-            if !has_selection {
+            if !has_any_selection {
                 ui.label(egui::RichText::new("Select a note to edit it.").small());
             }
         });
@@ -4571,7 +5473,7 @@ impl BetterWriterApp {
         }
         submenu(ui, "Effects", |ui| {
             let mut effects_changed = false;
-            ui.add_enabled_ui(has_selection, |ui| {
+            ui.add_enabled_ui(has_any_selection, |ui| {
                 planned_menu_item(ui, "Grace Note");
                 planned_menu_item(ui, "Trill...  (N)");
                 planned_menu_item(ui, "Ornament");
@@ -4689,11 +5591,15 @@ impl BetterWriterApp {
 
     /// Scrolls just far enough to bring the edit cursor's row onto the page.
     fn scroll_cursor_into_view(&mut self, page: Rect) {
+        self.scroll_tick_into_view(page, self.cursor.tick);
+    }
+
+    fn scroll_tick_into_view(&mut self, page: Rect, tick: Tick) {
         let Some(track) = self.project.track(self.selected_track_id) else {
             return;
         };
         let geometry = self.page_geometry(track, page);
-        let row = geometry.system_index_of_tick(self.cursor.tick);
+        let row = geometry.system_index_of_tick(tick);
         let top = PAGE_TOP_INSET + row as f32 * geometry.metrics.height;
         let bottom = top + geometry.metrics.height;
         let mut scroll = self.scroll_y;
@@ -5000,16 +5906,22 @@ impl BetterWriterApp {
                         self.theme.staff_stroke(),
                     );
                 }
-                painter.text(
-                    Pos2::new(left - 26.0, staff_y + 14.0),
-                    Align2::CENTER_CENTER,
-                    if clef == Clef::Bass { "F" } else { "G" },
-                    FontId::proportional(28.0),
-                    self.theme.notation_foreground,
-                );
+                if let Some(symbols) = &self.symbols {
+                    let glyph = if clef == Clef::Bass {
+                        &symbols.bass_clef
+                    } else {
+                        &symbols.treble_clef
+                    };
+                    glyph.paint(
+                        painter,
+                        Pos2::new(left - 34.0, staff_y),
+                        SystemMetrics::STAFF_LINE_GAP,
+                        self.theme.notation_foreground,
+                    );
+                }
                 // Guitars and basses sound an octave below the written pitch.
                 painter.text(
-                    Pos2::new(left - 26.0, staff_y + 33.0),
+                    Pos2::new(left - 26.0, staff_y + SystemMetrics::STAFF_HEIGHT + 17.0),
                     Align2::CENTER_CENTER,
                     "8",
                     FontId::proportional(10.0),
@@ -5043,6 +5955,30 @@ impl BetterWriterApp {
                     [Pos2::new(x, system_top), Pos2::new(x, tab_bottom + 3.0)],
                     self.theme.bar_stroke(),
                 );
+                let mark = track.bar_mark_at(bar_start);
+                if mark.repeat_open {
+                    self.paint_repeat_sign(
+                        painter, x, true, system_top, tab_bottom, staff_y, tab_y, &metrics,
+                    );
+                }
+                if mark.repeat_close > 0 {
+                    let end_x = system
+                        .bars
+                        .get(bar_index + 1)
+                        .map_or(system_right, |_| {
+                            left + system.bar_x(bar_index + 1, self.pixels_per_tick)
+                        });
+                    self.paint_repeat_sign(
+                        painter, end_x, false, system_top, tab_bottom, staff_y, tab_y, &metrics,
+                    );
+                    painter.text(
+                        Pos2::new(end_x - 4.0, system_top - 8.0),
+                        Align2::RIGHT_CENTER,
+                        format!("x{}", mark.repeat_close as u32 + 1),
+                        FontId::monospace(11.0),
+                        self.theme.notation_foreground,
+                    );
+                }
                 // Only label a bar where the signature actually *changes*
                 // (or the very first bar of the piece) - not every bar that
                 // happens to share the current signature.
@@ -5053,6 +5989,8 @@ impl BetterWriterApp {
                     // in front of the staff.
                     let label_x = if bar_index == 0 && !system.has_beat_layout() {
                         x - 12.0
+                    } else if mark.repeat_open {
+                        x + 18.0
                     } else {
                         x + 6.0
                     };
@@ -5141,32 +6079,37 @@ impl BetterWriterApp {
                 self.paint_tab_rhythm(painter, track, clef, system, left, tab_bottom);
             }
 
-            // Rests: every gap in tab view, only the end of each bar in
-            // brick view (where a gap between bricks is simply empty).
-            for (bar_index, &(bar_start, bar_end)) in system.bars.iter().enumerate() {
-                match self.view_mode {
-                    EditorViewMode::Bricks => {
-                        for rest in self.project.tail_padding_rests(track.id, bar_start) {
-                            let x = left + system.x_of(rest.abs_tick, self.pixels_per_tick);
-                            let y = tab_bottom + 17.0;
-                            painter.line_segment(
-                                [Pos2::new(x, y), Pos2::new(x + 14.0, y)],
-                                Stroke::new(2.0, self.theme.rest_color),
-                            );
-                        }
-                    }
-                    EditorViewMode::TabNumbers => {
-                        for rest in
-                            self.project
-                                .bar_rests(track.id, bar_start, self.tab_rest_fill())
-                        {
-                            let (cx, value) =
-                                self.rest_anchor(system, left, bar_index, bar_end, &rest);
+            if let Some(position) = self.playback_score_tick
+                && position >= system.start_tick as f64
+                && position < system_end_tick as f64
+            {
+                let x = left + system.x_of_position(position, self.pixels_per_tick);
+                painter.line_segment(
+                    [
+                        Pos2::new(x, system_top - PLAYBACK_LINE_OVERSHOOT),
+                        Pos2::new(x, tab_bottom + self.tab_rhythm_depth()),
+                    ],
+                    Stroke::new(2.5_f32, self.theme.playback_color),
+                );
+            }
+
+            // Rests are written in tab view only; in brick view a gap between
+            // bricks is simply empty.
+            if self.view_mode == EditorViewMode::TabNumbers {
+                for (bar_index, &(bar_start, bar_end)) in system.bars.iter().enumerate() {
+                    for rest in self
+                        .project
+                        .bar_rests(track.id, bar_start, self.tab_rest_fill())
+                    {
+                        let (cx, value) = self.rest_anchor(system, left, bar_index, bar_end, &rest);
+                        if let Some(symbols) = &self.symbols {
                             paint_rest_symbol(
                                 painter,
+                                symbols,
                                 cx,
                                 tab_y + metrics.tab_span() * 0.5,
                                 value,
+                                SystemMetrics::STRING_GAP / 12.0,
                                 self.theme.rest_color,
                             );
                         }
@@ -5254,10 +6197,11 @@ impl BetterWriterApp {
         let thin = Stroke::new(1.0_f32, ink);
         let stem_stroke = Stroke::new(1.2_f32, ink);
 
-        // Head centers by note id, for drawing ties afterwards.
-        let mut head_spots: std::collections::HashMap<u64, (f32, f32, bool)> =
+        // Head centers by (note id, piece start), for drawing ties afterwards.
+        type HeadKey = (u64, Tick);
+        let mut head_spots: std::collections::HashMap<HeadKey, (f32, f32, bool)> =
             std::collections::HashMap::new();
-        let mut ties: Vec<(u64, u64)> = Vec::new();
+        let mut ties: Vec<(HeadKey, HeadKey)> = Vec::new();
 
         for (bar_index, &(bar_start, bar_end)) in system.bars.iter().enumerate() {
             let signature = track.signature_at(bar_start);
@@ -5332,7 +6276,17 @@ impl BetterWriterApp {
                             1 => y_of(6),
                             _ => y_of(4),
                         };
-                        paint_rest_symbol(painter, cx, reference, glyph, self.theme.rest_color);
+                        if let Some(symbols) = &self.symbols {
+                            paint_rest_symbol(
+                                painter,
+                                symbols,
+                                cx,
+                                reference,
+                                glyph,
+                                SystemMetrics::STAFF_LINE_GAP / 7.0,
+                                self.theme.rest_color,
+                            );
+                        }
                     }
                     ScoreItem::Chord(chord) => {
                         let cx = self.content_x(system, left, chord.tick);
@@ -5381,7 +6335,7 @@ impl BetterWriterApp {
                             let hy = y_of(head.step);
                             let selected = self.is_note_selected(head.note_id);
                             let color = if selected {
-                                self.theme.accent_color
+                                self.theme.note_selection_color
                             } else {
                                 ink
                             };
@@ -5429,7 +6383,13 @@ impl BetterWriterApp {
                                     Stroke::new(1.3_f32, color),
                                 ));
                             }
-                            head_spots.insert(head.note_id, (hx, hy, chord.stem_up));
+                            head_spots.insert(
+                                (head.note_id, head.piece_start),
+                                (hx, hy, chord.stem_up),
+                            );
+                            if let Some(from) = head.tie_from {
+                                ties.push((from, (head.note_id, head.piece_start)));
+                            }
                         }
 
                         // Augmentation dots go in the space to the right of
@@ -5495,13 +6455,6 @@ impl BetterWriterApp {
                             }
                         }
 
-                        for note in track.notes.iter().filter(|note| {
-                            note.abs_tick == chord.tick && track.is_tied_continuation(note)
-                        }) {
-                            if let Some(previous) = track.tie_predecessor(note) {
-                                ties.push((previous.id, note.id));
-                            }
-                        }
                     }
                 }
             }
@@ -5581,26 +6534,73 @@ impl BetterWriterApp {
         }
     }
 
-    /// Draws a note as a bare fret number on its string (tab view). A tied
-    /// continuation is written "(fret)" with a tie arc back to the note it
-    /// continues; when that note sits in an earlier row the arc starts at
-    /// the left edge of this one.
-    /// Whether rhythm marks hang under the tab strings: in tab view the
-    /// strings carry only fret numbers, so without the staff above them the
-    /// marks are the only place a note's length shows.
+    /// Whether rhythm marks hang under the tab strings. Tab view carries only
+    /// fret numbers on the strings, so the marks are what shows each note's
+    /// length there, with or without the classic staff above.
     fn tab_rhythm_shown(&self) -> bool {
-        self.view_mode == EditorViewMode::TabNumbers && !self.show_classic_notation
+        self.view_mode == EditorViewMode::TabNumbers
+    }
+
+    /// A repeat sign at `x`: a thick and a thin line with two dots beside
+    /// them, facing into the repeated bars. `opening` puts the dots on the
+    /// right of the lines, a close sign puts them on the left.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_repeat_sign(
+        &self,
+        painter: &egui::Painter,
+        x: f32,
+        opening: bool,
+        system_top: f32,
+        tab_bottom: f32,
+        staff_y: f32,
+        tab_y: f32,
+        metrics: &SystemMetrics,
+    ) {
+        let ink = self.theme.notation_foreground;
+        let side = if opening { 1.0 } else { -1.0 };
+        let (top, bottom) = (system_top, tab_bottom + 3.0);
+        painter.line_segment(
+            [Pos2::new(x + side * 2.5, top), Pos2::new(x + side * 2.5, bottom)],
+            Stroke::new(4.0_f32, ink),
+        );
+        painter.line_segment(
+            [Pos2::new(x + side * 7.0, top), Pos2::new(x + side * 7.0, bottom)],
+            Stroke::new(1.2_f32, ink),
+        );
+        let dot_x = x + side * 12.0;
+        let mut dots = |middle: f32, gap: f32| {
+            for offset in [-0.5_f32, 0.5] {
+                painter.circle_filled(Pos2::new(dot_x, middle + offset * gap), 2.0, ink);
+            }
+        };
+        dots(tab_y + metrics.tab_span() * 0.5, SystemMetrics::STRING_GAP);
+        if self.show_classic_notation {
+            dots(
+                staff_y + SystemMetrics::STAFF_HEIGHT * 0.5,
+                SystemMetrics::STAFF_LINE_GAP * 2.0,
+            );
+        }
     }
 
     /// Distance from the last tab string to the "P.M." label, clear of the
     /// rhythm marks when they are shown.
     fn palm_mute_label_gap(&self) -> f32 {
-        if self.tab_rhythm_shown() { 24.0 } else { 13.0 }
+        if self.tab_rhythm_shown() { 35.0 } else { 13.0 }
     }
 
-    /// TuxGuitar-style rhythm under the tab strings: a stem per beat, flags
-    /// or beams for short values, and a dot after the stem for each
-    /// augmentation dot, all read from the notes' lengths.
+    /// Bottom of the rhythm marks relative to the last tab string.
+    fn tab_rhythm_depth(&self) -> f32 {
+        if self.tab_rhythm_shown() {
+            TAB_STEM_GAP + TAB_STEM_LENGTH + 4.0
+        } else {
+            PLAYBACK_LINE_OVERSHOOT
+        }
+    }
+
+    /// Rhythm under the tab strings in the style of MuseScore's tab staff: a
+    /// stem per beat hanging below the strings, beams or flags for short
+    /// values, and a dot after the stem for each augmentation dot, all read
+    /// from the notes' lengths.
     fn paint_tab_rhythm(
         &self,
         painter: &egui::Painter,
@@ -5612,10 +6612,10 @@ impl BetterWriterApp {
     ) {
         use notation::ScoreItem;
 
-        let top = tab_bottom + 6.0;
-        let tip = top + 14.0;
+        let top = tab_bottom + TAB_STEM_GAP;
+        let tip = top + TAB_STEM_LENGTH;
         let ink = self.theme.notation_foreground;
-        let beam_stroke = Stroke::new(2.0_f32, ink);
+        let beam_stroke = Stroke::new(2.6_f32, ink);
 
         for &(bar_start, bar_end) in &system.bars {
             let signature = track.signature_at(bar_start);
@@ -5646,7 +6646,7 @@ impl BetterWriterApp {
                     .collect();
                 let deepest = flags.iter().map(|(_, count)| *count).max().unwrap_or(0);
                 for level in 1..=deepest {
-                    let y = tip - (level - 1) as f32 * 3.5;
+                    let y = tip - (level - 1) as f32 * TAB_BEAM_SPACING;
                     let mut index = 0;
                     while index < flags.len() {
                         if flags[index].1 < level {
@@ -5661,7 +6661,7 @@ impl BetterWriterApp {
                         if index - run_start >= 2 {
                             let last = stem_x(flags[index - 1].0);
                             painter.line_segment(
-                                [Pos2::new(first, y), Pos2::new(last, y)],
+                                [Pos2::new(first, y), Pos2::new(last + TAB_STEM_HALF, y)],
                                 beam_stroke,
                             );
                         } else if run_start + 1 < flags.len() {
@@ -5671,7 +6671,7 @@ impl BetterWriterApp {
                             );
                         } else {
                             painter.line_segment(
-                                [Pos2::new(first - 5.0, y), Pos2::new(first, y)],
+                                [Pos2::new(first - 5.0, y), Pos2::new(first + TAB_STEM_HALF, y)],
                                 beam_stroke,
                             );
                         }
@@ -5690,7 +6690,7 @@ impl BetterWriterApp {
                     .iter()
                     .any(|head| self.is_note_selected(head.note_id));
                 let color = if selected {
-                    self.theme.accent_color
+                    self.theme.note_selection_color
                 } else {
                     ink
                 };
@@ -5701,10 +6701,10 @@ impl BetterWriterApp {
                     );
                     if !beamed.contains(&position) {
                         for flag in 0..chord.value.flags() {
-                            let y = tip - flag as f32 * 3.5;
+                            let y = tip - flag as f32 * TAB_BEAM_SPACING;
                             painter.line_segment(
-                                [Pos2::new(x, y), Pos2::new(x + 4.5, y - 4.0)],
-                                Stroke::new(1.5_f32, color),
+                                [Pos2::new(x, y), Pos2::new(x + 5.0, y - 5.0)],
+                                Stroke::new(1.6_f32, color),
                             );
                         }
                     }
@@ -5732,6 +6732,10 @@ impl BetterWriterApp {
         }
     }
 
+    /// Draws a note as a bare fret number on its string (tab view). A tied
+    /// continuation is written "(fret)" with a tie arc back to the note it
+    /// continues; when that note sits in an earlier row the arc starts at
+    /// the left edge of this one.
     fn paint_tab_number(
         &self,
         painter: &egui::Painter,
@@ -5747,7 +6751,7 @@ impl BetterWriterApp {
         let predecessor = track.tie_predecessor(note);
 
         let text_color = if selected {
-            self.theme.accent_color
+            self.theme.note_selection_color
         } else {
             self.theme.notation_foreground
         };
@@ -5756,14 +6760,16 @@ impl BetterWriterApp {
         } else {
             note.fret.to_string()
         };
-        let galley = painter.layout_no_wrap(label, FontId::monospace(11.0), text_color);
+        // The monospace face draws a dotted zero, which reads as a mark inside
+        // the digit; the proportional face has a plain one.
+        let galley = painter.layout_no_wrap(label, FontId::proportional(12.0), text_color);
         let rect = Rect::from_center_size(Pos2::new(x, y), galley.size());
         // The backing patch keeps the string line from striking through the
         // number.
         let backing = rect.expand2(Vec2::new(1.5, 0.0));
         painter.rect_filled(backing, 1.0, self.theme.sheet_background);
         if selected {
-            let [r, g, b, _] = self.theme.accent_color.to_array();
+            let [r, g, b, _] = self.theme.note_selection_color.to_array();
             painter.rect_filled(
                 backing,
                 2.0,
@@ -5818,7 +6824,7 @@ impl BetterWriterApp {
         is_onset: bool,
     ) -> Rect {
         let x = left + (fragment_start - system_origin_tick) as f32 * self.pixels_per_tick;
-        let tab_line_y = tab_y + note.string_index as f32 * 9.0;
+        let tab_line_y = tab_y + note.string_index as f32 * SystemMetrics::STRING_GAP;
 
         // Fragment width is strictly proportional to however much of the
         // note's duration falls in this row. The onset fragment is floored
@@ -5837,12 +6843,9 @@ impl BetterWriterApp {
         let width = proportional
             .max(min_for_digits)
             .min((system_right - x).max(2.0));
-        // Slightly shorter bricks for very brief notes so the visual
-        // rhythm matches the musical one, without squashing legible ones.
-        let height = if proportional < 10.0 { 9.0 } else { 12.0 };
         Rect::from_center_size(
             Pos2::new(x + width * 0.5, tab_line_y),
-            Vec2::new(width, height),
+            Vec2::new(width, SystemMetrics::STRING_GAP),
         )
     }
 
@@ -5869,7 +6872,7 @@ impl BetterWriterApp {
     ) {
         let note_end = note.abs_tick + note.duration_ticks;
         let x = left + (fragment_start - system_origin_tick) as f32 * self.pixels_per_tick;
-        let tab_line_y = tab_y + note.string_index as f32 * 9.0;
+        let tab_line_y = tab_y + note.string_index as f32 * SystemMetrics::STRING_GAP;
         let selected = self.is_note_selected(note.id);
         let note_rect = self.brick_fragment_rect(
             left,
@@ -5890,7 +6893,7 @@ impl BetterWriterApp {
             painter,
             note_rect,
             if selected {
-                self.theme.accent_color
+                self.theme.note_selection_color
             } else {
                 self.theme.note_fill
             },
@@ -5978,7 +6981,7 @@ impl BetterWriterApp {
         {
             return;
         }
-        let string_gap = 9.0;
+        let string_gap = SystemMetrics::STRING_GAP;
         // Brick view mirrors the brick that will land there: the cursor box
         // is as wide as the selected duration, with a small floor so it
         // stays visible at the shortest durations. Tab view marks the beat
@@ -5997,54 +7000,32 @@ impl BetterWriterApp {
 
         // Translucent accent fill derived from the theme's accent color so the
         // highlight stays readable on light or dark palettes.
-        let [ar, ag, ab, _] = self.theme.accent_color.to_array();
+        let [ar, ag, ab, _] = self.theme.cursor_color.to_array();
         let fill = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 70);
         let ghost = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 160);
 
         // Filled highlight box.
         let cell = Rect::from_center_size(
             Pos2::new(x + cell_width * 0.5, y),
-            Vec2::new(cell_width, string_gap + 2.0),
+            Vec2::new(cell_width, string_gap),
         );
         painter.rect_filled(cell, 2.0, fill);
         painter.rect_stroke(
             cell,
             2.0,
-            Stroke::new(1.5, self.theme.accent_color),
+            Stroke::new(1.5, self.theme.cursor_color),
             StrokeKind::Middle,
         );
 
-        // Ghost text for the pending fret, or a caret hint when empty.
-        let label = match self.cursor.pending_fret {
-            Some(fret) => fret.to_string(),
-            None => "_".to_owned(),
-        };
-        painter.text(
-            cell.center(),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::monospace(10.0),
-            ghost,
-        );
-    }
-
-    fn paint_shadow_overview(&self, painter: &egui::Painter, rect: Rect) {
-        let events: Vec<MidiPlaybackEvent> = self.shadow_timeline.snapshot();
-        let y = rect.bottom() - 14.0;
-        let left = rect.left() + 54.0;
-        painter.line_segment(
-            [Pos2::new(left, y), Pos2::new(rect.right() - 24.0, y)],
-            Stroke::new(1.0, self.theme.muted_foreground),
-        );
-        for event in events
-            .iter()
-            .filter(|event| matches!(event.kind, MidiEventKind::NoteOn))
-        {
-            let x = left + event.tick as f32 * self.pixels_per_tick;
-            if x > rect.right() - 24.0 {
-                continue;
-            }
-            painter.circle_filled(Pos2::new(x, y), 2.5, self.theme.playhead_color);
+        // Ghost text for the fret being typed.
+        if let Some(fret) = self.cursor.pending_fret {
+            painter.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                fret.to_string(),
+                FontId::monospace(10.0),
+                ghost,
+            );
         }
     }
 
@@ -6107,7 +7088,7 @@ impl BetterWriterApp {
                     ((fragment_end - fragment_start) as f32 * self.pixels_per_tick).max(22.0);
                 Some(Rect::from_center_size(
                     Pos2::new(x + width * 0.5, y),
-                    Vec2::new(width, 14.0),
+                    Vec2::new(width, SystemMetrics::STRING_GAP),
                 ))
             }
             EditorViewMode::TabNumbers => {
@@ -6117,7 +7098,7 @@ impl BetterWriterApp {
                 let x = self.content_x(system, left, note.abs_tick);
                 Some(Rect::from_center_size(
                     Pos2::new(x, y),
-                    Vec2::new(18.0, 14.0),
+                    Vec2::new(18.0, SystemMetrics::STRING_GAP),
                 ))
             }
         }
@@ -6497,7 +7478,11 @@ impl BetterWriterApp {
         self.canvas_drag = CanvasDragMode::Idle;
     }
 
-    fn handle_canvas_click(&mut self, pos: Pos2, page: Rect) {
+    /// A click on a note selects it; a click on empty space moves the edit
+    /// cursor there and clears the selection. With `keep_selection` (the
+    /// right button) a click on a note does nothing and a click on empty
+    /// space only moves the cursor.
+    fn handle_canvas_click(&mut self, pos: Pos2, page: Rect, keep_selection: bool) {
         if !page.contains(pos) {
             return;
         }
@@ -6506,7 +7491,9 @@ impl BetterWriterApp {
         // with it) to keep this immune to any borrow-checker ambiguity
         // between the `&self` hit test and the `&mut self` select call.
         if let Some(note_id) = self.find_note_fragment_at(pos, page) {
-            self.select_single_note(note_id);
+            if !keep_selection {
+                self.select_single_note(note_id);
+            }
             return;
         }
 
@@ -6539,7 +7526,7 @@ impl BetterWriterApp {
         };
         let tab_y =
             first_top + system_index as f32 * system_height + metrics.tab_offset;
-        let string_gap = 9.0;
+        let string_gap = SystemMetrics::STRING_GAP;
 
         let string_index = ((pos.y - tab_y + string_gap * 0.5) / string_gap)
             .floor()
@@ -6553,13 +7540,28 @@ impl BetterWriterApp {
         self.cursor.string_index = string_index;
         self.cursor.pending_fret = None;
         self.cursor.pending_at = None;
-        self.selected_note_id = None;
-        self.area_selected_note_ids.clear();
+        if !keep_selection {
+            self.selected_note_id = None;
+            self.area_selected_note_ids.clear();
+        }
         self.status = format!(
             "Cursor at tick {} on string {}. Type a fret and press Enter.",
             snapped_tick,
             string_index + 1
         );
+        if self.view_mode == EditorViewMode::TabNumbers {
+            let fill = self.tab_rest_fill();
+            let on_a_rest = self
+                .project
+                .bar_rests(track_id, snapped_tick, fill)
+                .iter()
+                .any(|rest| {
+                    rest.abs_tick <= snapped_tick && snapped_tick < rest.abs_tick + rest.duration_ticks
+                });
+            if on_a_rest {
+                self.status = "Rest selected. Press Delete to remove it, or type a fret.".to_owned();
+            }
+        }
     }
 }
 
@@ -6585,20 +7587,212 @@ fn playback_start(
     selected_start.unwrap_or(cursor_tick).max(0)
 }
 
-/// Track table columns: heading and width. Fixed widths let the header and
-/// the "All sounds" checkbox sit outside the scrolling list yet line up
-/// with its cells.
-const TRACK_COLUMNS: [(&str, f32); 8] = [
-    ("N", 28.0),
-    ("S", 24.0),
-    ("M", 24.0),
-    ("Name", 130.0),
-    ("Sound", 180.0),
-    ("Vol", 52.0),
-    ("Pan", 52.0),
-    ("Ch", 28.0),
+/// A track-table toggle: plain when off, filled with the warning color and
+/// white text when on.
+fn warning_toggle(ui: &mut egui::Ui, label: &str, on: bool, color: egui::Color32) -> egui::Response {
+    if on {
+        ui.add(
+            egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE))
+                .fill(color)
+                .stroke(Stroke::NONE),
+        )
+    } else {
+        ui.selectable_label(false, label)
+    }
+}
+
+/// What a track's FX pair shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FxState {
+    /// No plug-ins: both buttons stay plain.
+    Empty,
+    Active,
+    Bypassed,
+}
+
+/// The Reaper-style FX pair in the track table: an "FX" button (opens the
+/// chain) joined to a power button (bypass toggle). Returns both responses.
+/// The pair is plain until the track has plug-ins, then FX is filled with
+/// the accent; while the chain is bypassed both turn Warning 2.
+fn fx_button_pair(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    label: &str,
+    state: FxState,
+    accent: egui::Color32,
+    warning2: egui::Color32,
+) -> (egui::Response, egui::Response) {
+    let height = ui.spacing().interact_size.y;
+    let power_width = 20.0_f32;
+    let label_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x;
+    let fx_width = (label_width + 14.0).max(28.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(fx_width + power_width, height), Sense::hover());
+    let fx_rect = Rect::from_min_size(rect.min, Vec2::new(fx_width, height));
+    let power_rect = Rect::from_min_size(
+        Pos2::new(rect.min.x + fx_width, rect.min.y),
+        Vec2::new(power_width, height),
+    );
+    let fx = ui.interact(fx_rect, id.with("open"), Sense::click());
+    let power = ui.interact(
+        power_rect,
+        id.with("power"),
+        if state == FxState::Empty { Sense::hover() } else { Sense::click() },
+    );
+    let visuals = ui.visuals().clone();
+    let plain = |response: &egui::Response| {
+        if response.hovered() {
+            visuals.widgets.hovered.weak_bg_fill
+        } else {
+            visuals.widgets.inactive.weak_bg_fill
+        }
+    };
+    let (fx_fill, fx_text, power_color) = match state {
+        FxState::Empty => (plain(&fx), visuals.text_color(), visuals.weak_text_color()),
+        FxState::Active => (accent, crate::theme::contrast_text(accent), accent),
+        FxState::Bypassed => (warning2, egui::Color32::WHITE, warning2),
+    };
+    let painter = ui.painter();
+    let left = egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 };
+    let right = egui::CornerRadius { nw: 0, sw: 0, ne: 3, se: 3 };
+    painter.rect_filled(fx_rect, left, fx_fill);
+    painter.rect_filled(power_rect, right, plain(&power));
+    painter.text(
+        fx_rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(13.0),
+        fx_text,
+    );
+    // The power symbol: an open ring with a short bar through its gap.
+    let center = power_rect.center();
+    let radius = 4.5_f32;
+    let stroke = Stroke::new(1.5_f32, power_color);
+    let points: Vec<Pos2> = (0..=18)
+        .map(|step| {
+            let angle = (35.0_f32 + 290.0 * step as f32 / 18.0).to_radians();
+            Pos2::new(center.x + radius * angle.sin(), center.y + 0.5 - radius * angle.cos())
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, stroke));
+    painter.line_segment(
+        [Pos2::new(center.x, center.y - 6.0), Pos2::new(center.x, center.y - 0.5)],
+        stroke,
+    );
+    (fx, power)
+}
+
+/// Track table columns: heading and least width. The Name, Instrument and
+/// Sound columns grow to their longest entry (`track_column_widths`); the
+/// others stay fixed. One set of widths serves the header, the "All sounds"
+/// checkbox and every row, so they all line up.
+const TRACK_COLUMNS: [(&str, f32); 10] = [
+    ("N", 24.0),
+    ("S", 20.0),
+    ("M", 20.0),
+    ("FX", 48.0),
+    ("Name", 56.0),
+    ("Instrument", 88.0),
+    ("Sound", 100.0),
+    ("Vol", 42.0),
+    ("Pan", 42.0),
+    ("Ch", 24.0),
 ];
-const SOUND_COLUMN: usize = 4;
+/// Room a combo box needs around its text: padding plus the arrow.
+const COMBO_EXTRA_WIDTH: f32 = 40.0;
+/// The longest a Name, Instrument or Sound column gets.
+const MAX_NAME_WIDTH: f32 = 190.0;
+const MAX_SOUND_WIDTH: f32 = 230.0;
+
+/// The width of each track table column: its least width, or the longest
+/// text it holds, up to a cap.
+fn track_column_widths(ui: &egui::Ui, tracks: &[InstrumentTrack]) -> [f32; 10] {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let measure = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    let mut widths = TRACK_COLUMNS.map(|(_, width)| width);
+    let longest = |texts: &mut dyn Iterator<Item = String>| {
+        texts.map(|text| measure(&text)).fold(0.0_f32, f32::max)
+    };
+    let ids = longest(&mut tracks.iter().map(|track| track.id.to_string()));
+    widths[0] = widths[0].max(ids + 14.0);
+    let names = longest(&mut tracks.iter().map(|track| track.name.clone()));
+    widths[4] = widths[4].max((names + 16.0).min(MAX_NAME_WIDTH));
+    let variants = longest(&mut StringedVariant::ALL.iter().map(|variant| variant.label().to_owned()));
+    widths[5] = widths[5].max((variants + COMBO_EXTRA_WIDTH).min(MAX_SOUND_WIDTH));
+    let sounds = longest(&mut tracks.iter().map(|track| sound_name(track.program).to_owned()));
+    widths[6] = widths[6].max((sounds + COMBO_EXTRA_WIDTH).min(MAX_SOUND_WIDTH));
+    widths
+}
+const SOUND_COLUMN: usize = 6;
+
+/// The theme's background image, decoded once. `loaded` is `None` when the
+/// file could not be read, so it is not retried every frame.
+struct BackgroundImage {
+    path: PathBuf,
+    loaded: Option<(egui::TextureHandle, Vec2)>,
+}
+
+/// The part of an image of `image` size that fills `target` without
+/// stretching: centered, cropped on the long side.
+fn cover_uv(target: Vec2, image: Vec2) -> Rect {
+    if target.x <= 0.0 || target.y <= 0.0 || image.x <= 0.0 || image.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let scale = (target.x / image.x).max(target.y / image.y);
+    let shown = Vec2::new(target.x / scale / image.x, target.y / scale / image.y);
+    let margin = (Vec2::splat(1.0) - shown) * 0.5;
+    Rect::from_min_max(margin.to_pos2(), (margin + shown).to_pos2())
+}
+
+fn load_background_image(
+    ctx: &egui::Context,
+    path: &Path,
+) -> Result<(egui::TextureHandle, Vec2), String> {
+    // Larger images are scaled down: a photo wastes video memory at full size.
+    const LARGEST_SIDE: u32 = 2048;
+    let mut decoded = image::open(path).map_err(|error| error.to_string())?;
+    if decoded.width().max(decoded.height()) > LARGEST_SIDE {
+        decoded = decoded.resize(LARGEST_SIDE, LARGEST_SIDE, image::imageops::FilterType::Triangle);
+    }
+    let rgba = decoded.into_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    let texture = ctx.load_texture("theme_background", pixels, egui::TextureOptions::LINEAR);
+    Ok((texture, Vec2::new(size[0] as f32, size[1] as f32)))
+}
+
+fn theme_store_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|dir| dir.join("betterwriter_theme.txt"))
+}
+
+fn load_theme_store() -> ThemeStore {
+    theme_store_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| ThemeStore::from_text(&text))
+        .unwrap_or_default()
+}
+
+fn save_theme_store(store: &ThemeStore) {
+    if let Some(path) = theme_store_path() {
+        let _ = std::fs::write(path, store.to_text());
+    }
+}
+
 const TRACK_COLUMN_GAP: f32 = 4.0;
 const TRACK_ROW_HEIGHT: f32 = 22.0;
 
@@ -6716,64 +7910,74 @@ fn signature_label_at(track: &InstrumentTrack, bar_start: Tick) -> bool {
     bar_start == 0 || track.signature_at(bar_start - 1) != track.signature_at(bar_start)
 }
 
+/// The shorter-than-half rest outlines are drawn this much larger than the
+/// whole and half rest blocks, so a quarter rest spans about three staff gaps.
+const REST_GLYPH_SCALE: f32 = 1.7;
+
+/// How long a note stays drawn as freshly struck on the fretboard while
+/// playing: a sixteenth, so the attack is visible between ringing notes.
+const FRETBOARD_STRIKE_TICKS: Tick = TICKS_PER_QUARTER / 4;
+
+/// Width of the score's vertical scrollbar.
+const SCORE_SCROLLBAR_WIDTH: f32 = 10.0;
+
+/// How far the playback line reaches past the staff and the tab.
+const PLAYBACK_LINE_OVERSHOOT: f32 = 16.0;
+/// Gap between the last tab string and the top of the rhythm stems under it.
+const TAB_STEM_GAP: f32 = 11.0;
+/// Length of a rhythm stem under the tab strings.
+const TAB_STEM_LENGTH: f32 = 20.0;
+/// Half the stroke width of a stem; a beam reaches this far past its last stem
+/// so the end is flush with it.
+const TAB_STEM_HALF: f32 = 0.6;
+/// Distance between the beams of a beamed group.
+const TAB_BEAM_SPACING: f32 = 4.0;
+
 /// Draws a rest glyph centered on `cx`. `y` is the staff line the glyph
 /// attaches to: a whole rest hangs below it, a half rest sits on it, and
-/// shorter rests are centered on it.
+/// shorter rests are centered on it. `scale` is 1.0 for a staff-line gap of
+/// seven points.
 fn paint_rest_symbol(
     painter: &egui::Painter,
+    symbols: &Symbols,
     cx: f32,
     y: f32,
     value: notation::NoteValue,
+    scale: f32,
     color: egui::Color32,
 ) {
-    let stroke = Stroke::new(1.8_f32, color);
-    let line = Stroke::new(1.0_f32, color);
+    let block = Vec2::new(8.78, 3.65) * scale;
+    let glyph_scale = scale * REST_GLYPH_SCALE;
     match value.value {
         1 => {
-            painter.line_segment([Pos2::new(cx - 7.0, y), Pos2::new(cx + 7.0, y)], line);
             painter.rect_filled(
-                Rect::from_min_max(Pos2::new(cx - 5.0, y), Pos2::new(cx + 5.0, y + 3.8)),
+                Rect::from_min_size(Pos2::new(cx - block.x * 0.5, y), block),
                 0.0,
                 color,
             );
         }
         2 => {
-            painter.line_segment([Pos2::new(cx - 7.0, y), Pos2::new(cx + 7.0, y)], line);
             painter.rect_filled(
-                Rect::from_min_max(Pos2::new(cx - 5.0, y - 3.8), Pos2::new(cx + 5.0, y)),
+                Rect::from_min_size(Pos2::new(cx - block.x * 0.5, y - block.y), block),
                 0.0,
                 color,
             );
         }
-        4 => {
-            painter.add(egui::Shape::line(
-                vec![
-                    Pos2::new(cx - 2.0, y - 9.0),
-                    Pos2::new(cx + 3.0, y - 4.0),
-                    Pos2::new(cx - 3.0, y + 1.0),
-                    Pos2::new(cx + 3.0, y + 6.0),
-                ],
-                stroke,
-            ));
-        }
-        _ => {
-            // Eighth and shorter: a slash with one dot per flag.
-            painter.line_segment(
-                [Pos2::new(cx + 3.0, y - 8.0), Pos2::new(cx - 3.0, y + 8.0)],
-                stroke,
+        shorter => {
+            let (glyph, height) = symbols.rest(shorter);
+            let origin = Pos2::new(
+                cx - glyph.size().x * glyph_scale * 0.5,
+                y - height * glyph_scale * 0.5,
             );
-            for flag in 0..value.flags().clamp(1, 5) {
-                let t = flag as f32 * 0.25;
-                painter.circle_filled(
-                    Pos2::new(cx - 6.0 * t - 2.5, y - 8.0 + 16.0 * t),
-                    1.8,
-                    color,
-                );
-            }
+            glyph.paint(painter, origin, glyph_scale, color);
         }
     }
     for dot in 0..value.dots {
-        painter.circle_filled(Pos2::new(cx + 8.0 + dot as f32 * 4.0, y - 2.0), 1.3, color);
+        painter.circle_filled(
+            Pos2::new(cx + 6.5 * scale + 4.0 + dot as f32 * 4.0, y + 2.0 * scale),
+            1.3,
+            color,
+        );
     }
 }
 
@@ -6823,15 +8027,48 @@ fn paint_note_block(
     open_left: bool,
     open_right: bool,
 ) {
-    painter.rect_filled(rect, 1.0, fill);
-    painter.line_segment([rect.left_top(), rect.right_top()], stroke);
-    painter.line_segment([rect.left_bottom(), rect.right_bottom()], stroke);
-    if !open_left {
-        painter.line_segment([rect.left_top(), rect.left_bottom()], stroke);
+    // Same corner radius as the cursor box. A side the block continues
+    // through has neither a corner nor an outline.
+    let r = 2.0_f32.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    let corner = |open: bool| if open { 0 } else { r.round() as u8 };
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius {
+            nw: corner(open_left),
+            sw: corner(open_left),
+            ne: corner(open_right),
+            se: corner(open_right),
+        },
+        fill,
+    );
+
+    let (l, t, rt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let arc = |path: &mut Vec<Pos2>, center: Pos2, from_degrees: f32| {
+        for step in 0..=3 {
+            let angle = (from_degrees + 30.0 * step as f32).to_radians();
+            path.push(center + Vec2::new(angle.cos(), angle.sin()) * r);
+        }
+    };
+    let mut path: Vec<Pos2> = Vec::new();
+    if open_left {
+        path.push(Pos2::new(l, t));
+    } else {
+        path.push(Pos2::new(l, b - r));
+        arc(&mut path, Pos2::new(l + r, t + r), 180.0);
     }
-    if !open_right {
-        painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+    if open_right {
+        path.push(Pos2::new(rt, t));
+        path.push(Pos2::new(rt, b));
+    } else {
+        arc(&mut path, Pos2::new(rt - r, t + r), 270.0);
+        arc(&mut path, Pos2::new(rt - r, b - r), 0.0);
     }
+    if open_left {
+        path.push(Pos2::new(l, b));
+    } else {
+        arc(&mut path, Pos2::new(l + r, b - r), 90.0);
+    }
+    painter.add(egui::Shape::line(path, stroke));
 }
 
 fn snap_tick(tick: Tick, grid: Tick) -> Tick {
@@ -7254,11 +8491,11 @@ fn palette_button(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if active {
-            painter.rect_filled(rect, 3.0, theme.accent_color.gamma_multiply(0.28));
+            painter.rect_filled(rect, 3.0, theme.sidebar_color.gamma_multiply(0.28));
             painter.rect_stroke(
                 rect,
                 3.0,
-                Stroke::new(1.0_f32, theme.accent_color),
+                Stroke::new(1.0_f32, theme.sidebar_color),
                 StrokeKind::Inside,
             );
         } else if enabled && response.hovered() {
@@ -7308,6 +8545,23 @@ fn palette_separator(ui: &mut egui::Ui, theme: &EditorTheme) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_wide_image_is_cropped_at_the_sides_to_cover_a_square() {
+        let uv = cover_uv(Vec2::new(100.0, 100.0), Vec2::new(200.0, 100.0));
+        assert!((uv.width() - 0.5).abs() < 1e-5 && (uv.height() - 1.0).abs() < 1e-5);
+        assert!((uv.min.x - 0.25).abs() < 1e-5 && uv.min.y.abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_tall_image_is_cropped_top_and_bottom_and_a_match_is_whole() {
+        let uv = cover_uv(Vec2::new(200.0, 100.0), Vec2::new(100.0, 100.0));
+        assert!((uv.height() - 0.5).abs() < 1e-5 && (uv.width() - 1.0).abs() < 1e-5);
+        let whole = cover_uv(Vec2::new(50.0, 25.0), Vec2::new(200.0, 100.0));
+        assert!((whole.width() - 1.0).abs() < 1e-5 && (whole.height() - 1.0).abs() < 1e-5);
+        assert_eq!(cover_uv(Vec2::ZERO, Vec2::new(1.0, 1.0)).width(), 1.0);
+    }
+
     use super::*;
 
     fn two_bar_beat_system() -> StaffSystem {
@@ -7548,8 +8802,9 @@ mod tests {
         let with_staff = SystemMetrics::new(true, 6);
         let without_staff = SystemMetrics::new(false, 6);
         assert_eq!(with_staff.tab_offset, 104.0);
-        assert_eq!(with_staff.height, 104.0 + 45.0 + 41.0);
-        assert_eq!(without_staff.height, 16.0 + 45.0 + 41.0);
+        let span = SystemMetrics::STRING_GAP * 5.0;
+        assert_eq!(with_staff.height, 104.0 + span + 41.0);
+        assert_eq!(without_staff.height, 16.0 + span + 41.0);
         assert!(SystemMetrics::new(true, 8).height > with_staff.height);
     }
 }

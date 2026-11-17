@@ -3,10 +3,17 @@ name = "betterwriter"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+# `bw_check` is only passed when type-checking the Windows window code on
+# another system (see src/plugins/native_window.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bw_check)'] }
+
 [dependencies]
 cpal = "0.17.3"
 eframe = "0.34.2"
 egui = "0.34.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+libloading = "0.8"
 oxisynth = { version = "0.1.0", features = ["sf3"] }
 rfd = "0.17.2"
 ringbuf = "0.5.0"
@@ -17,17 +24,19 @@ vst3 = "0.3.0"
 wmidi = "4.0.11"
 zip = "6.0.0"
 
-# Decoding the SF3 soundfont and running the synth are far too slow at
-# opt-level 0 (the first Play click froze the UI for tens of seconds), so the
-# audio dependencies are always optimized, even in debug builds. BetterWriter's
-# own code stays unoptimized so debugging is unaffected.
-[profile.dev.package.oxisynth]
+# Debug builds run the whole UI, so every dependency (egui's tessellator and
+# renderer included, plus the SF3 decoder and the synth) is always optimized:
+# at opt-level 0 a frame takes long enough to hold the UI far below the
+# monitor's refresh rate and to freeze the first Play click for tens of
+# seconds. BetterWriter's own code gets a light level so it still debugs.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
 opt-level = 3
-[profile.dev.package.oxisynth-chorus]
-opt-level = 3
-[profile.dev.package.oxisynth-reverb]
-opt-level = 3
-[profile.dev.package.lewton]
-opt-level = 3
-[profile.dev.package.soundfont]
-opt-level = 3
+
+# oxisynth 0.1.0 only exposes one stereo mix. The vendored copy adds
+# `Synth::render_groups` so each track's soundfont audio can run through its
+# own plug-in chain before the mix.
+[patch.crates-io]
+oxisynth = { path = "vendor/oxisynth" }

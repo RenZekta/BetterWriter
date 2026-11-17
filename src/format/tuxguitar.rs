@@ -252,6 +252,9 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             bar_count: (headers.len() as u32).max(1),
             instrument_family: crate::core::project::InstrumentFamily::Stringed,
             stringed_variant: variant_for_program(program),
+            bar_marks: Vec::new(),
+            sound_chain: Vec::new(),
+            fx_bypassed: false,
         });
     }
 
@@ -265,6 +268,8 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
         tempo_points: tempo_points(&headers),
         tracks,
         next_note_id,
+        master_chain: Vec::new(),
+        master_fx_bypassed: false,
     };
     // TuxGuitar's measure headers are shared across all tracks, so bar_count
     // should already cover every note; this is just a safety net against a

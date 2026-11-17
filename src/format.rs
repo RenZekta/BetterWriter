@@ -33,7 +33,9 @@ pub fn encode_bwx(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
 }
 
 pub fn decode_bwx(bytes: &[u8]) -> Result<BwxProject, FormatError> {
-    Ok(rmp_serde::from_slice(bytes)?)
+    let mut project: BwxProject = rmp_serde::from_slice(bytes)?;
+    project.ensure_slot_ids();
+    Ok(project)
 }
 
 pub fn save_bwx(path: impl AsRef<Path>, project: &BwxProject) -> Result<(), FormatError> {
@@ -156,5 +158,63 @@ mod tests {
         let decoded = decode_bwx(&bytes).unwrap();
         assert_eq!(decoded.tracks.len(), 2);
         assert_eq!(decoded.tracks[0].notes[0].fret, 0);
+    }
+
+    #[test]
+    fn bwx_round_trip_keeps_repeat_signs_and_the_sound_chain() {
+        let mut project = BwxProject::demo();
+        let bar = project.tracks[0].bar_spans()[1].start;
+        project.tracks[0].set_repeat_open(bar, true);
+        project.tracks[0].set_repeat_close(bar, 2);
+        let slot = |name: &str, instrument: bool| crate::core::SoundChainSlot {
+            id: crate::core::fresh_slot_id(),
+            name: name.to_owned(),
+            path: format!("/x/{name}.vst3"),
+            is_instrument: instrument,
+            vendor: "Acme".to_owned(),
+            state: vec![1, 2, 3],
+            ..Default::default()
+        };
+        project.tracks[0].sound_chain.push(slot("Amp", false));
+        project.tracks[0].sound_chain.push(slot("Piano", true));
+        project.tracks[0].sound_chain[0].bypassed = true;
+        project.master_chain.push(slot("Verb", false));
+        project.master_fx_bypassed = true;
+        project.tracks[0].fx_bypassed = true;
+        let decoded = decode_bwx(&encode_bwx(&project).unwrap()).unwrap();
+        assert_eq!(decoded, project);
+        assert!(decoded.tracks[0].fx_bypassed && decoded.master_fx_bypassed);
+        assert_eq!(decoded.master_chain.len(), 1);
+        assert_ne!(
+            decoded.tracks[0].sound_chain[0].id,
+            decoded.tracks[0].sound_chain[1].id
+        );
+        assert_eq!(decoded.tracks[0].bar_mark_at(bar).repeat_close, 2);
+    }
+}
+
+#[cfg(test)]
+mod slot_id_tests {
+    use super::*;
+    use crate::core::SoundChainSlot;
+
+    #[test]
+    fn slots_saved_without_ids_get_distinct_ones_on_load() {
+        let mut project = BwxProject::demo();
+        for chain in [&mut project.tracks[0].sound_chain, &mut project.master_chain] {
+            chain.push(SoundChainSlot::default());
+            chain.push(SoundChainSlot::default());
+        }
+        let decoded = decode_bwx(&encode_bwx(&project).unwrap()).unwrap();
+        let mut ids: Vec<u64> = decoded.tracks[0]
+            .sound_chain
+            .iter()
+            .chain(&decoded.master_chain)
+            .map(|slot| slot.id)
+            .collect();
+        assert!(ids.iter().all(|id| *id != 0));
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4);
     }
 }

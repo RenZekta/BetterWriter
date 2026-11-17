@@ -29,7 +29,10 @@ impl ShadowTimeline {
     pub fn compile_from_project(project: &BwxProject) -> Vec<MidiPlaybackEvent> {
         let mut events = Vec::new();
 
-        for track in &project.tracks {
+        for written in &project.tracks {
+            // Repeats play as extra copies of their bars.
+            let unrolled = written.unrolled_for_playback();
+            let track = unrolled.as_ref().unwrap_or(written);
             // A tied continuation sustains the previous note instead of
             // striking again: it emits no NoteOn, and the note before it
             // emits no NoteOff, so a chain plays as one long note.
@@ -99,6 +102,8 @@ impl ShadowTimeline {
                 .cloned()
                 .collect(),
             next_note_id: project.next_note_id,
+            master_chain: Vec::new(),
+            master_fx_bypassed: false,
         });
 
         if let Ok(mut guard) = self.events.write() {

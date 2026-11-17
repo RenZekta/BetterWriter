@@ -290,6 +290,114 @@ impl StringedVariant {
     }
 }
 
+/// Repeat signs on one bar of a track, keyed by the bar's first tick.
+/// `repeat_close` is how many extra times the region ends here is played
+/// (0 = no close sign), so a plain `|:  :|` plays its bars twice.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BarMark {
+    pub at_tick: Tick,
+    pub repeat_open: bool,
+    pub repeat_close: u16,
+}
+
+impl BarMark {
+    pub fn is_empty(&self) -> bool {
+        !self.repeat_open && self.repeat_close == 0
+    }
+}
+
+/// A plug-in format BetterWriter can list. Only some can be hosted.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PluginFormat {
+    #[default]
+    Vst3,
+    Vst2,
+    Clap,
+    Lv2,
+    Au,
+}
+
+impl PluginFormat {
+    pub const ALL: [PluginFormat; 5] = [
+        PluginFormat::Vst3,
+        PluginFormat::Vst2,
+        PluginFormat::Clap,
+        PluginFormat::Lv2,
+        PluginFormat::Au,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PluginFormat::Vst3 => "VST3",
+            PluginFormat::Vst2 => "VST",
+            PluginFormat::Clap => "CLAP",
+            PluginFormat::Lv2 => "LV2",
+            PluginFormat::Au => "AU",
+        }
+    }
+}
+
+/// One plug-in slot of a sound chain. The chain is saved with the project;
+/// `state` is the plug-in's own saved settings, empty until it has run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoundChainSlot {
+    /// Names this instance while the program runs and across saves; 0 until
+    /// `fresh_slot_id` gave it one.
+    #[serde(default)]
+    pub id: u64,
+    pub name: String,
+    pub path: String,
+    pub is_instrument: bool,
+    pub bypassed: bool,
+    #[serde(default)]
+    pub format: PluginFormat,
+    #[serde(default)]
+    pub vendor: String,
+    /// Which class of a bundle that holds several, as hex; empty for the
+    /// bundle's first.
+    #[serde(default)]
+    pub class_id: String,
+    /// A name the user gave this instance; empty keeps `name`.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub state: Vec<u8>,
+}
+
+/// A number no other slot has: the clock in nanoseconds, kept increasing
+/// within a run so two slots made in the same instant still differ.
+pub fn fresh_slot_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |elapsed| elapsed.as_nanos() as u64);
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last + 1);
+        match LAST.compare_exchange(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
+}
+
+impl SoundChainSlot {
+    pub fn display_name(&self) -> &str {
+        if self.label.is_empty() { &self.name } else { &self.label }
+    }
+
+    /// "VST3i: Name", the way the chain lists it.
+    pub fn list_label(&self) -> String {
+        let tag = match (self.format, self.is_instrument) {
+            (PluginFormat::Vst3, true) => "VST3i",
+            (format, true) => return format!("{}i: {}", format.label(), self.display_name()),
+            (format, false) => format.label(),
+        };
+        format!("{tag}: {}", self.display_name())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InstrumentTrack {
     pub id: u64,
@@ -314,9 +422,32 @@ pub struct InstrumentTrack {
     pub bar_count: u32,
     pub instrument_family: InstrumentFamily,
     pub stringed_variant: StringedVariant,
+    /// Repeat signs, at most one entry per bar.
+    #[serde(default)]
+    pub bar_marks: Vec<BarMark>,
+    /// Plug-ins the track's sound passes through, in order.
+    #[serde(default)]
+    pub sound_chain: Vec<SoundChainSlot>,
+    /// The whole chain is switched off: the track plays without its plug-ins.
+    #[serde(default)]
+    pub fx_bypassed: bool,
 }
 
 impl InstrumentTrack {
+    /// Changes the instrument type, which sets the clef and the sound list.
+    /// A sound that was one of the old type's own suggestions follows the
+    /// change to the new type's default when the new type does not suggest
+    /// it; a sound picked from outside the old list is kept. Tuning and
+    /// notes are untouched.
+    pub fn set_stringed_variant(&mut self, variant: StringedVariant) {
+        use crate::core::sounds::recommended_programs;
+        let was_stock = recommended_programs(self.stringed_variant).contains(&self.program);
+        if was_stock && !recommended_programs(variant).contains(&self.program) {
+            self.program = variant.default_program();
+        }
+        self.stringed_variant = variant;
+    }
+
     pub fn standard_guitar(id: u64, name: impl Into<String>, channel: u8) -> Self {
         Self {
             id,
@@ -337,6 +468,9 @@ impl InstrumentTrack {
             bar_count: 4,
             instrument_family: InstrumentFamily::Stringed,
             stringed_variant: StringedVariant::AcousticGuitar,
+            bar_marks: Vec::new(),
+            sound_chain: Vec::new(),
+            fx_bypassed: false,
         }
     }
 
@@ -370,6 +504,9 @@ impl InstrumentTrack {
             bar_count: 1,
             instrument_family: family,
             stringed_variant,
+            bar_marks: Vec::new(),
+            sound_chain: Vec::new(),
+            fx_bypassed: false,
         }
     }
 
@@ -499,9 +636,32 @@ pub struct BwxProject {
     pub tempo_points: Vec<TempoPoint>,
     pub tracks: Vec<InstrumentTrack>,
     pub next_note_id: u64,
+    /// Plug-ins the mix of every track passes through last.
+    #[serde(default)]
+    pub master_chain: Vec<SoundChainSlot>,
+    #[serde(default)]
+    pub master_fx_bypassed: bool,
 }
 
 impl BwxProject {
+    /// Gives every plug-in slot of a freshly loaded project an id of its own.
+    pub fn ensure_slot_ids(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let chains = self
+            .tracks
+            .iter_mut()
+            .map(|track| &mut track.sound_chain)
+            .chain(std::iter::once(&mut self.master_chain));
+        for chain in chains {
+            for slot in chain.iter_mut() {
+                if slot.id == 0 || !seen.insert(slot.id) {
+                    slot.id = fresh_slot_id();
+                    seen.insert(slot.id);
+                }
+            }
+        }
+    }
+
     pub fn demo() -> Self {
         let mut guitar = InstrumentTrack::standard_guitar(1, "Guitar", 0);
         guitar.notes = vec![
@@ -591,6 +751,8 @@ impl BwxProject {
             tempo_points: vec![TempoPoint::new(0, 120.0)],
             tracks: vec![guitar, baritone],
             next_note_id: 8,
+            master_chain: Vec::new(),
+            master_fx_bypassed: false,
         }
     }
 
@@ -615,6 +777,8 @@ impl BwxProject {
             tempo_points: vec![TempoPoint::new(0, 120.0)],
             tracks: vec![track],
             next_note_id: 1,
+            master_chain: Vec::new(),
+            master_fx_bypassed: false,
         }
     }
 
@@ -637,6 +801,36 @@ impl BwxProject {
                 track.bar_count += 1;
             }
         }
+    }
+
+    /// Where playback ends: the end of the last bar that holds a note, over
+    /// every track. `None` when the project has no notes.
+    pub fn playback_end_tick(&self) -> Option<Tick> {
+        self.tracks
+            .iter()
+            .filter_map(InstrumentTrack::playback_end_tick)
+            .max()
+    }
+
+    /// Appends an empty track shaped like `source_id`: same instrument type,
+    /// tuning, sound, bars and time signatures, but no notes and a fresh
+    /// name, id and channel. Returns the new track's id.
+    pub fn add_track_like(&mut self, source_id: u64) -> Option<u64> {
+        let source = self.track(source_id)?;
+        let id = self.tracks.iter().map(|track| track.id).max().unwrap_or(0) + 1;
+        let base = source.stringed_variant.label();
+        let name = (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|candidate| self.tracks.iter().all(|track| track.name != *candidate))?;
+        let mut track = source.clone();
+        track.id = id;
+        track.name = name;
+        track.channel = crate::core::sounds::melodic_channel(self.tracks.len());
+        track.solo = false;
+        track.mute = false;
+        track.notes.clear();
+        self.tracks.push(track);
+        Some(id)
     }
 
     pub fn track(&self, id: u64) -> Option<&InstrumentTrack> {
@@ -694,4 +888,110 @@ fn default_track_volume() -> u8 {
 
 fn default_track_pan() -> i8 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_ends_with_the_last_bar_that_holds_a_note() {
+        let mut project = BwxProject::demo();
+        // Demo guitar notes end three quarters into a 4/4 bar; the 5/8 track
+        // ends inside its first bar.
+        assert_eq!(project.playback_end_tick(), Some(TICKS_PER_QUARTER * 4));
+
+        project.tracks[0].bar_count = 3;
+        project.insert_note(1, TICKS_PER_QUARTER * 9, TICKS_PER_QUARTER, 0, 1);
+        assert_eq!(project.playback_end_tick(), Some(TICKS_PER_QUARTER * 12));
+    }
+
+    #[test]
+    fn a_note_ending_on_a_barline_belongs_to_the_bar_it_ends() {
+        let mut project = BwxProject::demo();
+        project.tracks[0].notes.clear();
+        project.tracks[1].notes.clear();
+        project.insert_note(1, 0, TICKS_PER_QUARTER * 4, 0, 1);
+        assert_eq!(project.playback_end_tick(), Some(TICKS_PER_QUARTER * 4));
+    }
+
+    #[test]
+    fn a_project_without_notes_has_no_playback_end() {
+        let project = BwxProject::empty_with_track(
+            "t",
+            InstrumentFamily::Stringed,
+            StringedVariant::Bass,
+            4,
+        );
+        assert_eq!(project.playback_end_tick(), None);
+    }
+
+    #[test]
+    fn a_new_track_copies_the_shape_but_not_the_notes() {
+        let mut project = BwxProject::demo();
+        let source = project.tracks[1].clone();
+        let id = project.add_track_like(source.id).unwrap();
+
+        let added = project.track(id).unwrap();
+        assert_eq!(id, 3);
+        assert!(added.notes.is_empty());
+        assert_eq!(added.tuning, source.tuning);
+        assert_eq!(added.time_signature_changes, source.time_signature_changes);
+        assert_eq!(added.bar_count, source.bar_count);
+        assert_eq!(added.channel, 2);
+        assert_ne!(added.name, source.name);
+        assert_eq!(project.tracks.len(), 3);
+    }
+
+    #[test]
+    fn new_track_names_never_repeat() {
+        let mut project = BwxProject::demo();
+        let first = project.add_track_like(1).unwrap();
+        let second = project.add_track_like(1).unwrap();
+        assert_ne!(
+            project.track(first).unwrap().name,
+            project.track(second).unwrap().name
+        );
+    }
+
+    #[test]
+    fn changing_the_instrument_moves_a_stock_sound_to_the_new_default() {
+        let mut project = BwxProject::demo();
+        let track = &mut project.tracks[0];
+        track.set_stringed_variant(StringedVariant::Bass);
+        assert_eq!(track.stringed_variant, StringedVariant::Bass);
+        assert_eq!(track.program, StringedVariant::Bass.default_program());
+    }
+
+    #[test]
+    fn changing_the_instrument_keeps_a_sound_the_new_type_also_suggests() {
+        let mut project = BwxProject::demo();
+        let track = &mut project.tracks[0];
+        track.program = 26;
+        track.set_stringed_variant(StringedVariant::ElectricGuitar);
+        assert_eq!(track.program, 26);
+    }
+
+    #[test]
+    fn changing_the_instrument_keeps_a_custom_sound_and_the_notes() {
+        let mut project = BwxProject::demo();
+        let track = &mut project.tracks[0];
+        track.program = 80;
+        let notes = track.notes.clone();
+        let tuning = track.tuning.clone();
+        track.set_stringed_variant(StringedVariant::Bass);
+        assert_eq!(track.program, 80);
+        assert_eq!(track.notes, notes);
+        assert_eq!(track.tuning, tuning);
+    }
+
+    #[test]
+    fn a_new_track_starts_unmuted() {
+        let mut project = BwxProject::demo();
+        project.tracks[0].mute = true;
+        project.tracks[0].solo = true;
+        let id = project.add_track_like(1).unwrap();
+        let added = project.track(id).unwrap();
+        assert!(!added.mute && !added.solo);
+    }
 }

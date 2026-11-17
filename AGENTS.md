@@ -112,6 +112,20 @@ cargo test
 ```
 
 - Don't commit or zip `target/`.
+- `vendor/oxisynth` is oxisynth 0.1.0 plus one method (`render_groups`, so each
+  MIDI channel can be rendered apart for the plug-in chains). Keep it patched
+  through `[patch.crates-io]`; don't edit anything else in it.
+- Plug-in hosting lives in `src/plugins/` (`scan.rs`, `vst3.rs`, `host.rs`,
+  `native_window.rs`). Tests that need a real VST3 run when `BW_TEST_VST3` /
+  `BW_TEST_GAIN_VST3` / `BW_TEST_SYNTH_VST3` name a bundle (build the `gain`
+  example of the `vst3` crate; the synth is a small variant of it) and pass
+  quietly without. The Windows-only window code can be type-checked on other
+  systems with `rustc --cfg bw_check` (see `native_window.rs`).
+- When the deliverable is a zip of the repo, leave out `target/`, `.git` and
+  `assets/soundfonts/MS Basic.sf3`. The soundfont never changes and is most
+  of the zip's size; whoever unpacks over an existing copy keeps theirs. Put
+  any other large asset (another soundfont, say) behind a download link or
+  fetch it at runtime instead of shipping it in the zip.
 - Don't run `cargo fmt` over the whole tree: the repo isn't fully
   rustfmt-clean, so it produces a large unrelated diff. Format only the code
   you touched.
