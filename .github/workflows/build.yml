@@ -1,0 +1,161 @@
+name: Build and Release
+
+# Fully automatic releases, driven by the .github/VERSION file.
+#
+#   New version   Edit .github/VERSION (e.g. 0.3.0 -> 0.4.0) and push to main.
+#                 BetterWriter is tested and built on Windows, Linux and
+#                 macOS, then a release and tag 0.4.0 are created with
+#                 auto-generated notes.
+#
+#   Same version  Push to main without touching .github/VERSION.
+#                   - App code changed: the packages are rebuilt and replace
+#                     the ones on the release, and the tag moves to the new
+#                     commit, so the source archive matches too.
+#                   - Only docs changed: nothing is rebuilt and only the tag
+#                     moves.
+#                   - Nothing changed since the tag: nothing happens.
+#
+# Cargo.toml and Cargo.lock are filled in from .github/VERSION by
+# `release.sh sync`, so the version is never edited anywhere else. The release
+# is only touched after all three platforms built successfully.
+# Run it by hand any time: Actions -> Build and Release -> Run workflow
+# (optionally forcing a rebuild). Logic lives in .github/scripts/release.sh.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild and replace the packages even if nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags, to compare against the release tag
+
+      - name: Decide what to do
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: bash .github/scripts/release.sh plan
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.action == 'create' || needs.plan.outputs.action == 'rebuild'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false   # a failed platform can be re-run alone
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: ubuntu-latest
+            name: linux-x64
+          - os: macos-latest
+            name: macos-arm64
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Install ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set the version from .github/VERSION
+        shell: bash
+        run: bash .github/scripts/release.sh sync
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          dir="BetterWriter-${VERSION}-${PLATFORM}"
+          mkdir -p "$dir/assets" packages
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/betterwriter.exe "$dir/"
+          else
+            cp target/release/betterwriter "$dir/"
+          fi
+          cp -r assets/soundfonts "$dir/assets/"
+          cp LICENSE README.md "$dir/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "packages/${dir}.zip" "./$dir"
+          else
+            tar -czf "packages/${dir}.tar.gz" "$dir"
+          fi
+
+      - name: Keep packages for the release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.name }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    if: >-
+      ${{ !cancelled()
+      && needs.plan.result == 'success'
+      && needs.plan.outputs.action != 'none'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download packages
+        if: needs.plan.outputs.action != 'retag'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: packages
+
+      - name: Create or refresh the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ACTION: ${{ needs.plan.outputs.action }}
+        run: bash .github/scripts/release.sh publish packages

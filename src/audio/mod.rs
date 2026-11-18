@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, TryRecvError},
     },
+    time::{Duration, Instant},
 };
 
 use cpal::{
@@ -26,86 +27,165 @@ use crate::{
     },
 };
 use crate::core::{
-    BwxProject, MidiEventKind, MidiPlaybackEvent, TICKS_PER_QUARTER, TempoTransition, Tick,
-    sounds::midi_pan,
+    AutomationLane, BwxProject, MidiEventKind, MidiPlaybackEvent, TempoMap, Tick,
+    automation::controller_steps, sounds::midi_pan,
 };
 
-/// One constant-rate playback segment derived from the project's tempo
-/// automation. `Progressive` points use the average of their start/end bpm
-/// as the segment's rate - a good approximation for audio scheduling; the
-/// automation graph (in the UI) still shows the exact linear ramp. See
-/// `build_tempo_segments`.
-#[derive(Clone, Copy)]
-struct TempoSegment {
-    start_tick: Tick,
-    start_seconds: f64,
-    seconds_per_tick: f64,
+/// What a scheduled event does to its channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Action {
+    NoteOn { key: u8, velocity: u8 },
+    NoteOff { key: u8 },
+    /// Controller 7 value from volume automation.
+    Volume(u8),
+    /// Controller 10 value from pan automation.
+    Pan(u8),
 }
 
-fn seconds_per_tick_for(bpm: f64) -> f64 {
-    60.0 / (bpm.max(1.0) * TICKS_PER_QUARTER as f64)
+/// An event with the moment it sounds, in seconds from the start of the
+/// song. Every track is timed through its own tempo map, so the audio clock
+/// only counts seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Scheduled {
+    seconds: f64,
+    channel: u8,
+    action: Action,
 }
 
-/// Converts the project's tempo automation timeline into a sequence of
-/// constant-rate segments anchored to real elapsed seconds, so playback can
-/// convert "seconds since play started" into a musical tick position without
-/// assuming a single flat tempo for the whole piece.
-fn build_tempo_segments(project: &BwxProject) -> Vec<TempoSegment> {
-    let mut points: Vec<_> = project.tempo_points.iter().collect();
-    points.sort_by_key(|point| point.at_tick);
-    if points.is_empty() {
-        return vec![TempoSegment {
-            start_tick: 0,
-            start_seconds: 0.0,
-            seconds_per_tick: seconds_per_tick_for(120.0),
-        }];
-    }
-
-    let mut segments = Vec::with_capacity(points.len());
-    let mut elapsed_seconds = 0.0_f64;
-    for (index, point) in points.iter().enumerate() {
-        let next = points.get(index + 1);
-        let rate_bpm = if point.transition == TempoTransition::Progressive {
-            match next {
-                Some(next) => (point.bpm as f64 + next.bpm as f64) / 2.0,
-                None => point.bpm as f64,
-            }
-        } else {
-            point.bpm as f64
-        };
-        let seconds_per_tick = seconds_per_tick_for(rate_bpm);
-        segments.push(TempoSegment {
-            start_tick: point.at_tick,
-            start_seconds: elapsed_seconds,
-            seconds_per_tick,
-        });
-        if let Some(next) = next {
-            let tick_span = (next.at_tick - point.at_tick).max(0) as f64;
-            elapsed_seconds += tick_span * seconds_per_tick;
+impl Scheduled {
+    /// Controller changes land before the notes that share their moment, and
+    /// note ends before note starts.
+    fn rank(&self) -> u8 {
+        match self.action {
+            Action::Volume(_) | Action::Pan(_) => 0,
+            Action::NoteOff { .. } => 1,
+            Action::NoteOn { .. } => 2,
         }
     }
-    segments
 }
 
-/// Index of the tempo segment containing `tick` and the elapsed seconds at
-/// that tick, so playback can start partway into the song on the same clock
-/// a play from tick 0 would have reached it on.
-fn locate_tick(segments: &[TempoSegment], tick: Tick) -> (usize, f64) {
-    let index = segments
-        .iter()
-        .rposition(|segment| segment.start_tick <= tick)
-        .unwrap_or(0);
-    let Some(segment) = segments.get(index) else {
-        return (0, 0.0);
+/// Everything the audio thread needs to play a song from `start_seconds`.
+struct Schedule {
+    events: Vec<Scheduled>,
+    start_seconds: f64,
+    /// Playback counts as finished once the clock reaches this.
+    end_seconds: f64,
+}
+
+/// Times the notes and automation of `project`. `start_tick` is a position
+/// on `start_track`'s own axis; the other tracks start at the same moment.
+/// Notes before the start are dropped; of the volume and pan changes before
+/// it, the latest of each channel is kept and applied at the start so a song
+/// begun mid-way sounds as it would at that point.
+fn build_schedule(
+    project: &BwxProject,
+    notes: &[MidiPlaybackEvent],
+    start_tick: Tick,
+    start_track: u64,
+) -> Schedule {
+    let mut maps: std::collections::HashMap<u64, TempoMap> = std::collections::HashMap::new();
+    let seconds_of = |track_id: u64, tick: Tick, maps: &mut std::collections::HashMap<u64, TempoMap>| {
+        maps.entry(track_id)
+            .or_insert_with(|| project.tempo_map_for(track_id))
+            .seconds_at(tick as f64)
     };
-    let ticks_in = (tick - segment.start_tick).max(0) as f64;
-    (index, segment.start_seconds + ticks_in * segment.seconds_per_tick)
+
+    let start_seconds = seconds_of(start_track, start_tick, &mut maps);
+    let mut events: Vec<Scheduled> = notes
+        .iter()
+        .map(|event| Scheduled {
+            seconds: seconds_of(event.track_id, event.tick, &mut maps),
+            channel: event.channel,
+            action: match event.kind {
+                MidiEventKind::NoteOn => Action::NoteOn {
+                    key: event.key,
+                    velocity: event.velocity,
+                },
+                MidiEventKind::NoteOff => Action::NoteOff { key: event.key },
+            },
+        })
+        .collect();
+    let last_note = events.iter().map(|event| event.seconds).fold(0.0_f64, f64::max);
+    let song_end = project
+        .tracks
+        .iter()
+        .filter_map(|track| {
+            let end = track.playback_end_tick()?;
+            Some(seconds_of(track.id, end, &mut maps))
+        })
+        .fold(0.0_f64, f64::max);
+
+    let mut controllers: Vec<Scheduled> = Vec::new();
+    let any_solo = project.tracks.iter().any(|track| track.solo);
+    for track in &project.tracks {
+        let scope = project.scope_for(track.id);
+        // A muted track, or one a solo silences, keeps its volume at 0 so
+        // automation does not bring it back.
+        let silent = track.mute || (any_solo && !track.solo);
+        for (lane, make) in [
+            (AutomationLane::Volume, Action::Volume as fn(u8) -> Action),
+            (AutomationLane::Pan, Action::Pan as fn(u8) -> Action),
+        ] {
+            if silent && lane == AutomationLane::Volume {
+                continue;
+            }
+            let points = project.automation_points(lane, scope);
+            for (tick, value) in controller_steps(lane, &points) {
+                controllers.push(Scheduled {
+                    seconds: seconds_of(track.id, tick, &mut maps),
+                    channel: track.channel,
+                    action: make(value),
+                });
+            }
+        }
+    }
+    // Keep the state in force at the start, then everything after it.
+    let (earlier, later): (Vec<Scheduled>, Vec<Scheduled>) = controllers
+        .into_iter()
+        .partition(|event| event.seconds < start_seconds);
+    let mut in_force: Vec<Scheduled> = Vec::new();
+    for event in earlier {
+        let same = |other: &Scheduled| {
+            other.channel == event.channel && other.rank() == event.rank() && {
+                matches!(
+                    (other.action, event.action),
+                    (Action::Volume(_), Action::Volume(_)) | (Action::Pan(_), Action::Pan(_))
+                )
+            }
+        };
+        match in_force.iter_mut().find(|other| same(other)) {
+            Some(slot) if slot.seconds <= event.seconds => *slot = event,
+            Some(_) => {}
+            None => in_force.push(event),
+        }
+    }
+    events.retain(|event| event.seconds >= start_seconds);
+    events.extend(in_force.into_iter().map(|event| Scheduled {
+        seconds: start_seconds,
+        ..event
+    }));
+    events.extend(later);
+    events.sort_by(|a, b| {
+        a.seconds
+            .total_cmp(&b.seconds)
+            .then(a.rank().cmp(&b.rank()))
+            .then(a.channel.cmp(&b.channel))
+    });
+
+    Schedule {
+        events,
+        start_seconds,
+        end_seconds: song_end.max(last_note),
+    }
 }
 
 /// Synth state for one MIDI channel, taken from the track that plays on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelSetup {
     channel: u8,
+    /// Soundfont bank; controller 0 carries its high part, controller 32
+    /// its low 7 bits.
+    bank: u16,
     program: u8,
     /// Controller 7 value; 0 for a muted track.
     volume: u8,
@@ -122,9 +202,11 @@ pub fn channel_setups(project: &BwxProject) -> Vec<ChannelSetup> {
         .iter()
         .map(|track| {
             let silent = track.mute || (any_solo && !track.solo);
+            let (bank, program) = track.sound();
             ChannelSetup {
                 channel: track.channel.min(15),
-                program: track.program.min(127),
+                bank,
+                program: program.min(127),
                 volume: if silent { 0 } else { track.volume.min(127) },
                 pan: midi_pan(track.pan),
             }
@@ -132,20 +214,21 @@ pub fn channel_setups(project: &BwxProject) -> Vec<ChannelSetup> {
         .collect()
 }
 
-/// Events that put a channel into a setup. Bank 0 is selected explicitly so
-/// a program number always means the General MIDI sound.
+/// Events that put a channel into a setup. The bank is selected explicitly so
+/// a program number always means the sound the track asked for; bank 128
+/// (the drum kits) is controller 0 = 1 and controller 32 = 0.
 fn setup_events(setup: ChannelSetup) -> [MidiEvent; 5] {
     let channel = setup.channel;
     [
         MidiEvent::ControlChange {
             channel,
             ctrl: 0,
-            value: 0,
+            value: ((setup.bank >> 7) & 0x7f) as u8,
         },
         MidiEvent::ControlChange {
             channel,
             ctrl: 32,
-            value: 0,
+            value: (setup.bank & 0x7f) as u8,
         },
         MidiEvent::ProgramChange {
             channel,
@@ -173,11 +256,10 @@ enum AudioCommand {
     /// The plug-in chains to run; replaces the previous graph.
     SetGraph(Arc<Graph>),
     Play {
-        events: Arc<Vec<MidiPlaybackEvent>>,
-        tempo_segments: Arc<Vec<TempoSegment>>,
-        start_tick: Tick,
-        /// Playback counts as finished once the clock reaches this tick.
-        end_tick: Tick,
+        events: Arc<Vec<Scheduled>>,
+        start_seconds: f64,
+        /// Playback counts as finished once the clock reaches this.
+        end_seconds: f64,
         channels: Arc<Vec<ChannelSetup>>,
     },
     /// Applies new channel setups without touching playback.
@@ -208,18 +290,41 @@ struct SharedFlags {
     /// clock reaches the song's end. Notes still ringing at the end keep
     /// sounding after this goes false.
     playing: AtomicBool,
-    /// The song position in ticks, as `f64` bits, kept current while playing.
+    /// The song position in seconds, as `f64` bits, kept current while
+    /// playing.
     position: AtomicU64,
     /// Set when the audio callback panicked; the runtime rebuilds the stream
     /// the next time playback is requested.
     faulted: AtomicBool,
+    /// Set by the stream's error callback when the device went away or its
+    /// format changed, which leaves the stream silent until it is rebuilt.
+    stream_lost: AtomicBool,
+}
+
+/// What a stream was opened with, to notice the device changing under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceFormat {
+    sample_rate: u32,
+    channels: u16,
+    sample_format: cpal::SampleFormat,
+}
+
+/// How often the default output device's format is compared with the one
+/// the stream was opened with.
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+fn default_device_format() -> Option<DeviceFormat> {
+    let device = cpal::default_host().default_output_device()?;
+    let config = device.default_output_config().ok()?;
+    Some(DeviceFormat {
+        sample_rate: config.sample_rate(),
+        channels: config.channels(),
+        sample_format: config.sample_format(),
+    })
 }
 
 struct PendingPlay {
-    events: Vec<MidiPlaybackEvent>,
-    tempo_segments: Vec<TempoSegment>,
-    start_tick: Tick,
-    end_tick: Tick,
+    schedule: Schedule,
 }
 
 type LoaderResult = Result<Box<Synth>, String>;
@@ -243,6 +348,11 @@ pub struct AudioRuntime {
     graph: Arc<Graph>,
     graph_key: Vec<u64>,
     status: String,
+    /// What the open stream was built for.
+    format: Option<DeviceFormat>,
+    last_device_check: Instant,
+    /// Where a song that a device change interrupted was, in seconds.
+    resume_seconds: Option<f64>,
 }
 
 impl AudioRuntime {
@@ -263,6 +373,9 @@ impl AudioRuntime {
             graph: Arc::new(Graph::default()),
             graph_key: Vec::new(),
             status: "Audio engine idle".to_owned(),
+            format: None,
+            last_device_check: Instant::now(),
+            resume_seconds: None,
         }
     }
 
@@ -295,9 +408,10 @@ impl AudioRuntime {
         self.loader.is_some()
     }
 
-    /// Where the song is right now, in ticks, while it plays. The position
-    /// follows the tempo clock continuously, not the notes.
-    pub fn playback_tick(&self) -> Option<f64> {
+    /// Where the song is right now, in seconds from the start of the song,
+    /// while it plays. The position follows the clock continuously, not the
+    /// notes; `TempoMap::tick_at` turns it into a track's own ticks.
+    pub fn playback_seconds(&self) -> Option<f64> {
         self.flags
             .playing
             .load(Ordering::Relaxed)
@@ -312,6 +426,9 @@ impl AudioRuntime {
     /// thread, releases a waiting Play request, and recovers from audio
     /// thread faults. Returns true while the UI should keep repainting.
     pub fn poll(&mut self) -> bool {
+        if self.flags.stream_lost.swap(false, Ordering::Relaxed) || self.device_changed() {
+            self.reopen_stream();
+        }
         if self.flags.faulted.swap(false, Ordering::Relaxed) {
             self.stream = None;
             self.loader = None;
@@ -360,6 +477,48 @@ impl AudioRuntime {
         self.loader.is_some() || self.is_playing()
     }
 
+    /// True when the default output device now has another sample rate,
+    /// channel count or sample format than the open stream.
+    fn device_changed(&mut self) -> bool {
+        if self.stream.is_none() || self.last_device_check.elapsed() < DEVICE_CHECK_INTERVAL {
+            return false;
+        }
+        self.last_device_check = Instant::now();
+        default_device_format().is_some_and(|now| Some(now) != self.format)
+    }
+
+    /// Replaces a stream the device invalidated: the soundfont is decoded
+    /// again for the new sample rate and a song that was playing is offered
+    /// back through `take_resume`.
+    fn reopen_stream(&mut self) {
+        let was_playing = self.flags.playing.load(Ordering::Relaxed);
+        let position = f64::from_bits(self.flags.position.load(Ordering::Relaxed));
+        self.stream = None;
+        self.format = None;
+        self.loader = None;
+        self.synth_installed = false;
+        self.pending_play = None;
+        self.mix.clear();
+        match self.ensure_stream() {
+            Ok(()) => {
+                self.preload();
+                self.resume_seconds = was_playing.then_some(position.max(0.0));
+                self.status = format!(
+                    "Audio device changed, reopened at {} Hz",
+                    self.sample_rate
+                );
+            }
+            Err(err) => {
+                self.status = format!("Audio device unavailable: {err}");
+            }
+        }
+    }
+
+    /// The time a song was interrupted at by a device change, once.
+    pub fn take_resume(&mut self) -> Option<f64> {
+        self.resume_seconds.take()
+    }
+
     pub fn ensure_stream(&mut self) -> Result<(), AudioError> {
         if self.stream.is_some() {
             return Ok(());
@@ -373,6 +532,11 @@ impl AudioRuntime {
         let config: cpal::StreamConfig = supported.clone().into();
         let sample_rate = config.sample_rate as f32;
         let channels = config.channels as usize;
+        let format = DeviceFormat {
+            sample_rate: config.sample_rate,
+            channels: config.channels,
+            sample_format: supported.sample_format(),
+        };
 
         let (producer, consumer) = HeapRb::<AudioCommand>::new(2048).split();
         let flags = Arc::new(SharedFlags::default());
@@ -410,6 +574,8 @@ impl AudioRuntime {
 
         stream.play()?;
         self.stream = Some(stream);
+        self.format = Some(format);
+        self.last_device_check = Instant::now();
         self.producer = producer;
         self.flags = flags;
         self.sample_rate = sample_rate;
@@ -435,25 +601,20 @@ impl AudioRuntime {
         }
     }
 
-    /// Starts playback at `start_tick`; earlier events are skipped and the
-    /// tempo clock begins at that tick's position in the tempo map.
+    /// Starts playback at `start_tick` of `start_track`; the other tracks
+    /// start at the same moment. Earlier notes are skipped and the clock
+    /// begins at that moment on the tempo map of `start_track`.
     pub fn play(
         &mut self,
         project: &BwxProject,
-        events: Vec<MidiPlaybackEvent>,
+        events: &[MidiPlaybackEvent],
         start_tick: Tick,
+        start_track: u64,
     ) -> Result<(), AudioError> {
         self.ensure_stream()?;
         self.mix = channel_setups(project);
-        let last_event_tick = events.iter().map(|event| event.tick).max().unwrap_or(0);
         let pending = PendingPlay {
-            end_tick: project
-                .playback_end_tick()
-                .unwrap_or(0)
-                .max(last_event_tick),
-            events,
-            tempo_segments: build_tempo_segments(project),
-            start_tick,
+            schedule: build_schedule(project, events, start_tick, start_track),
         };
         if self.synth_installed {
             return self.send_play(pending);
@@ -500,10 +661,9 @@ impl AudioRuntime {
         self.flags.playing.store(true, Ordering::Relaxed);
         self.producer
             .try_push(AudioCommand::Play {
-                events: Arc::new(pending.events),
-                tempo_segments: Arc::new(pending.tempo_segments),
-                start_tick: pending.start_tick,
-                end_tick: pending.end_tick,
+                events: Arc::new(pending.schedule.events),
+                start_seconds: pending.schedule.start_seconds,
+                end_seconds: pending.schedule.end_seconds,
                 channels: Arc::new(self.mix.clone()),
             })
             .map_err(|_| {
@@ -585,11 +745,20 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let mut state = CallbackState::new(consumer, sample_rate, flags.clone());
-    let err_fn = |err| eprintln!("BetterWriter audio stream error: {err}");
+    let lost = flags.clone();
+    let err_fn = move |err: cpal::StreamError| {
+        eprintln!("BetterWriter audio stream error: {err}");
+        // An underrun is a glitch the stream survives; anything else leaves
+        // it dead until it is rebuilt.
+        if !matches!(err, cpal::StreamError::BufferUnderrun) {
+            lost.stream_lost.store(true, Ordering::Relaxed);
+        }
+    };
 
     Ok(device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            flush_denormals();
             // A panic must never unwind into the platform audio thread.
             let finished = catch_unwind(AssertUnwindSafe(|| {
                 if !state.faulted {
@@ -610,24 +779,44 @@ where
     )?)
 }
 
+/// Makes the calling thread treat denormal floats as zero. Reverbs and
+/// filters decay into denormals, which are many times slower to compute, and
+/// the audio thread then misses its deadline and crackles. DAWs set this on
+/// their audio threads; plug-ins rely on it.
+fn flush_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reads and writes the thread's own MXCSR through valid pointers;
+    // bits 6 (denormals are zero) and 15 (flush to zero) only change rounding
+    // of denormal results.
+    unsafe {
+        let mut csr: u32 = 0;
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut csr, options(nostack));
+        csr |= 0x8040;
+        std::arch::asm!("ldmxcsr [{}]", in(reg) &csr, options(nostack, readonly));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: sets the flush-to-zero bit (24) of the thread's FPCR.
+    unsafe {
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {}, fpcr", out(reg) fpcr, options(nostack, nomem));
+        fpcr |= 1 << 24;
+        std::arch::asm!("msr fpcr, {}", in(reg) fpcr, options(nostack, nomem));
+    }
+}
+
 struct CallbackState {
     command_consumer: HeapCons<AudioCommand>,
     /// `None` until the loader thread hands the synth over; the stream
     /// outputs silence in the meantime.
     synth: Option<Box<Synth>>,
-    events: Arc<Vec<MidiPlaybackEvent>>,
+    events: Arc<Vec<Scheduled>>,
     next_event_index: usize,
     playing: bool,
-    tempo_segments: Arc<Vec<TempoSegment>>,
-    /// Monotonically advances forward through `tempo_segments` as playback
-    /// progresses, mirroring `next_event_index`'s incremental scan - cheap
-    /// per audio frame even with many automation points.
-    current_segment_index: usize,
     sample_rate: f32,
-    /// Position on the tempo clock in samples, counted from tick 0 of the
-    /// song. A play that starts mid-song begins at its start tick's offset.
+    /// Position of the clock in samples, counted from the start of the song.
+    /// A play that starts mid-song begins at its start moment's offset.
     samples_since_start: u64,
-    end_tick: Tick,
+    end_seconds: f64,
     flags: Arc<SharedFlags>,
     faulted: bool,
     graph: Arc<Graph>,
@@ -658,15 +847,9 @@ impl CallbackState {
             events: Arc::new(Vec::new()),
             next_event_index: 0,
             playing: false,
-            tempo_segments: Arc::new(vec![TempoSegment {
-                start_tick: 0,
-                start_seconds: 0.0,
-                seconds_per_tick: seconds_per_tick_for(120.0),
-            }]),
-            current_segment_index: 0,
             sample_rate,
             samples_since_start: 0,
-            end_tick: 0,
+            end_seconds: 0.0,
             flags,
             faulted: false,
             graph: Arc::new(Graph::default()),
@@ -745,27 +928,18 @@ impl CallbackState {
                 AudioCommand::SetGraph(graph) => self.set_graph(graph),
                 AudioCommand::Play {
                     events,
-                    tempo_segments,
-                    start_tick,
-                    end_tick,
+                    start_seconds,
+                    end_seconds,
                     channels,
                 } => {
                     self.all_notes_off();
                     self.end_instrument_notes();
                     self.apply_channels(&channels);
-                    let (segment_index, start_seconds) =
-                        locate_tick(&tempo_segments, start_tick);
                     self.events = events;
-                    self.tempo_segments = tempo_segments;
-                    self.current_segment_index = segment_index;
-                    self.next_event_index = self
-                        .events
-                        .iter()
-                        .position(|event| event.tick >= start_tick)
-                        .unwrap_or(self.events.len());
+                    self.next_event_index = 0;
                     self.samples_since_start =
-                        (start_seconds * self.sample_rate as f64).ceil() as u64;
-                    self.end_tick = end_tick;
+                        (start_seconds * f64::from(self.sample_rate)).ceil() as u64;
+                    self.end_seconds = end_seconds;
                     self.playing = true;
                     self.flags.playing.store(true, Ordering::Relaxed);
                 }
@@ -787,67 +961,96 @@ impl CallbackState {
         frame
     }
 
-    /// Advances the song clock by one block, sending the notes that fall in
-    /// it to the synth and to instrument plug-ins.
+    /// Advances the song clock by one block, sending the notes and the
+    /// volume and pan changes that fall in it to the synth and to instrument
+    /// plug-ins.
     fn advance_clock(&mut self) {
         for offset in 0..BLOCK {
             if !self.playing {
                 break;
             }
-            let position = self.current_position();
-            let tick = position as Tick;
-            self.flags.position.store(position.to_bits(), Ordering::Relaxed);
+            let seconds = self.current_position();
+            self.flags.position.store(seconds.to_bits(), Ordering::Relaxed);
             while self
                 .events
                 .get(self.next_event_index)
-                .is_some_and(|event| event.tick <= tick)
+                .is_some_and(|event| event.seconds <= seconds)
             {
                 let event = self.events[self.next_event_index];
                 self.next_event_index += 1;
-                let channel = usize::from(event.channel.min(15));
-                if self.instrument_channels[channel] {
-                    let on = event.kind == MidiEventKind::NoteOn;
-                    self.notes[channel].push(NoteEvent {
-                        offset: offset as u32,
-                        on,
-                        channel: 0,
-                        key: event.key,
-                        velocity: if on { f32::from(event.velocity) / 127.0 } else { 0.0 },
-                    });
-                    let held = (channel as u8, event.key);
-                    if on {
-                        if !self.sounding.contains(&held) {
-                            self.sounding.push(held);
-                        }
-                    } else {
-                        self.sounding.retain(|note| *note != held);
-                    }
-                }
-                if self.instrument_channels[channel] {
-                    // The plug-in is this channel's sound: the soundfont
-                    // does not play it, so nothing of it (not even its
-                    // reverb) reaches the mix.
-                    continue;
-                }
-                let midi_event = match event.kind {
-                    MidiEventKind::NoteOn => MidiEvent::NoteOn {
-                        channel: event.channel,
-                        key: event.key,
-                        vel: event.velocity,
-                    },
-                    MidiEventKind::NoteOff => MidiEvent::NoteOff {
-                        channel: event.channel,
-                        key: event.key,
-                    },
-                };
-                if let Some(synth) = self.synth.as_mut() {
-                    let _ = synth.send_event(midi_event);
-                }
+                self.dispatch(event, offset as u32);
             }
-            if tick >= self.end_tick && self.next_event_index >= self.events.len() {
+            if seconds >= self.end_seconds && self.next_event_index >= self.events.len() {
                 self.finish_playback();
             }
             self.samples_since_start += 1;
+        }
+    }
+
+    fn dispatch(&mut self, event: Scheduled, offset: u32) {
+        let channel = usize::from(event.channel.min(15));
+        let instrument = self.instrument_channels[channel];
+        match event.action {
+            Action::NoteOn { key, velocity } => {
+                if instrument {
+                    self.notes[channel].push(NoteEvent {
+                        offset,
+                        on: true,
+                        channel: 0,
+                        key,
+                        velocity: f32::from(velocity) / 127.0,
+                    });
+                    let held = (channel as u8, key);
+                    if !self.sounding.contains(&held) {
+                        self.sounding.push(held);
+                    }
+                } else if let Some(synth) = self.synth.as_mut() {
+                    let _ = synth.send_event(MidiEvent::NoteOn {
+                        channel: event.channel,
+                        key,
+                        vel: velocity,
+                    });
+                }
+            }
+            Action::NoteOff { key } => {
+                if instrument {
+                    self.notes[channel].push(NoteEvent {
+                        offset,
+                        on: false,
+                        channel: 0,
+                        key,
+                        velocity: 0.0,
+                    });
+                    let held = (channel as u8, key);
+                    self.sounding.retain(|note| *note != held);
+                } else if let Some(synth) = self.synth.as_mut() {
+                    let _ = synth.send_event(MidiEvent::NoteOff {
+                        channel: event.channel,
+                        key,
+                    });
+                }
+            }
+            Action::Volume(value) => {
+                self.channel_mix[channel].0 = value;
+                self.send_controller(event.channel, 7, value);
+            }
+            Action::Pan(value) => {
+                self.channel_mix[channel].1 = value;
+                self.send_controller(event.channel, 10, value);
+            }
+        }
+    }
+
+    /// An instrument plug-in channel has no soundfont sound; its volume and
+    /// pan are applied from `channel_mix` after the plug-in. The synth gets
+    /// the controller either way, which is harmless for a silent channel.
+    fn send_controller(&mut self, channel: u8, ctrl: u8, value: u8) {
+        if let Some(synth) = self.synth.as_mut() {
+            let _ = synth.send_event(MidiEvent::ControlChange {
+                channel,
+                ctrl,
+                value,
+            });
         }
     }
 
@@ -924,19 +1127,9 @@ impl CallbackState {
         self.block_pos = 0;
     }
 
-    /// Converts elapsed playback time into a musical tick, walking forward
-    /// through the tempo automation's precomputed segments.
-    fn current_position(&mut self) -> f64 {
-        let elapsed_seconds = self.samples_since_start as f64 / self.sample_rate as f64;
-        while self.current_segment_index + 1 < self.tempo_segments.len()
-            && self.tempo_segments[self.current_segment_index + 1].start_seconds
-                <= elapsed_seconds
-        {
-            self.current_segment_index += 1;
-        }
-        let segment = self.tempo_segments[self.current_segment_index];
-        let tick_offset = (elapsed_seconds - segment.start_seconds) / segment.seconds_per_tick;
-        segment.start_tick as f64 + tick_offset.max(0.0)
+    /// Seconds since the start of the song.
+    fn current_position(&self) -> f64 {
+        self.samples_since_start as f64 / f64::from(self.sample_rate)
     }
 }
 
@@ -992,7 +1185,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::MidiEventKind;
+    use crate::core::{MidiEventKind, TICKS_PER_QUARTER};
 
     fn flags() -> Arc<SharedFlags> {
         Arc::new(SharedFlags::default())
@@ -1005,23 +1198,17 @@ mod tests {
         (producer, state, flags)
     }
 
-    fn one_note(tick_on: Tick, tick_off: Tick) -> Arc<Vec<MidiPlaybackEvent>> {
+    fn one_note(on: f64, off: f64) -> Arc<Vec<Scheduled>> {
         Arc::new(vec![
-            MidiPlaybackEvent {
-                tick: tick_on,
-                kind: MidiEventKind::NoteOn,
-                track_id: 0,
+            Scheduled {
+                seconds: on,
                 channel: 0,
-                key: 60,
-                velocity: 100,
+                action: Action::NoteOn { key: 60, velocity: 100 },
             },
-            MidiPlaybackEvent {
-                tick: tick_off,
-                kind: MidiEventKind::NoteOff,
-                track_id: 0,
+            Scheduled {
+                seconds: off,
                 channel: 0,
-                key: 60,
-                velocity: 0,
+                action: Action::NoteOff { key: 60 },
             },
         ])
     }
@@ -1030,12 +1217,18 @@ mod tests {
         Arc::new(Vec::new())
     }
 
-    fn segments() -> Arc<Vec<TempoSegment>> {
-        Arc::new(vec![TempoSegment {
-            start_tick: 0,
-            start_seconds: 0.0,
-            seconds_per_tick: seconds_per_tick_for(120.0),
-        }])
+    fn play_command(
+        events: Arc<Vec<Scheduled>>,
+        start_seconds: f64,
+        end_seconds: f64,
+        channels: Arc<Vec<ChannelSetup>>,
+    ) -> AudioCommand {
+        AudioCommand::Play {
+            events,
+            start_seconds,
+            end_seconds,
+            channels,
+        }
     }
 
     #[test]
@@ -1044,13 +1237,7 @@ mod tests {
         assert_eq!(state.next_frame(), (0.0, 0.0));
         assert!(!flags.playing.load(Ordering::Relaxed));
 
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 10),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 2,
-            channels: no_channels(),
-        });
+        let _ = producer.try_push(play_command(one_note(0.0, 0.01), 0.0, 1.0, no_channels()));
         state.next_frame();
         assert!(flags.playing.load(Ordering::Relaxed));
     }
@@ -1058,13 +1245,7 @@ mod tests {
     #[test]
     fn stop_command_clears_playing_flag() {
         let (mut producer, mut state, flags) = state_with_queue();
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 10),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 2,
-            channels: no_channels(),
-        });
+        let _ = producer.try_push(play_command(one_note(0.0, 0.01), 0.0, 1.0, no_channels()));
         state.next_frame();
         let _ = producer.try_push(AudioCommand::Stop);
         state.next_frame();
@@ -1074,14 +1255,8 @@ mod tests {
     #[test]
     fn song_finishes_by_itself_when_the_clock_reaches_the_end() {
         let (mut producer, mut state, flags) = state_with_queue();
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 10),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 2,
-            channels: no_channels(),
-        });
-        // 1 kHz sample rate: the end tick is two quarters, 1 s at 120 bpm.
+        let _ = producer.try_push(play_command(one_note(0.0, 0.01), 0.0, 1.0, no_channels()));
+        // 1 kHz sample rate: the end is 1 s, i.e. 1000 frames.
         for _ in 0..1_100 {
             state.next_frame();
         }
@@ -1092,33 +1267,20 @@ mod tests {
     #[test]
     fn the_position_follows_the_clock_between_notes() {
         let (mut producer, mut state, flags) = state_with_queue();
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 10),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 8,
-            channels: no_channels(),
-        });
+        let _ = producer.try_push(play_command(one_note(0.0, 0.01), 0.0, 4.0, no_channels()));
         for _ in 0..500 {
             state.next_frame();
         }
         let position = f64::from_bits(flags.position.load(Ordering::Relaxed));
         // The position is stamped per frame while a block of 64 is played
         // ahead of the 500 frames asked for.
-        let block = 64.0 / 1_000.0 * 2.0 * TICKS_PER_QUARTER as f64;
-        assert!((position - TICKS_PER_QUARTER as f64).abs() <= block, "{position}");
+        assert!((position - 0.5).abs() <= 64.0 / 1_000.0, "{position}");
     }
 
     #[test]
-    fn song_keeps_playing_until_the_end_tick() {
+    fn song_keeps_playing_until_the_end() {
         let (mut producer, mut state, flags) = state_with_queue();
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 10),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 2,
-            channels: no_channels(),
-        });
+        let _ = producer.try_push(play_command(one_note(0.0, 0.01), 0.0, 1.0, no_channels()));
         for _ in 0..500 {
             state.next_frame();
         }
@@ -1126,17 +1288,9 @@ mod tests {
     }
 
     #[test]
-    fn play_from_a_later_tick_sounds_without_waiting_for_the_skipped_time() {
+    fn play_from_a_later_moment_sounds_without_waiting_for_the_skipped_time() {
         let (mut producer, mut state, _flags) = state_with_queue();
-        let start = TICKS_PER_QUARTER * 8;
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(start, start + TICKS_PER_QUARTER),
-            tempo_segments: segments(),
-            start_tick: start,
-            end_tick: start + TICKS_PER_QUARTER,
-            channels: no_channels(),
-        });
-        // 8 quarters at 120 bpm is 4 s, i.e. 4000 frames at 1 kHz.
+        let _ = producer.try_push(play_command(one_note(4.0, 4.5), 4.0, 4.5, no_channels()));
         for _ in 0..10 {
             state.next_frame();
         }
@@ -1145,102 +1299,193 @@ mod tests {
     }
 
     #[test]
-    fn play_skips_events_before_the_start_tick() {
-        let (mut producer, mut state, _flags) = state_with_queue();
-        let events = Arc::new(vec![
-            one_note(0, 100)[0],
-            one_note(0, 100)[1],
-            one_note(2_000, 2_100)[0],
-            one_note(2_000, 2_100)[1],
-        ]);
-        let _ = producer.try_push(AudioCommand::Play {
-            events,
-            tempo_segments: segments(),
-            start_tick: 2_000,
-            end_tick: 2_100,
-            channels: no_channels(),
-        });
-        state.next_frame();
-        // The two notes before the start are skipped; the first block holds
-        // the note at the start tick, and may hold its end too.
-        assert!(state.next_event_index >= 3, "{}", state.next_event_index);
-    }
-
-    #[test]
     fn play_past_the_last_event_finishes_at_once() {
         let (mut producer, mut state, flags) = state_with_queue();
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 10),
-            tempo_segments: segments(),
-            start_tick: TICKS_PER_QUARTER * 100,
-            end_tick: TICKS_PER_QUARTER * 100,
-            channels: no_channels(),
-        });
+        let _ = producer.try_push(play_command(one_note(0.0, 0.01), 50.0, 50.0, no_channels()));
         state.next_frame();
         assert!(!flags.playing.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn locate_tick_follows_the_tempo_map() {
-        let slow = seconds_per_tick_for(60.0);
-        let fast = seconds_per_tick_for(120.0);
-        let boundary = TICKS_PER_QUARTER * 4;
-        let segments = [
-            TempoSegment {
-                start_tick: 0,
-                start_seconds: 0.0,
-                seconds_per_tick: slow,
-            },
-            TempoSegment {
-                start_tick: boundary,
-                start_seconds: boundary as f64 * slow,
-                seconds_per_tick: fast,
-            },
-        ];
-        assert_eq!(locate_tick(&segments, 0), (0, 0.0));
-        assert_eq!(locate_tick(&segments, boundary - 1).0, 0);
-        let (index, seconds) = locate_tick(&segments, boundary + TICKS_PER_QUARTER);
-        assert_eq!(index, 1);
-        // Four quarters at 60 bpm, then one quarter at 120 bpm.
-        assert!((seconds - 4.5).abs() < 1e-9);
+    fn volume_and_pan_changes_reach_the_mix_when_they_fall_due() {
+        let (mut producer, mut state, _flags) = state_with_queue();
+        let events = Arc::new(vec![
+            Scheduled { seconds: 0.1, channel: 2, action: Action::Volume(30) },
+            Scheduled { seconds: 0.2, channel: 2, action: Action::Pan(10) },
+        ]);
+        let _ = producer.try_push(play_command(events, 0.0, 1.0, no_channels()));
+        for _ in 0..150 {
+            state.next_frame();
+        }
+        assert_eq!(state.channel_mix[2].0, 30);
+        assert_ne!(state.channel_mix[2].1, 10, "the pan is not due yet");
+        for _ in 0..250 {
+            state.next_frame();
+        }
+        assert_eq!(state.channel_mix[2], (30, 10));
+    }
+
+    fn event(track_id: u64, tick: Tick, kind: MidiEventKind) -> MidiPlaybackEvent {
+        MidiPlaybackEvent {
+            tick,
+            kind,
+            track_id,
+            channel: track_id as u8 - 1,
+            key: 60,
+            velocity: 100,
+        }
+    }
+
+    fn notes_for_both_tracks(project: &BwxProject) -> Vec<MidiPlaybackEvent> {
+        let (a, b) = (project.tracks[0].id, project.tracks[1].id);
+        vec![
+            event(a, TICKS_PER_QUARTER, MidiEventKind::NoteOn),
+            event(a, TICKS_PER_QUARTER * 2, MidiEventKind::NoteOff),
+            event(b, TICKS_PER_QUARTER, MidiEventKind::NoteOn),
+            event(b, TICKS_PER_QUARTER * 2, MidiEventKind::NoteOff),
+        ]
+    }
+
+    fn on_times(schedule: &Schedule) -> Vec<(u8, f64)> {
+        schedule
+            .events
+            .iter()
+            .filter(|event| matches!(event.action, Action::NoteOn { .. }))
+            .map(|event| (event.channel, event.seconds))
+            .collect()
     }
 
     #[test]
-    fn play_inside_a_later_tempo_segment_continues_on_that_tempo() {
-        let (mut producer, mut state, _flags) = state_with_queue();
-        let boundary = TICKS_PER_QUARTER * 4;
-        let tempo_segments = Arc::new(vec![
-            TempoSegment {
-                start_tick: 0,
-                start_seconds: 0.0,
-                seconds_per_tick: seconds_per_tick_for(60.0),
-            },
-            TempoSegment {
-                start_tick: boundary,
-                start_seconds: 4.0,
-                seconds_per_tick: seconds_per_tick_for(120.0),
-            },
-        ]);
-        let start = boundary + TICKS_PER_QUARTER;
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(start + TICKS_PER_QUARTER, start + TICKS_PER_QUARTER * 2),
-            tempo_segments,
-            start_tick: start,
-            end_tick: start + TICKS_PER_QUARTER * 2,
-            channels: no_channels(),
-        });
-        state.next_frame();
-        assert_eq!(state.current_segment_index, 1);
-        // One quarter at 120 bpm is 0.5 s: the note is due 500 frames in.
-        // The clock moves a block (64 frames) at a time.
-        for _ in 0..390 {
-            state.next_frame();
-        }
-        assert_eq!(state.next_event_index, 0);
-        for _ in 0..160 {
-            state.next_frame();
-        }
-        assert_eq!(state.next_event_index, 1);
+    fn one_tempo_curve_times_every_track_alike() {
+        let project = BwxProject::demo();
+        let notes = notes_for_both_tracks(&project);
+        let schedule = build_schedule(&project, &notes, 0, project.tracks[0].id);
+        // One quarter at 120 bpm.
+        let times = on_times(&schedule);
+        assert_eq!(times.len(), 2);
+        assert!(times.iter().all(|&(_, seconds)| (seconds - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn per_track_tempo_times_each_track_on_its_own_curve() {
+        let mut project = BwxProject::demo();
+        let (a, b) = (project.tracks[0].id, project.tracks[1].id);
+        project.set_per_track_automation(true);
+        project.set_automation_point(
+            AutomationLane::Tempo,
+            project.scope_for(b),
+            0,
+            60.0,
+            crate::core::TempoTransition::Constant,
+        );
+        let notes = notes_for_both_tracks(&project);
+        let schedule = build_schedule(&project, &notes, 0, a);
+        let mut times = on_times(&schedule);
+        times.sort_by(|x, y| x.1.total_cmp(&y.1));
+        assert!((times[0].1 - 0.5).abs() < 1e-9, "120 bpm: {times:?}");
+        assert!((times[1].1 - 1.0).abs() < 1e-9, "60 bpm: {times:?}");
+    }
+
+    #[test]
+    fn the_start_moment_is_read_on_the_start_tracks_curve() {
+        let mut project = BwxProject::demo();
+        let (a, b) = (project.tracks[0].id, project.tracks[1].id);
+        project.set_per_track_automation(true);
+        project.set_automation_point(
+            AutomationLane::Tempo,
+            project.scope_for(b),
+            0,
+            60.0,
+            crate::core::TempoTransition::Constant,
+        );
+        let notes = notes_for_both_tracks(&project);
+        // One quarter in on the 60 bpm track is 1 s; the other track's note
+        // at 0.5 s is behind it and is skipped.
+        let schedule = build_schedule(&project, &notes, TICKS_PER_QUARTER, b);
+        assert!((schedule.start_seconds - 1.0).abs() < 1e-9);
+        let times = on_times(&schedule);
+        assert_eq!(times.len(), 1, "{times:?}");
+        assert_eq!(times[0].0, project.tracks[1].channel);
+        assert!(schedule.events.iter().all(|event| event.seconds >= 1.0));
+        let _ = a;
+    }
+
+    #[test]
+    fn automation_becomes_controller_changes_on_the_tracks_channel() {
+        let mut project = BwxProject::demo();
+        let a = project.tracks[0].id;
+        let scope = project.scope_for(a);
+        let hold = crate::core::TempoTransition::Constant;
+        project.set_automation_point(AutomationLane::Volume, scope, 0, 100.0, hold);
+        project.set_automation_point(AutomationLane::Volume, scope, TICKS_PER_QUARTER * 2, 40.0, hold);
+        project.set_automation_point(AutomationLane::Pan, scope, TICKS_PER_QUARTER * 2, -64.0, hold);
+        let schedule = build_schedule(&project, &[], 0, a);
+        let channel = project.tracks[0].channel;
+        let volumes: Vec<(u8, f64)> = schedule
+            .events
+            .iter()
+            .filter_map(|event| match event.action {
+                Action::Volume(value) if event.channel == channel => Some((value, event.seconds)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0], (100, 0.0));
+        assert_eq!(volumes[1].0, 40);
+        assert!((volumes[1].1 - 1.0).abs() < 1e-9);
+        assert!(schedule
+            .events
+            .iter()
+            .any(|event| event.action == Action::Pan(0) && event.channel == channel));
+    }
+
+    #[test]
+    fn starting_mid_song_applies_the_volume_in_force_at_that_moment() {
+        let mut project = BwxProject::demo();
+        let a = project.tracks[0].id;
+        let scope = project.scope_for(a);
+        let hold = crate::core::TempoTransition::Constant;
+        project.set_automation_point(AutomationLane::Volume, scope, 0, 100.0, hold);
+        project.set_automation_point(AutomationLane::Volume, scope, TICKS_PER_QUARTER * 2, 40.0, hold);
+        project.set_automation_point(AutomationLane::Volume, scope, TICKS_PER_QUARTER * 8, 90.0, hold);
+        let schedule = build_schedule(&project, &[], TICKS_PER_QUARTER * 4, a);
+        let channel = project.tracks[0].channel;
+        let volumes: Vec<(u8, f64)> = schedule
+            .events
+            .iter()
+            .filter_map(|event| match event.action {
+                Action::Volume(value) if event.channel == channel => Some((value, event.seconds)),
+                _ => None,
+            })
+            .collect();
+        // The change to 40 is in force at the start; 90 follows later.
+        assert_eq!(volumes[0], (40, schedule.start_seconds));
+        assert_eq!(volumes[1].0, 90);
+        assert_eq!(volumes.len(), 2);
+    }
+
+    #[test]
+    fn volume_automation_does_not_unmute_a_silent_track() {
+        let mut project = BwxProject::demo();
+        let a = project.tracks[0].id;
+        let scope = project.scope_for(a);
+        project.set_automation_point(
+            AutomationLane::Volume,
+            scope,
+            0,
+            100.0,
+            crate::core::TempoTransition::Constant,
+        );
+        project.tracks[0].mute = true;
+        let schedule = build_schedule(&project, &[], 0, a);
+        let volume_on = |channel: u8| {
+            schedule
+                .events
+                .iter()
+                .any(|event| event.channel == channel && matches!(event.action, Action::Volume(_)))
+        };
+        assert!(!volume_on(project.tracks[0].channel));
+        assert!(volume_on(project.tracks[1].channel), "the shared curve still reaches the other track");
     }
 
     fn two_track_project() -> BwxProject {
@@ -1264,6 +1509,7 @@ mod tests {
             setups[0],
             ChannelSetup {
                 channel: 0,
+                bank: 0,
                 program: 29,
                 volume: 80,
                 pan: 44,
@@ -1295,9 +1541,10 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_is_set_up_with_bank_zero_before_its_program() {
+    fn a_channel_is_set_up_with_its_bank_before_its_program() {
         let events = setup_events(ChannelSetup {
             channel: 3,
+            bank: 0,
             program: 35,
             volume: 100,
             pan: 64,
@@ -1307,6 +1554,38 @@ mod tests {
         assert!(events[2] == MidiEvent::ProgramChange { channel: 3, program_id: 35 });
         assert!(events[3] == MidiEvent::ControlChange { channel: 3, ctrl: 7, value: 100 });
         assert!(events[4] == MidiEvent::ControlChange { channel: 3, ctrl: 10, value: 64 });
+    }
+
+    #[test]
+    fn a_drum_kit_bank_is_split_over_the_two_bank_controllers() {
+        let events = setup_events(ChannelSetup {
+            channel: 2,
+            bank: 128,
+            program: 8,
+            volume: 100,
+            pan: 64,
+        });
+        assert!(events[0] == MidiEvent::ControlChange { channel: 2, ctrl: 0, value: 1 });
+        assert!(events[1] == MidiEvent::ControlChange { channel: 2, ctrl: 32, value: 0 });
+        let events = setup_events(ChannelSetup {
+            channel: 2,
+            bank: 17,
+            program: 16,
+            volume: 100,
+            pan: 64,
+        });
+        assert!(events[0] == MidiEvent::ControlChange { channel: 2, ctrl: 0, value: 0 });
+        assert!(events[1] == MidiEvent::ControlChange { channel: 2, ctrl: 32, value: 17 });
+    }
+
+    #[test]
+    fn an_automatic_sound_reaches_the_synth_as_the_instruments_preset() {
+        let mut project = two_track_project();
+        project.tracks[0].set_instrument(crate::core::instruments::instrument("flute").unwrap());
+        project.tracks[0].set_sound_automatic();
+        let flute = crate::core::instruments::instrument("flute").unwrap();
+        let setup = channel_setups(&project)[0];
+        assert_eq!((setup.bank, setup.program), (flute.bank, flute.program));
     }
 
     #[test]
@@ -1371,17 +1650,12 @@ mod tests {
         let _ = producer.try_push(AudioCommand::InstallSynth(synth));
         let channels = Arc::new(vec![ChannelSetup {
             channel: 0,
+            bank: 0,
             program: 33,
             volume: 100,
             pan: 64,
         }]);
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, 240),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: 240,
-            channels,
-        });
+        let _ = producer.try_push(play_command(one_note(0.0, 0.25), 0.0, 0.25, channels));
         let started = std::time::Instant::now();
         let mut peak = 0.0_f32;
         for _ in 0..48_000 * 2 {
@@ -1401,21 +1675,16 @@ mod tests {
         let path = std::env::var_os(var)?;
         let module = crate::plugins::vst3::Module::load(Path::new(&path)).expect("load");
         let instance = crate::plugins::vst3::Instance::create(&module, "", 1_000.0).expect("create");
-        Some(Arc::new(LivePlugin {
-            id,
-            is_instrument: instrument,
-            instance: std::sync::Mutex::new(instance),
-        }))
+        Some(Arc::new(LivePlugin::new(id, instrument, instance)))
     }
 
     fn play_one_note(state: &mut CallbackState, producer: &mut HeapProd<AudioCommand>, frames: usize) -> f32 {
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, TICKS_PER_QUARTER * 4),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 4,
-            channels: Arc::new(vec![ChannelSetup { channel: 0, program: 0, volume: 127, pan: 64 }]),
-        });
+        let _ = producer.try_push(play_command(
+            one_note(0.0, 2.0),
+            0.0,
+            2.0,
+            Arc::new(vec![ChannelSetup { channel: 0, bank: 0, program: 0, volume: 127, pan: 64 }]),
+        ));
         let mut peak = 0.0_f32;
         for _ in 0..frames {
             let (left, right) = state.next_frame();
@@ -1449,13 +1718,12 @@ mod tests {
         let mut graph = Graph::default();
         graph.channels[0].push(synth);
         let _ = producer.try_push(AudioCommand::SetGraph(Arc::new(graph)));
-        let _ = producer.try_push(AudioCommand::Play {
-            events: one_note(0, TICKS_PER_QUARTER * 4),
-            tempo_segments: segments(),
-            start_tick: 0,
-            end_tick: TICKS_PER_QUARTER * 4,
-            channels: Arc::new(vec![ChannelSetup { channel: 0, program: 0, volume: 0, pan: 64 }]),
-        });
+        let _ = producer.try_push(play_command(
+            one_note(0.0, 2.0),
+            0.0,
+            2.0,
+            Arc::new(vec![ChannelSetup { channel: 0, bank: 0, program: 0, volume: 0, pan: 64 }]),
+        ));
         let mut peak = 0.0_f32;
         for _ in 0..400 {
             let (left, right) = state.next_frame();
@@ -1511,13 +1779,12 @@ mod tests {
             // A fresh plug-in each run, so both start from the same phase.
             graph.channels[0].push(live_plugin("BW_TEST_SYNTH_VST3", 1, true).unwrap());
             let _ = producer.try_push(AudioCommand::SetGraph(Arc::new(graph)));
-            let _ = producer.try_push(AudioCommand::Play {
-                events: one_note(0, 240),
-                tempo_segments: segments(),
-                start_tick: 0,
-                end_tick: 240,
-                channels: Arc::new(vec![ChannelSetup { channel: 0, program: 33, volume: 127, pan: 64 }]),
-            });
+            let _ = producer.try_push(play_command(
+                one_note(0.0, 0.25),
+                0.0,
+                0.25,
+                Arc::new(vec![ChannelSetup { channel: 0, bank: 0, program: 33, volume: 127, pan: 64 }]),
+            ));
             (0..48_000).map(|_| state.next_frame()).collect::<Vec<_>>()
         };
         let with = run(true);

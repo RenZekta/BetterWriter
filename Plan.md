@@ -165,8 +165,7 @@ Important: edit this file with its formatting in mind, don't change the formatti
       Guitar Pro's automation display.
 - [x] **Automation Editor** window (toolbar button, "TVP Automation" —
       replaces the old flat tempo `DragValue`), modeled on Guitar Pro 8's:
-      TYPE dropdown (Tempo implemented; Volume/Pan shown disabled with
-      "Coming soon", ready for when per-track automation exists), a POINT
+      TYPE dropdown (Tempo, Volume, Pan since 19.11.2026), a POINT
       SETTINGS panel (tempo value + TAP-tempo button, Constant/Progressive
       transition, per-point "hide label" toggle, delete), a "Remove
       automations" reset, and a scrollable/zoomable graph
@@ -701,12 +700,12 @@ accidentals) and `TGMusicKeyUtils` (staff position from the sounding pitch).
       note.
 
 ### 3. Zoom and scrolling
-- [x] **Mouse wheel zooms** the score around the pointer; `Ctrl`+wheel and
-      pinch do too. It drives the same `pixels_per_tick` as the toolbar
+- [x] **`Shift`+wheel zooms** the score around the pointer (since 19.11.2026;
+      the plain wheel scrolls); `Ctrl`+wheel and pinch do too. It drives the same `pixels_per_tick` as the toolbar
       slider (shared `MIN_PIXELS_PER_TICK` / `MAX_PIXELS_PER_TICK`).
       Rows reflow to the page width at every zoom level, so only the row under
       the pointer is held at its screen height.
-- [x] **`Shift`+wheel scrolls the score vertically**, and keyboard edits
+- [x] **The wheel scrolls the score vertically** (since 19.11.2026), and keyboard edits
       scroll the cursor's row into view. The 8-system cap is gone: rows are
       culled by the page rect instead.
 - [x] Page placement lives in one `PageGeometry` (`page_geometry`) instead of
@@ -853,10 +852,10 @@ right-click submenus and the move / stretch drag previews.
 - [x] **`Ctrl+C`, `Ctrl+X`, `Ctrl+V`** and Edit > Cut / Copy / Paste work on
       the selected note or the rubber-band selection (`core/clipboard.rs`).
       egui reports these as `Copy` / `Cut` / `Paste` events, not key presses;
-      copying also puts a marker text on the system clipboard, because egui
-      only reports a paste while it holds text, and a paste is accepted only
-      while that text is still there (so Ctrl+V after copying something
-      else, elsewhere, does nothing).
+      copying also puts a text on the system clipboard, because egui only
+      reports a paste while it holds text, and our own copy is pasted only
+      while that text is still there (what else happens to Ctrl+V is in
+      19.11.2026 item 1).
 - [x] **Paste goes to the edit cursor** and leaves exactly the new notes
       selected (including the tied pieces tab view cuts at barlines). Pasted
       notes replace what they land on, on the same string: a note starting
@@ -1020,9 +1019,8 @@ right-click submenus and the move / stretch drag previews.
 
 ### 15. Score scrollbar
 - [x] A vertical scrollbar along the right edge of the score area (thumb
-      drag, click to jump). The wheel zooms, so Shift+wheel and this bar
-      are how the score scrolls. It shows only when the score is taller
-      than the page.
+      drag, click to jump). It shows only when the score is taller than the
+      page.
 
 ### 16. Cursor box has no placeholder mark
 - [x] The "_" in the middle of the cursor box is gone; the box only shows a
@@ -1316,11 +1314,225 @@ right-click submenus and the move / stretch drag previews.
       a fixed test position (no audio device there). Not exercised in the
       app: the file picker for the image, deleting and reverting presets.
 
+## 18.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Releases (version 0.3.0)
+- [x] `.github/VERSION` holds the version (0.3.0); `Cargo.toml` and
+      `Cargo.lock` carry the same number. `.github/workflows/build.yml` and
+      `.github/scripts/release.sh` work like the ones of XLM-Studio: a push to
+      `main` with a new version builds Windows, Linux and macOS packages (the
+      program, `assets/soundfonts` and the licence; `cargo test --locked`
+      runs first) and creates release and tag `0.3.0`; the same version with
+      changed code rebuilds the packages and moves the tag; docs-only changes
+      only move the tag. `release.sh sync` writes the version into the two
+      Cargo files. The soundfont is now looked up next to the program first
+      (`default_soundfont_path`), because a packaged build has no source tree.
+
+### 2. Playback survives a change of the sound card's rate or buffer
+- [x] The stream's error callback and a once-a-second comparison of the
+      default output's sample rate, channels and format tell the runtime that
+      the device changed. It then rebuilds the stream, decodes the soundfont
+      again for the new rate, sets the plug-ins up again at that rate
+      (`Instance::set_sample_rate`, editors stay open) and, if a song was
+      playing, carries on from where it was (`take_resume`). The idle window
+      wakes once a second for the comparison.
+
+### 3. Crackling with plug-ins
+- [x] Causes removed in the host: the UI took the plug-in's lock every frame
+      to reach its controller, so the audio thread skipped blocks (a click);
+      `LivePlugin` now keeps the controller handle from the start. Every
+      block allocated event lists and parameter queues; they are reused now
+      (up to 64 parameters per block, the rest wait). A plug-in that flags its
+      output as silent no longer leaves the previous block's samples in the
+      output (buffers start cleared, flagged channels are zeroed). The audio
+      thread flushes denormals to zero (x86_64 and aarch64), as DAWs do.
+
+### 4. FX Chain window: selection, plug-in view (resizing: see 19.11.2026)
+- [x] (Replaced on 19.11.2026: the window was drawn by `fx_chain.rs` with its
+      own edge dragging; it is a window of the operating system now, which
+      resizes and moves as every window does, so the drift no longer applies.)
+- [x] The list takes several plug-ins: Ctrl+click toggles, Shift+click picks a
+      range, Ctrl+A all. Delete or Backspace removes the picked ones while the
+      pointer is over the window (taken before the score's own keys). Dragging
+      reorders the picked ones together, with an insertion line; one undo step.
+      Bypass and Remove from the menus work on the whole pick.
+- [x] A **Plug-in UI / Parameters** switch sits at the right end of the FX
+      Chain menu bar. Plug-in UI lays the plug-in's editor over the right half
+      as a child window of the program's window (Windows); Parameters shows
+      the sliders. Only one of them is shown, so the sliders no longer sit
+      beside an open editor. A double click on a slider or its name puts the
+      parameter back to the plug-in's default.
+- [x] The instance menu has **Open in a separate window** (and Show in the FX
+      Chain window); double click does the same. The window of its own has a
+      working title bar, minimise and close, and a sizing frame and maximise
+      button when the plug-in can be resized. Cause: the window used the
+      system `STATIC` class, which answers every hit test as transparent, so
+      nothing could be clicked; it now has a class of its own
+      (`native_window.rs`).
+
+### 5. Instruments and sounds as in MuseScore
+- [x] The Instrument column opens a picker with MuseScore's 644 instruments
+      (`src/core/instruments.rs`, from its `instruments.xml`): a genre list
+      (Common, All instruments, ...), the families of the genre, and the
+      instruments in MuseScore's order, with a search box that puts the
+      earliest match first. Picking one sets the tab view type (guitar, bass,
+      other), keeps the tuning and the notes, and moves an automatic sound.
+- [x] The Sound column is MuseScore's menu for `MS Basic`: the current sound,
+      then SoundFonts > MS Basic > Choose automatically and the categories
+      (Pipe, Reed, Brass, Vocal, Piano, Organ, Guitar, Bass, Strings, World,
+      Synth, Sound effects, Percussion, Drumsets), with a search box. Names
+      come from the soundfont's own preset list; the Expr. variants stay out
+      of the menu as in MuseScore.
+- [x] **Choose automatically**: `InstrumentTrack::sound_auto`. The sound is
+      the bank and program of the instrument's definition and follows the
+      instrument; a sound picked by hand stays until automatic is chosen
+      again. New tracks start automatic; files from before read back with the
+      sound they had. Banks other than 0 now reach the synth (controllers 0
+      and 32; bank 128 is the drum kits).
+- [ ] No drum track type yet: a drum kit sound plays on a melodic channel.
+      The 12 MuseScore families all list, but only plucked strings have a tab
+      view and a fretboard.
+
+### 6. Build and tests
+- [x] `cargo check --all-targets` and `cargo test`: 255 passed, 2 ignored; the
+      warning count is the same as before this pass. The tests that need a
+      real VST3 bundle passed quietly (none built here).
+
+
+## 19.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Instrument list
+- [x] The picker's list ran sideways (a vertical list inside a horizontal row);
+      it is a scrolling vertical list now.
+- [x] Notation-only twins are gone: the 14 `(tablature)` instruments and
+      `Marimba (single staff)` are not listed and `(grand staff)` lost its
+      suffix. BetterWriter chooses the view (tab, staff) apart from the
+      instrument, so these changed nothing here. An instrument id from an
+      older file (`...-tablature`, `...-single`) finds the instrument it was
+      a twin of. 629 instruments remain. The clef variants (`treble clef`,
+      `bass clef`, `C clef`) are still listed.
+
+### 2. Floating windows leave the program's window
+- [x] The FX Chain window, the Add FX browser, the instrument picker, the
+      Theme window and the Automation Editor are windows of the operating
+      system now (egui viewports, `floating.rs`): they can be dragged over
+      the desktop and past the program's window. On Windows each is owned
+      by the program's window (`SetWindowLongPtr(GWLP_HWNDPARENT)`, found
+      by its title), so it stays above it and goes with it when it is
+      minimised; plug-in windows of their own are owned the same way. Where
+      the platform has no such windows egui shows them inside the program's
+      window. The New Project dialog stays an egui window.
+- [x] Move and resize are the system's, so the custom edge dragging of
+      18.11.2026 (and its tests) is removed. Delete, Backspace and Ctrl+A in
+      the FX Chain list and Delete in the Automation Editor are read from the
+      window that has the keyboard.
+- [ ] **Not tested here (Windows only)**: finding the window by title,
+      the owner relation, and plug-in editors as children of the FX Chain's
+      own window instead of the program's.
+
+### 3. Plug-in editors freezing during playback
+- [x] Probable cause: playback asked for a repaint after every frame, so the
+      window's message queue was never empty and `WM_TIMER`, the lowest
+      priority message, never came. Editors animated by timers (Neural DSP,
+      Cradle) froze; ones that draw on their own thread (FabFilter) did not.
+      Playback now asks for a frame every 16 ms.
+
+### 4. Blank white editor area
+- [x] Editors that were shown stay alive, hidden (up to 4 per chain, the one
+      used longest ago closes), so switching between Plug-in UI and
+      Parameters, or back to a plug-in, does not make the editor again.
+- [x] Hiding an editor no longer resizes it to 1 x 1; a visible one is
+      repainted at once (`RedrawWindow`) when it is shown.
+- [x] While nothing plays, the editors of the other plug-ins of a chain are
+      made in the background, one per frame, so picking one shows a finished
+      editor. A VST3 editor has to be made on the thread that owns the
+      window, so this is spread over frames, not moved to another thread.
+
+### 5. Copy and paste across apps
+- [x] Copying no longer leaves "BetterWriter: N notes (copy N)" on the
+      clipboard. The system clipboard (`clipboard-rs`, `app/system_clipboard.rs`)
+      now holds the notes as a MIDI file (`audio/midi`; `public.midi-audio` on
+      macOS), as a `.mid` file in the temp folder offered as a file list, and
+      as a plain-text tab (`NoteClip::ascii_tab`). The text is also what lets
+      egui report Ctrl+V. Tied notes are merged into one MIDI note; the tempo
+      is the one in force at the first copied note (`core/smf.rs`,
+      `NoteClip::midi_notes`).
+- [x] Paste: the editor's own copy is pasted while the clipboard text is
+      still its own. Otherwise a MIDI file on the clipboard (as data or as a
+      `.mid` file) is placed on the track: each note takes the free string
+      that reaches its key at the lowest fret, and notes no string reaches are
+      left out (`NoteClip::from_midi`). Edit > Paste is enabled for either.
+- [x] Tests: MIDI file write/read (resolutions, running status, held notes,
+      refusing bad files), tie merging, the text tab, string choice and a
+      pasted MIDI clip.
+
+### 6. Allow irrational time signatures
+- [x] Bar RMB menu > Time Signature has an **Allow irrational** checkbox. On,
+      the denominator is any whole number from 1 to 255 (4/6, 5/12); off, it
+      steps through 1 to 32 again and snaps to the nearest of those. A bar
+      that already has an irrational signature turns the box on.
+- [x] A bar's length is `numerator * 3840 / denominator` rounded to the
+      nearest tick (`TimeSignature::measure_ticks`, also the beaming unit in
+      `notation::beat_ticks_for`). Powers of two are unchanged.
+- [x] An irrational signature greys out the `.tg` / `.gp` export with its own
+      warning (`CompatibilityReport::has_irrational_meter`).
+
+### 7. TVP Automation
+- [x] Points are grabbed at once: the graph reads raw pointer input (press
+      position and movement) instead of egui's drag response, which only
+      starts after a hold or several pixels of travel.
+- [x] Points move in whole values (bpm, volume, pan step) and sixteenth-note
+      positions; **Alt** moves them freely. The "snap to grid" toggle still
+      turns the position snap off.
+- [x] **Per-track automation** checkbox: each track gets its own tempo, volume
+      and pan curves (`InstrumentTrack::{tempo,volume,pan}_points`). Turning
+      it on copies the shared curves into tracks that have none, and the
+      window names the track it edits. Off, the shared curves play again.
+- [x] **Volume and Pan automation** (`core/automation.rs`): constant or
+      progressive points, sent as MIDI CC 7 and CC 10 (a ramp is stepped).
+      A muted track or one a solo silences keeps its volume at 0.
+- [x] Playback is timed in seconds: every track runs through its own tempo
+      curve (`core/tempo.rs`), so tracks at different bpm stay in step with
+      the clock; the playback position is derived per track.
+
+### 8. Bar timeline
+- [x] The timeline axis is real time: a block's width is its length in
+      seconds through its track's tempo curve, so a faster track gets
+      narrower blocks, and the playing mark follows the clock.
+- [x] Multi-selection hover: for bars at different bpm the offset and length
+      difference are given in seconds with the tick difference
+      (`+0 ticks`); the on-timeline offset label switches to seconds.
+- [x] The hover also tells **when the bar lines meet again**: bars of each
+      track counted from the compared bars ("in step again after 5 bars here,
+      4 bars there"), marked when the meeting lies past the last written bar,
+      or "never back in step". Computed with exact fractions
+      (`tempo::resync`); a tempo ramp in either track makes it "cannot be
+      worked out". Nothing is shown for bars that already start together
+      with the same length.
+
+### 9. Scrolling in notation
+- [x] The wheel scrolls the score up and down; `Shift`+wheel (also `Ctrl`+wheel
+      and pinch) zooms around the pointer. Help text updated.
+
+### 10. Build and tests (items 5 to 9)
+- [x] Merged with the 18.11.2026 and 19.11.2026 work above. `cargo test`: 284
+      passed, 2 ignored. `cargo check --all-targets`: only the three warnings
+      that were already there. Not exercised in a running app: grabbing and
+      Alt-dragging points, the per-track checkbox, the timeline hover text, the
+      checkbox in the RMB menu, wheel and Shift+wheel, and pasting into a real
+      DAW or from Guitar Pro (the clipboard formats follow the clipboard
+      crate's documentation, not checked against those programs). Playback
+      resumed after a device change now continues at the interrupted time
+      (seconds) on the selected track.
+
 ---
 
 ## 🚧 Not yet done / future work
 
 ### Current issues:
+- [ ] "Choose automatically" for MS Basic soundfont does not choose palm muted guitar on palm muted notes, all per-note autochoosing requires verification
+- [ ] Palm muting just says P. M. on an affected note instead of showing a dashed line like in MuseScore or Tuxguitar. Needs reimplementation.
+- [ ] Note lengths aren't autoreadjusted for bars with irrational time signatures
 - [ ] Theme switching (19.08.2026, item 2) covers the biggest-impact colors
       but not every hardcoded one in `app.rs` — smaller accents (e.g. the
       P.M. label, playhead, selection-rectangle colors) weren't audited
@@ -1330,19 +1542,19 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Note dragging (19.08.2026, item 1) can change string, but there's no
       equivalent for *stretching* a note's edges across strings (stretching
       only ever changes duration/start on the note's current string) — not
-      requested, just noting the asymmetry.
-- [ ] Note dragging (18.08.2026, item 6) only moves notes in time
-      (horizontally) — it doesn't support dragging a note to a different
-      string (vertically). Not requested yet, but a natural next step if
-      wanted.
+      requested, just noting the asymmetry. Dev note: that's called BENDING.
 - [ ] Playback tempo ramps (`Progressive` transition) are approximated by a
-      flat average-bpm segment for audio scheduling; the automation graph
+      flat average-bpm segment for audio scheduling (tempo, per track or
+      shared); the automation graph
       shows the true linear ramp, but sample-accurate ramped playback timing
       is still open. Worth a dedicated pass if precise tempo-ramp audio ever
       matters (e.g. a gradual accelerando).
-- [ ] Volume/Pan automation is UI-only scaffolding (disabled options in the
-      Automation Editor's TYPE dropdown) — no per-track automation data
-      model exists yet.
+- [ ] Ctrl+V with a clipboard that holds a MIDI file but no text (copied
+      in another program) does nothing, because egui reports a paste only
+      for text; Edit > Paste takes it. Which clipboard formats a given DAW
+      or Guitar Pro 8 reads is unchecked.
+- [ ] Irrational time signatures stop at denominators of 255 and are not
+      exported to `.tg` / `.gp`; the numerator still stops at 32.
 - [ ] `.tg` export writes a brick that spans a barline as one over-long
       beat; exporting from tab view (where it is already split into tied
       notes) is the faithful path. Unverified against TuxGuitar itself.
@@ -1442,8 +1654,9 @@ right-click submenus and the move / stretch drag previews.
       when it is the length being written), and no length is split into tied
       dotted pieces when it is not a single standard value.
 - [ ] Copy and paste carries notes only: no rests, bar properties or tempo,
-      no paste into another track's bar grid beyond the cursor rule, and not
-      between two running copies of the app.
+      no paste into another track's bar grid beyond the cursor rule, and
+      between two running copies of the app it goes through MIDI (strings
+      and frets are chosen again, effects are lost).
 - [ ] Real chord detection (multiple notes on one tick drawn as a chord block).
 - [ ] Deleting and reordering tracks (`Add Track` exists).
 - [ ] Bar adding/deleting
@@ -1453,7 +1666,7 @@ right-click submenus and the move / stretch drag previews.
       (Note input, show/hide and the open-string zone beside the nut shipped
       12.11.2026, item 5.)
 - [ ] In timeline instead of diamonds for each note display a row of blocks with a block for each existing bar, a block with a width of a bar size/time measure (4/4, 3/4, 6/4) relative to all other bar sizes in the project, so 1/4 is 4x smaller than 4/4, but to make them all visible and clickable, the smallest cannot go smaller than some width amount of pixels, and if it gets to that, make everything get bigger. Each instrument has its own row of bar blocks.
-- [ ] Starting menu with recently opened projects kept in a vertical list, double-clicking opens the project to the edit menu we currently have. There should be a button to create new project with options: 1: name ("Untitled" by default, if it already exists add 1 then 2, etc.), 2. First track instrument Currently only Stringed will work, but also add Orchestra, Drums, MIDI. Stringed has options of Acoustic guitar, Electric guitar, Bass, Other. In the future each will have default playback sound that will be modified with VST3s. 3. Amount of strings selection (up to 12, but in the input menu make any value above inputable.) Add there a button for "Demo project" option will open what we currently have as open-on-startup. New projects are fully empty and only have 1 instrument and 1 bar at 4/4 set to default tempo of 120 bpm.
+- [ ] Starting menu with recently opened projects kept in a vertical list, double-clicking opens the project to the edit menu we currently have. There should be a button to create new project with options: 1: name ("Untitled" by default, if it already exists add 1 then 2, etc.), 2. First track instrument Currently only Stringed will work, replace it with an instruments menu. Stringed has options of Acoustic guitar, Electric guitar, Bass, Other. In the future each will have default playback sound that will be modified with VST3s. 3. Amount of strings selection (up to 12, but in the input menu make any value above inputable.) Add there a button for "Demo project" option will open what we currently have as open-on-startup. New projects are fully empty and only have 1 instrument and 1 bar at 4/4 set to default tempo of 120 bpm.
 - [ ] Make instruments selectable to display multiple of their tabs/notations at the same time (current time of each instrument's notes is the key for synchronization here)
 
 ### Audio / playback (Phase 3)

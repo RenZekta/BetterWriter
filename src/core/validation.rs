@@ -21,6 +21,7 @@ impl StandardExportFormat {
 pub struct CompatibilityReport {
     pub has_polymeter: bool,
     pub has_unaligned_bar_boundaries: bool,
+    pub has_irrational_meter: bool,
     pub standard_exports_enabled: bool,
     pub warning: Option<String>,
 }
@@ -57,12 +58,25 @@ impl CompatibilityReport {
                 != first_signature
         });
 
-        let incompatible = has_polymeter || has_unaligned_bar_boundaries;
+        let has_irrational_meter = project.tracks.iter().any(|track| {
+            track
+                .time_signature_changes
+                .iter()
+                .any(|change| !change.signature.is_regular())
+        });
+
+        let incompatible = has_polymeter || has_unaligned_bar_boundaries || has_irrational_meter;
+        let warning = if has_irrational_meter && !(has_polymeter || has_unaligned_bar_boundaries) {
+            Some("Irrational time signature, incompatible format.".to_owned())
+        } else {
+            incompatible.then(|| "Polyrhythms detected, incompatible format.".to_owned())
+        };
         Self {
             has_polymeter,
             has_unaligned_bar_boundaries,
+            has_irrational_meter,
             standard_exports_enabled: !incompatible,
-            warning: incompatible.then(|| "Polyrhythms detected, incompatible format.".to_owned()),
+            warning,
         }
     }
 }

@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use super::project::{BwxProject, TabNote, Tick};
+use super::project::{BwxProject, InstrumentTrack, TabNote, Tick};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MidiEventKind {
@@ -25,61 +25,68 @@ pub struct ShadowTimeline {
     events: Arc<RwLock<Vec<MidiPlaybackEvent>>>,
 }
 
+/// The note events of one track, in playback order of its bars.
+fn compile_track(written: &InstrumentTrack, events: &mut Vec<MidiPlaybackEvent>) {
+    // Repeats play as extra copies of their bars.
+    let unrolled = written.unrolled_for_playback();
+    let track = unrolled.as_ref().unwrap_or(written);
+    // A tied continuation sustains the previous note instead of striking
+    // again: it emits no NoteOn, and the note before it emits no NoteOff, so
+    // a chain plays as one long note.
+    let continuations: Vec<&TabNote> = track
+        .notes
+        .iter()
+        .filter(|note| track.is_tied_continuation(note))
+        .collect();
+    let is_continued = |note: &TabNote| {
+        continuations.iter().any(|next| {
+            next.string_index == note.string_index && next.abs_tick == note.end_tick()
+        })
+    };
+    let is_continuation = |note: &TabNote| continuations.iter().any(|c| c.id == note.id);
+
+    for note in &track.notes {
+        let key = track.midi_key_for(note);
+        if !is_continuation(note) {
+            events.push(MidiPlaybackEvent {
+                tick: note.abs_tick,
+                kind: MidiEventKind::NoteOn,
+                track_id: track.id,
+                channel: track.channel,
+                key,
+                velocity: note.velocity,
+            });
+        }
+        if !is_continued(note) {
+            events.push(MidiPlaybackEvent {
+                tick: note.end_tick(),
+                kind: MidiEventKind::NoteOff,
+                track_id: track.id,
+                channel: track.channel,
+                key,
+                velocity: 0,
+            });
+        }
+    }
+}
+
+fn sort_events(events: &mut [MidiPlaybackEvent]) {
+    events.sort_by_key(|event| {
+        let off_first = match event.kind {
+            MidiEventKind::NoteOff => 0,
+            MidiEventKind::NoteOn => 1,
+        };
+        (event.tick, off_first, event.channel, event.key)
+    });
+}
+
 impl ShadowTimeline {
     pub fn compile_from_project(project: &BwxProject) -> Vec<MidiPlaybackEvent> {
         let mut events = Vec::new();
-
-        for written in &project.tracks {
-            // Repeats play as extra copies of their bars.
-            let unrolled = written.unrolled_for_playback();
-            let track = unrolled.as_ref().unwrap_or(written);
-            // A tied continuation sustains the previous note instead of
-            // striking again: it emits no NoteOn, and the note before it
-            // emits no NoteOff, so a chain plays as one long note.
-            let continuations: Vec<&TabNote> = track
-                .notes
-                .iter()
-                .filter(|note| track.is_tied_continuation(note))
-                .collect();
-            let is_continued = |note: &TabNote| {
-                continuations.iter().any(|next| {
-                    next.string_index == note.string_index && next.abs_tick == note.end_tick()
-                })
-            };
-            let is_continuation = |note: &TabNote| continuations.iter().any(|c| c.id == note.id);
-
-            for note in &track.notes {
-                let key = track.midi_key_for(note);
-                if !is_continuation(note) {
-                    events.push(MidiPlaybackEvent {
-                        tick: note.abs_tick,
-                        kind: MidiEventKind::NoteOn,
-                        track_id: track.id,
-                        channel: track.channel,
-                        key,
-                        velocity: note.velocity,
-                    });
-                }
-                if !is_continued(note) {
-                    events.push(MidiPlaybackEvent {
-                        tick: note.end_tick(),
-                        kind: MidiEventKind::NoteOff,
-                        track_id: track.id,
-                        channel: track.channel,
-                        key,
-                        velocity: 0,
-                    });
-                }
-            }
+        for track in &project.tracks {
+            compile_track(track, &mut events);
         }
-
-        events.sort_by_key(|event| {
-            let off_first = match event.kind {
-                MidiEventKind::NoteOff => 0,
-                MidiEventKind::NoteOn => 1,
-            };
-            (event.tick, off_first, event.channel, event.key)
-        });
+        sort_events(&mut events);
         events
     }
 
@@ -91,31 +98,14 @@ impl ShadowTimeline {
     }
 
     pub fn replace_track(&self, project: &BwxProject, track_id: u64) {
-        let mut compiled_track = Self::compile_from_project(&BwxProject {
-            schema_version: project.schema_version,
-            title: project.title.clone(),
-            tempo_points: project.tempo_points.clone(),
-            tracks: project
-                .tracks
-                .iter()
-                .filter(|track| track.id == track_id)
-                .cloned()
-                .collect(),
-            next_note_id: project.next_note_id,
-            master_chain: Vec::new(),
-            master_fx_bypassed: false,
-        });
-
+        let mut compiled_track = Vec::new();
+        if let Some(track) = project.track(track_id) {
+            compile_track(track, &mut compiled_track);
+        }
         if let Ok(mut guard) = self.events.write() {
             guard.retain(|event| event.track_id != track_id);
             guard.append(&mut compiled_track);
-            guard.sort_by_key(|event| {
-                let off_first = match event.kind {
-                    MidiEventKind::NoteOff => 0,
-                    MidiEventKind::NoteOn => 1,
-                };
-                (event.tick, off_first, event.channel, event.key)
-            });
+            sort_events(&mut guard);
         }
     }
 

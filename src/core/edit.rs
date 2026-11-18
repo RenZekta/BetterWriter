@@ -1,5 +1,5 @@
 use super::project::{
-    BwxProject, NoteEffects, RestNode, TICKS_PER_QUARTER, TabNote, TempoPoint, TempoTransition,
+    BwxProject, NoteEffects, RestNode, TICKS_PER_QUARTER, TabNote,
     Tick, TimeSignature,
 };
 
@@ -115,74 +115,6 @@ impl BwxProject {
                 .sort_by_key(|change| change.at_tick);
         }
         true
-    }
-
-    /// Insert or replace a point on the project-wide tempo automation
-    /// timeline. Tempo is global (not per-track), unlike time signatures.
-    pub fn set_tempo_point(
-        &mut self,
-        at_tick: Tick,
-        bpm: f32,
-        transition: TempoTransition,
-    ) -> bool {
-        if !bpm.is_finite() || bpm <= 0.0 {
-            return false;
-        }
-        let at_tick = at_tick.max(0);
-        let bpm = bpm.clamp(1.0, 999.0);
-        if let Some(point) = self
-            .tempo_points
-            .iter_mut()
-            .find(|point| point.at_tick == at_tick)
-        {
-            if point.bpm == bpm && point.transition == transition {
-                return false;
-            }
-            point.bpm = bpm;
-            point.transition = transition;
-        } else {
-            self.tempo_points.push(TempoPoint {
-                at_tick,
-                bpm,
-                transition,
-                hidden: false,
-            });
-            self.tempo_points.sort_by_key(|point| point.at_tick);
-        }
-        true
-    }
-
-    /// Toggle whether a tempo point's "♩=bpm" label is drawn above the staff.
-    pub fn set_tempo_point_hidden(&mut self, at_tick: Tick, hidden: bool) -> bool {
-        let Some(point) = self
-            .tempo_points
-            .iter_mut()
-            .find(|point| point.at_tick == at_tick)
-        else {
-            return false;
-        };
-        if point.hidden == hidden {
-            return false;
-        }
-        point.hidden = hidden;
-        true
-    }
-
-    /// Removes the tempo point at `at_tick`. Refuses to remove the point at
-    /// (or before) tick 0, since playback always needs a starting tempo.
-    pub fn delete_tempo_point(&mut self, at_tick: Tick) -> bool {
-        if at_tick <= 0 {
-            return false;
-        }
-        let before = self.tempo_points.len();
-        self.tempo_points.retain(|point| point.at_tick != at_tick);
-        self.tempo_points.len() != before
-    }
-
-    /// Resets tempo automation back to a single flat point, mirroring Guitar
-    /// Pro's "Remove automations".
-    pub fn clear_tempo_automation(&mut self, bpm: f32) {
-        self.tempo_points = vec![TempoPoint::new(0, bpm)];
     }
 
     pub fn set_note_duration_fluid(
@@ -1184,54 +1116,6 @@ mod tests {
         assert_eq!(track.measure_bounds_at(2_400), (0, 2_500));
         assert_eq!(track.measure_bounds_at(2_500), (2_500, 5_380));
         assert_eq!(track.measure_bounds_at(5_380), (5_380, 8_260));
-    }
-
-    #[test]
-    fn tempo_point_holds_flat_until_the_next_point() {
-        let mut project = BwxProject::demo();
-        assert_eq!(project.tempo_at(0), 120.0);
-        assert!(project.set_tempo_point(
-            TICKS_PER_QUARTER * 4,
-            180.0,
-            TempoTransition::Constant,
-        ));
-        assert_eq!(project.tempo_at(0), 120.0);
-        assert_eq!(project.tempo_at(TICKS_PER_QUARTER * 2), 120.0);
-        assert_eq!(project.tempo_at(TICKS_PER_QUARTER * 4), 180.0);
-        assert_eq!(project.tempo_at(TICKS_PER_QUARTER * 10), 180.0);
-    }
-
-    #[test]
-    fn progressive_tempo_point_ramps_toward_the_next_point() {
-        let mut project = BwxProject::demo();
-        assert!(project.set_tempo_point(
-            0,
-            120.0,
-            TempoTransition::Progressive,
-        ));
-        assert!(project.set_tempo_point(
-            TICKS_PER_QUARTER * 4,
-            220.0,
-            TempoTransition::Constant,
-        ));
-        assert_eq!(project.interpolated_tempo_at(0), 120.0);
-        assert_eq!(project.interpolated_tempo_at(TICKS_PER_QUARTER * 4), 220.0);
-        let midpoint = project.interpolated_tempo_at(TICKS_PER_QUARTER * 2);
-        assert!((midpoint - 170.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn deleting_the_first_tempo_point_is_refused() {
-        let mut project = BwxProject::demo();
-        assert!(!project.delete_tempo_point(0));
-        assert_eq!(project.tempo_points.len(), 1);
-        assert!(project.set_tempo_point(
-            TICKS_PER_QUARTER * 4,
-            90.0,
-            TempoTransition::Constant,
-        ));
-        assert!(project.delete_tempo_point(TICKS_PER_QUARTER * 4));
-        assert_eq!(project.tempo_points.len(), 1);
     }
 
     fn quarter_fill() -> RestFill {

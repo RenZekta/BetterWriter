@@ -407,7 +407,8 @@ fn stem_points_up(chords: &[&Chord]) -> bool {
 /// Ticks per beaming unit for a time signature: the denominator's note, or
 /// three of them in compound meters such as 6/8 and 12/8.
 pub fn beat_ticks_for(numerator: u32, denominator: u32) -> Tick {
-    let unit = TICKS_PER_QUARTER * 4 / denominator.max(1) as Tick;
+    let denominator = denominator.max(1) as Tick;
+    let unit = ((TICKS_PER_QUARTER * 8 + denominator) / (denominator * 2)).max(1);
     if denominator == 8 && matches!(numerator, 6 | 9 | 12 | 15) {
         unit * 3
     } else {

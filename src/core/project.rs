@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::automation::{AutomationPoint, value_at};
+
 pub type Tick = i64;
 pub const TICKS_PER_QUARTER: Tick = 960;
 
@@ -17,9 +19,17 @@ impl TimeSignature {
         }
     }
 
+    /// Denominators that are a power of two. Any other denominator is
+    /// "irrational": its bar length is rounded to a whole tick and standard
+    /// score formats cannot store it.
+    pub fn is_regular(self) -> bool {
+        self.denominator.is_power_of_two()
+    }
+
     pub fn measure_ticks(self) -> Tick {
         let denominator = self.denominator.max(1) as Tick;
-        self.numerator as Tick * TICKS_PER_QUARTER * 4 / denominator
+        let whole = self.numerator as Tick * TICKS_PER_QUARTER * 4;
+        ((whole + denominator / 2) / denominator).max(1)
     }
 }
 
@@ -39,9 +49,8 @@ pub enum TempoTransition {
     Progressive,
 }
 
-/// One point on the project's tempo automation timeline. Tempo is global
-/// (not per-track) since a piece has one clock even when individual
-/// instruments run their own bar/time-signature grid.
+/// One point of a tempo curve. The curve is shared by the project, or each
+/// track has its own when the project uses per-track automation.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TempoPoint {
     pub at_tick: Tick,
@@ -404,6 +413,17 @@ pub struct InstrumentTrack {
     pub name: String,
     pub channel: u8,
     pub program: u8,
+    /// Soundfont bank of `program`; 128 holds the drum kits.
+    #[serde(default)]
+    pub bank: u16,
+    /// The sound follows the instrument (`instrument_id`) instead of the
+    /// picked `bank` and `program`.
+    #[serde(default)]
+    pub sound_auto: bool,
+    /// Id of the instrument in `core::instruments`; empty in files that
+    /// only know a `stringed_variant`.
+    #[serde(default)]
+    pub instrument_id: String,
     #[serde(default)]
     pub solo: bool,
     #[serde(default)]
@@ -431,21 +451,60 @@ pub struct InstrumentTrack {
     /// The whole chain is switched off: the track plays without its plug-ins.
     #[serde(default)]
     pub fx_bypassed: bool,
+    /// This track's own automation, used instead of the project's curves
+    /// while `BwxProject::per_track_automation` is on. An empty tempo curve
+    /// falls back to the project's.
+    #[serde(default)]
+    pub tempo_points: Vec<TempoPoint>,
+    #[serde(default)]
+    pub volume_points: Vec<AutomationPoint>,
+    #[serde(default)]
+    pub pan_points: Vec<AutomationPoint>,
 }
 
 impl InstrumentTrack {
-    /// Changes the instrument type, which sets the clef and the sound list.
-    /// A sound that was one of the old type's own suggestions follows the
-    /// change to the new type's default when the new type does not suggest
-    /// it; a sound picked from outside the old list is kept. Tuning and
-    /// notes are untouched.
-    pub fn set_stringed_variant(&mut self, variant: StringedVariant) {
-        use crate::core::sounds::recommended_programs;
-        let was_stock = recommended_programs(self.stringed_variant).contains(&self.program);
-        if was_stock && !recommended_programs(variant).contains(&self.program) {
-            self.program = variant.default_program();
+    /// The instrument the track is, falling back to the one its tab-view
+    /// type stands for when the file named none.
+    pub fn instrument_def(&self) -> Option<&'static crate::core::instruments::InstrumentDef> {
+        use crate::core::{instruments::instrument, sounds::default_instrument_id};
+        instrument(&self.instrument_id)
+            .or_else(|| instrument(default_instrument_id(self.stringed_variant)))
+    }
+
+    /// Bank and program the synth plays the track with.
+    pub fn sound(&self) -> (u16, u8) {
+        match self.instrument_def() {
+            Some(def) if self.sound_auto => (def.bank, def.program),
+            _ => (self.bank, self.program),
         }
-        self.stringed_variant = variant;
+    }
+
+    /// Makes the track another instrument: its tab-view type follows, and so
+    /// does the sound while it is automatic. A sound that was picked by hand
+    /// stays, as do the tuning and the notes.
+    pub fn set_instrument(&mut self, def: &'static crate::core::instruments::InstrumentDef) {
+        self.instrument_id = def.id.to_owned();
+        self.stringed_variant = crate::core::sounds::variant_for_instrument(def);
+        if self.sound_auto {
+            self.bank = def.bank;
+            self.program = def.program;
+        }
+    }
+
+    /// Picks a sound by hand.
+    pub fn set_sound(&mut self, bank: u16, program: u8) {
+        self.sound_auto = false;
+        self.bank = bank;
+        self.program = program;
+    }
+
+    /// Lets the instrument choose the sound again.
+    pub fn set_sound_automatic(&mut self) {
+        self.sound_auto = true;
+        if let Some(def) = self.instrument_def() {
+            self.bank = def.bank;
+            self.program = def.program;
+        }
     }
 
     pub fn standard_guitar(id: u64, name: impl Into<String>, channel: u8) -> Self {
@@ -454,6 +513,9 @@ impl InstrumentTrack {
             name: name.into(),
             channel,
             program: 24,
+            bank: 0,
+            sound_auto: false,
+            instrument_id: "guitar-steel".to_owned(),
             solo: false,
             mute: false,
             volume: 100,
@@ -471,6 +533,9 @@ impl InstrumentTrack {
             bar_marks: Vec::new(),
             sound_chain: Vec::new(),
             fx_bypassed: false,
+            tempo_points: Vec::new(),
+            volume_points: Vec::new(),
+            pan_points: Vec::new(),
         }
     }
 
@@ -490,6 +555,9 @@ impl InstrumentTrack {
             name: name.into(),
             channel,
             program: stringed_variant.default_program(),
+            bank: 0,
+            sound_auto: true,
+            instrument_id: crate::core::sounds::default_instrument_id(stringed_variant).to_owned(),
             solo: false,
             mute: false,
             volume: 100,
@@ -507,6 +575,9 @@ impl InstrumentTrack {
             bar_marks: Vec::new(),
             sound_chain: Vec::new(),
             fx_bypassed: false,
+            tempo_points: Vec::new(),
+            volume_points: Vec::new(),
+            pan_points: Vec::new(),
         }
     }
 
@@ -630,10 +701,21 @@ impl InstrumentTrack {
 pub struct BwxProject {
     pub schema_version: u16,
     pub title: String,
-    /// Tempo automation timeline. Always has at least one point; the point
-    /// at or before tick 0 governs playback until the next point takes over.
-    /// See `tempo_at` / `interpolated_tempo_at`.
+    /// Shared tempo curve. Always has at least one point; the point at or
+    /// before tick 0 governs playback until the next point takes over. See
+    /// `tempo_at`.
     pub tempo_points: Vec<TempoPoint>,
+    /// Shared volume and pan curves, applied to every track. They are empty
+    /// until a point is added; before the first point a track plays at its
+    /// own volume and pan.
+    #[serde(default)]
+    pub volume_points: Vec<AutomationPoint>,
+    #[serde(default)]
+    pub pan_points: Vec<AutomationPoint>,
+    /// Each track follows its own tempo, volume and pan curves instead of the
+    /// shared ones.
+    #[serde(default)]
+    pub per_track_automation: bool,
     pub tracks: Vec<InstrumentTrack>,
     pub next_note_id: u64,
     /// Plug-ins the mix of every track passes through last.
@@ -749,6 +831,9 @@ impl BwxProject {
             schema_version: 1,
             title: "BetterWriter sketch".to_owned(),
             tempo_points: vec![TempoPoint::new(0, 120.0)],
+            volume_points: Vec::new(),
+            pan_points: Vec::new(),
+            per_track_automation: false,
             tracks: vec![guitar, baritone],
             next_note_id: 8,
             master_chain: Vec::new(),
@@ -775,6 +860,9 @@ impl BwxProject {
             schema_version: 1,
             title: title.into(),
             tempo_points: vec![TempoPoint::new(0, 120.0)],
+            volume_points: Vec::new(),
+            pan_points: Vec::new(),
+            per_track_automation: false,
             tracks: vec![track],
             next_note_id: 1,
             master_chain: Vec::new(),
@@ -803,22 +891,15 @@ impl BwxProject {
         }
     }
 
-    /// Where playback ends: the end of the last bar that holds a note, over
-    /// every track. `None` when the project has no notes.
-    pub fn playback_end_tick(&self) -> Option<Tick> {
-        self.tracks
-            .iter()
-            .filter_map(InstrumentTrack::playback_end_tick)
-            .max()
-    }
-
     /// Appends an empty track shaped like `source_id`: same instrument type,
     /// tuning, sound, bars and time signatures, but no notes and a fresh
     /// name, id and channel. Returns the new track's id.
     pub fn add_track_like(&mut self, source_id: u64) -> Option<u64> {
         let source = self.track(source_id)?;
         let id = self.tracks.iter().map(|track| track.id).max().unwrap_or(0) + 1;
-        let base = source.stringed_variant.label();
+        let base = source
+            .instrument_def()
+            .map_or_else(|| source.stringed_variant.label().to_owned(), |def| def.name.to_owned());
         let name = (2..)
             .map(|n| format!("{base} {n}"))
             .find(|candidate| self.tracks.iter().all(|track| track.name != *candidate))?;
@@ -841,38 +922,13 @@ impl BwxProject {
         self.tracks.iter_mut().find(|track| track.id == id)
     }
 
-    /// The flat bpm governing `tick`: the latest tempo point at or before it.
-    /// Falls back to 120 if the project somehow has no points at all (every
-    /// constructor seeds one at tick 0, so this is only a defensive floor).
+    /// The flat bpm of the shared tempo curve at `tick`: the latest point at
+    /// or before it. Falls back to 120 if the project somehow has no points
+    /// at all (every constructor seeds one at tick 0, so this is only a
+    /// defensive floor).
     pub fn tempo_at(&self, tick: Tick) -> f32 {
-        self.tempo_points
-            .iter()
-            .filter(|point| point.at_tick <= tick)
-            .max_by_key(|point| point.at_tick)
-            .map(|point| point.bpm)
-            .unwrap_or(120.0)
-    }
-
-    /// Like `tempo_at`, but linearly ramps through a `Progressive` point
-    /// toward the next one instead of holding flat - this is what the
-    /// automation graph and the on-staff "♩=bpm" labels use so they read as
-    /// a smooth ramp, matching the Guitar Pro automation editor.
-    pub fn interpolated_tempo_at(&self, tick: Tick) -> f32 {
-        let mut sorted: Vec<&TempoPoint> = self.tempo_points.iter().collect();
-        sorted.sort_by_key(|point| point.at_tick);
-        let Some(governing_index) = sorted.iter().rposition(|point| point.at_tick <= tick) else {
-            return sorted.first().map(|point| point.bpm).unwrap_or(120.0);
-        };
-        let governing = sorted[governing_index];
-        if governing.transition == TempoTransition::Progressive
-            && let Some(next) = sorted.get(governing_index + 1)
-        {
-            let span = (next.at_tick - governing.at_tick).max(1) as f32;
-            let t = ((tick - governing.at_tick) as f32 / span).clamp(0.0, 1.0);
-            governing.bpm + (next.bpm - governing.bpm) * t
-        } else {
-            governing.bpm
-        }
+        let points: Vec<AutomationPoint> = self.tempo_points.iter().map(Into::into).collect();
+        value_at(&points, tick).unwrap_or(120.0)
     }
 
     pub fn allocate_note_id(&mut self) -> u64 {
@@ -892,18 +948,54 @@ fn default_track_pan() -> i8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn irrational_signatures_have_whole_tick_bars() {
+        assert_eq!(TimeSignature::new(4, 6).measure_ticks(), 2560);
+        assert_eq!(TimeSignature::new(5, 12).measure_ticks(), 1600);
+        // 3840 / 7 is 548.57: rounded to the nearest tick.
+        assert_eq!(TimeSignature::new(1, 7).measure_ticks(), 549);
+        assert_eq!(TimeSignature::new(3, 4).measure_ticks(), 2880);
+        assert!(TimeSignature::new(3, 4).is_regular());
+        assert!(!TimeSignature::new(4, 6).is_regular());
+    }
+
+    #[test]
+    fn an_irrational_bar_blocks_standard_exports() {
+        let mut project = BwxProject::demo();
+        let track_id = project.tracks[0].id;
+        let report = crate::core::CompatibilityReport::analyze(&project, 20_000);
+        assert!(!report.has_irrational_meter);
+        for track in &mut project.tracks {
+            track.time_signature_changes.clear();
+        }
+        assert!(project.set_track_time_signature(track_id, 0, TimeSignature::new(5, 12)));
+        let report = crate::core::CompatibilityReport::analyze(&project, 20_000);
+        assert!(report.has_irrational_meter);
+        assert!(!report.standard_exports_enabled);
+        assert!(project.track(track_id).unwrap().bar_spans()[0].end == 1600);
+    }
+
     use super::*;
+
+    /// Where playback ends over every track.
+    fn playback_end(project: &BwxProject) -> Option<Tick> {
+        project
+            .tracks
+            .iter()
+            .filter_map(InstrumentTrack::playback_end_tick)
+            .max()
+    }
 
     #[test]
     fn playback_ends_with_the_last_bar_that_holds_a_note() {
         let mut project = BwxProject::demo();
         // Demo guitar notes end three quarters into a 4/4 bar; the 5/8 track
         // ends inside its first bar.
-        assert_eq!(project.playback_end_tick(), Some(TICKS_PER_QUARTER * 4));
+        assert_eq!(playback_end(&project), Some(TICKS_PER_QUARTER * 4));
 
         project.tracks[0].bar_count = 3;
         project.insert_note(1, TICKS_PER_QUARTER * 9, TICKS_PER_QUARTER, 0, 1);
-        assert_eq!(project.playback_end_tick(), Some(TICKS_PER_QUARTER * 12));
+        assert_eq!(playback_end(&project), Some(TICKS_PER_QUARTER * 12));
     }
 
     #[test]
@@ -912,7 +1004,7 @@ mod tests {
         project.tracks[0].notes.clear();
         project.tracks[1].notes.clear();
         project.insert_note(1, 0, TICKS_PER_QUARTER * 4, 0, 1);
-        assert_eq!(project.playback_end_tick(), Some(TICKS_PER_QUARTER * 4));
+        assert_eq!(playback_end(&project), Some(TICKS_PER_QUARTER * 4));
     }
 
     #[test]
@@ -923,7 +1015,7 @@ mod tests {
             StringedVariant::Bass,
             4,
         );
-        assert_eq!(project.playback_end_tick(), None);
+        assert_eq!(playback_end(&project), None);
     }
 
     #[test]
@@ -955,34 +1047,60 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_instrument_moves_a_stock_sound_to_the_new_default() {
-        let mut project = BwxProject::demo();
-        let track = &mut project.tracks[0];
-        track.set_stringed_variant(StringedVariant::Bass);
-        assert_eq!(track.stringed_variant, StringedVariant::Bass);
-        assert_eq!(track.program, StringedVariant::Bass.default_program());
+    fn a_new_track_chooses_its_sound_automatically() {
+        let track = InstrumentTrack::new_track(
+            1,
+            "Bass",
+            0,
+            InstrumentFamily::Stringed,
+            StringedVariant::Bass,
+            4,
+        );
+        assert!(track.sound_auto);
+        assert_eq!(track.sound(), (0, 33));
     }
 
     #[test]
-    fn changing_the_instrument_keeps_a_sound_the_new_type_also_suggests() {
-        let mut project = BwxProject::demo();
-        let track = &mut project.tracks[0];
-        track.program = 26;
-        track.set_stringed_variant(StringedVariant::ElectricGuitar);
-        assert_eq!(track.program, 26);
+    fn an_automatic_sound_follows_the_instrument() {
+        let mut track = InstrumentTrack::new_track(
+            1,
+            "Guitar",
+            0,
+            InstrumentFamily::Stringed,
+            StringedVariant::AcousticGuitar,
+            6,
+        );
+        let flute = crate::core::instruments::instrument("flute").unwrap();
+        track.set_instrument(flute);
+        assert_eq!(track.instrument_id, "flute");
+        assert_eq!(track.sound(), (flute.bank, flute.program));
+        assert_eq!(track.stringed_variant, StringedVariant::Other);
     }
 
     #[test]
-    fn changing_the_instrument_keeps_a_custom_sound_and_the_notes() {
+    fn a_picked_sound_survives_a_change_of_instrument() {
         let mut project = BwxProject::demo();
         let track = &mut project.tracks[0];
-        track.program = 80;
+        track.set_sound(8, 25);
         let notes = track.notes.clone();
         let tuning = track.tuning.clone();
-        track.set_stringed_variant(StringedVariant::Bass);
-        assert_eq!(track.program, 80);
+        let bass = crate::core::instruments::instrument("bass-guitar").unwrap();
+        track.set_instrument(bass);
+        assert_eq!(track.sound(), (8, 25));
+        assert_eq!(track.stringed_variant, StringedVariant::Bass);
         assert_eq!(track.notes, notes);
         assert_eq!(track.tuning, tuning);
+        track.set_sound_automatic();
+        assert_eq!(track.sound(), (bass.bank, bass.program));
+    }
+
+    #[test]
+    fn a_track_saved_without_an_instrument_id_uses_its_tab_type() {
+        let mut track = BwxProject::demo().tracks[0].clone();
+        track.instrument_id.clear();
+        track.stringed_variant = StringedVariant::ElectricGuitar;
+        assert_eq!(track.instrument_def().unwrap().id, "electric-guitar");
+        assert_eq!(track.sound(), (track.bank, track.program));
     }
 
     #[test]

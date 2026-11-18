@@ -21,7 +21,19 @@ pub struct LivePlugin {
     pub id: u64,
     pub is_instrument: bool,
     pub instance: Mutex<Instance>,
+    /// Taken once, when the plug-in starts, so the UI never needs the lock
+    /// the audio thread runs the plug-in under. Every frame the UI held that
+    /// lock was a block the audio thread had to skip, which is a click.
+    controller: UiHandle,
 }
+
+/// The controller half of a plug-in, which only the UI thread touches; the
+/// audio thread never looks at it.
+struct UiHandle(Option<ControllerHandle>);
+
+// SAFETY: see `UiHandle`; the processing half is behind the mutex.
+unsafe impl Send for UiHandle {}
+unsafe impl Sync for UiHandle {}
 
 /// What the audio thread runs: one chain per MIDI channel, then the master.
 #[derive(Default)]
@@ -73,8 +85,17 @@ impl PluginHost {
         }
     }
 
+    /// Sets the rate new plug-ins start at and moves the running ones to it.
     pub fn set_sample_rate(&mut self, sample_rate: f64) {
+        if (sample_rate - self.sample_rate).abs() < 0.5 {
+            return;
+        }
         self.sample_rate = sample_rate;
+        for live in self.live.values() {
+            if let Ok(mut instance) = live.instance.lock() {
+                instance.set_sample_rate(sample_rate);
+            }
+        }
     }
 
     /// Why a slot's plug-in is not running, if it failed to start.
@@ -124,11 +145,7 @@ impl PluginHost {
         };
         let instance = Instance::create(&module, &slot.class_id, self.sample_rate)?;
         instance.load_state(&slot.state);
-        Ok(Arc::new(LivePlugin {
-            id: slot.id,
-            is_instrument: slot.is_instrument,
-            instance: Mutex::new(instance),
-        }))
+        Ok(Arc::new(LivePlugin::new(slot.id, slot.is_instrument, instance)))
     }
 
     /// Drops every plug-in no slot of `project` names any more, and ones
@@ -202,34 +219,105 @@ impl PluginHost {
 }
 
 impl LivePlugin {
+    pub fn new(id: u64, is_instrument: bool, instance: Instance) -> Self {
+        let controller = UiHandle(instance.controller_handle());
+        Self {
+            id,
+            is_instrument,
+            instance: Mutex::new(instance),
+            controller,
+        }
+    }
+
     /// The handle the UI thread shows parameters through.
     pub fn controller_handle(&self) -> Option<ControllerHandle> {
-        self.instance.lock().ok().and_then(|instance| instance.controller_handle())
+        self.controller.0.clone()
     }
 }
 
-/// A plug-in's own editor, open in a window of its own.
+/// Where a plug-in's editor is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorMode {
+    /// A window of its own, with a title bar.
+    Floating,
+    /// A child window laid over a part of the program's own window.
+    Embedded,
+}
+
+/// A plug-in's own editor, open in a native window.
 pub struct EditorWindow {
     // The view comes off before its window goes.
     editor: Editor,
     window: NativeWindow,
+    mode: EditorMode,
+    /// The size the plug-in wants, in pixels.
+    size: (i32, i32),
+    can_resize: bool,
+    /// The size last given to the view, so it is only told about changes.
+    last_view_size: Option<(i32, i32)>,
+}
+
+fn editors_need_windows() -> Result<(), String> {
+    if cfg!(windows) {
+        Ok(())
+    } else {
+        Err(
+            "Plug-in editor windows are only available on Windows for now; the parameters work everywhere"
+                .to_owned(),
+        )
+    }
 }
 
 impl EditorWindow {
-    pub fn open(title: &str, plugin: &LivePlugin) -> Result<EditorWindow, String> {
-        if !cfg!(windows) {
-            return Err(
-                "Plug-in editor windows are only available on Windows for now; the parameters below work everywhere"
-                    .to_owned(),
-            );
-        }
+    /// Opens the editor in a window of its own, owned by `owner` (the
+    /// program's window, which it then stays above; null for none).
+    pub fn open(title: &str, plugin: &LivePlugin, owner: *mut std::ffi::c_void) -> Result<EditorWindow, String> {
+        editors_need_windows()?;
         let handle = plugin.controller_handle().ok_or("the plug-in has no controller")?;
         let mut editor = Editor::new(handle.controller())?;
         let (width, height) = editor.size();
-        let window = NativeWindow::create(title, width, height)?;
+        let can_resize = editor.can_resize();
+        let window = NativeWindow::create(title, width, height, can_resize, owner)?;
         editor.attach(window.handle())?;
         window.focus();
-        Ok(EditorWindow { editor, window })
+        window.redraw();
+        Ok(EditorWindow {
+            editor,
+            window,
+            mode: EditorMode::Floating,
+            size: (width, height),
+            can_resize,
+            last_view_size: Some((width, height)),
+        })
+    }
+
+    /// Opens the editor as a child of the program's main window `parent`. It
+    /// stays hidden until `place` puts it somewhere.
+    pub fn open_embedded(parent: *mut std::ffi::c_void, plugin: &LivePlugin) -> Result<EditorWindow, String> {
+        editors_need_windows()?;
+        let handle = plugin.controller_handle().ok_or("the plug-in has no controller")?;
+        let mut editor = Editor::new(handle.controller())?;
+        let (width, height) = editor.size();
+        let can_resize = editor.can_resize();
+        let window = NativeWindow::create_child(parent, width, height)?;
+        editor.attach(window.handle())?;
+        Ok(EditorWindow {
+            editor,
+            window,
+            mode: EditorMode::Embedded,
+            size: (width, height),
+            can_resize,
+            last_view_size: Some((width, height)),
+        })
+    }
+
+    pub fn mode(&self) -> EditorMode {
+        self.mode
+    }
+
+    /// The size the plug-in's editor wants, in pixels.
+    pub fn wanted_size(&self) -> (i32, i32) {
+        self.size
     }
 
     /// False once the user closed the window.
@@ -237,11 +325,59 @@ impl EditorWindow {
         self.window.is_open()
     }
 
-    /// Follows a size the plug-in asked for.
+    /// Follows a size the plug-in asked for, and, in a window the user can
+    /// resize, tells the editor the window's new size.
     pub fn update(&mut self) {
         if let Some((width, height)) = self.editor.take_resize_request() {
-            self.window.resize(width, height);
+            self.size = (width, height);
+            self.last_view_size = Some((width, height));
+            if self.mode == EditorMode::Floating {
+                self.window.resize(width, height);
+            }
         }
+        if self.mode == EditorMode::Floating
+            && self.window.is_resizable()
+            && let Some(client) = self.window.client_size()
+            && client.0 > 0
+            && client.1 > 0
+            && Some(client) != self.last_view_size
+        {
+            self.editor.resize(client.0, client.1);
+            self.last_view_size = Some(client);
+        }
+    }
+
+    /// Puts an embedded editor over a rectangle of the main window (pixels),
+    /// or hides it. A hidden editor is left at the size it had.
+    pub fn place(&mut self, x: i32, y: i32, width: i32, height: i32, visible: bool) {
+        if self.mode != EditorMode::Embedded {
+            return;
+        }
+        if !visible {
+            self.window.hide();
+            return;
+        }
+        // An editor that cannot be resized keeps its own size, cut off where
+        // the room given to it ends.
+        let (width, height) = if self.can_resize {
+            (width, height)
+        } else {
+            (self.size.0.min(width), self.size.1.min(height))
+        };
+        if self.can_resize && self.last_view_size != Some((width, height)) {
+            self.editor.resize(width, height);
+            self.last_view_size = Some((width, height));
+        }
+        self.window.place(x, y, width, height, visible);
+    }
+
+    /// True while the keyboard goes to the editor.
+    pub fn has_keyboard(&self) -> bool {
+        self.window.has_keyboard()
+    }
+
+    pub fn can_resize(&self) -> bool {
+        self.can_resize
     }
 
     pub fn focus(&self) {

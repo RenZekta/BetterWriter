@@ -24,5 +24,8 @@ cargo run
 
 
 
+## Releases
+The version lives in `.github/VERSION`. Changing it and pushing to `main` builds Windows, Linux and macOS packages and publishes a release (see `.github/workflows/build.yml`). Unpack a package anywhere; the program finds `assets/soundfonts` next to itself.
+
 ## Contribution
 Use the roadmap in [Plan.md](Plan.md) for general understanding of the project, make sure your agent follows [AGENTS.md](AGENTS.md)

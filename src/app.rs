@@ -6,12 +6,14 @@ use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, 
 use crate::{
     audio::AudioRuntime,
     core::{
-        BwxProject, CompatibilityReport, DurationChoice, InstrumentFamily, InstrumentTrack,
+        AutomationLane, AutomationPoint, BwxProject, CompatibilityReport, DurationChoice, InstrumentFamily, InstrumentTrack,
         MidiEventKind, NoteClip, NoteEffects, RestFill, ShadowTimeline, SoundChainSlot,
-        StandardExportFormat, StretchEdge, StringedVariant, TICKS_PER_QUARTER, TempoTransition,
-        Tick, TimeSignature,
+        Scope, StandardExportFormat, StretchEdge, StringedVariant, TICKS_PER_QUARTER,
+        TempoTransition, Tick, TimeSignature,
+        automation::{interpolated_value_at, value_at},
         bars::{BarMove, BarRef},
-        sounds::{sound_choices, sound_name},
+        instruments::InstrumentDef,
+        sounds::sound_label,
     },
     format,
     fretboard::{self, FretboardFrame, Inlay},
@@ -25,7 +27,10 @@ use crate::{
     plugins::{PluginKind, PluginScanner, ScannedPlugin, host::PluginHost},
 };
 
+mod floating;
 mod fx_chain;
+mod sound_picker;
+mod system_clipboard;
 mod timeline;
 
 /// The keyboard-driven write cursor. It points at a `(tick, string)` cell on
@@ -295,62 +300,29 @@ impl SystemMetrics {
     }
 }
 
-/// Which automation lane is being edited in the Automation Editor. Only
-/// `Tempo` is wired up to real project data today; `Volume`/`Pan` are shown
-/// (mirroring Guitar Pro's dropdown) but disabled until per-track automation
-/// exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AutomationType {
-    Tempo,
-    Volume,
-    Pan,
-}
-
-impl AutomationType {
-    const ALL: [AutomationType; 3] = [
-        AutomationType::Tempo,
-        AutomationType::Volume,
-        AutomationType::Pan,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            AutomationType::Tempo => "Tempo",
-            AutomationType::Volume => "Volume",
-            AutomationType::Pan => "Pan",
-        }
-    }
-
-    fn is_implemented(self) -> bool {
-        matches!(self, AutomationType::Tempo)
-    }
-}
-
 /// What the graph-area drag gesture is currently doing.
 #[derive(Clone, Debug, PartialEq)]
 enum AutomationDragMode {
     Idle,
-    /// Dragging one or more selected points together. Elastic snapping (see
-    /// `show_tempo_graph`) needs each point's position *as it was when the
-    /// drag started* - recomputing every frame from a fixed baseline plus
-    /// the total raw drag distance, rather than incrementally re-snapping
-    /// an already-snapped position, is what keeps a small nudge from
-    /// compounding into a runaway jump.
+    /// Dragging one or more selected points together. Each frame recomputes
+    /// the result from the points as they were when the drag started plus
+    /// the total raw pointer distance, rather than re-snapping an already
+    /// snapped position.
     MovingPoints {
-        /// (tick, bpm) of every selected point at drag start, in the same
+        /// (tick, value) of every selected point at drag start, in the same
         /// order as `AutomationEditorState::selected_points` at that moment.
         original_points: Vec<(Tick, f32)>,
         /// Index into `original_points` of the point actually grabbed -
-        /// only *its* raw distance from a grid line decides whether the
-        /// whole selection is currently snapped; everything else just
-        /// follows the same effective offset.
+        /// only its position decides how the whole selection snaps;
+        /// everything else follows the same effective offset.
         anchor_index: usize,
         /// Total raw (unsnapped) drag distance accumulated since the
         /// gesture started.
         raw_offset_ticks: f64,
-        raw_offset_bpm: f32,
+        raw_offset_value: f32,
     },
-    /// Rubber-band selecting: drag started on empty canvas.
+    /// Rubber-band selecting: drag started on empty canvas. Released without
+    /// travelling, it adds a point instead.
     AreaSelecting { start_pos: Pos2, current_pos: Pos2 },
 }
 
@@ -436,10 +408,12 @@ fn apply_note_drag(
 /// style tempo/volume/pan curve editor). `None` on `BetterWriterApp` means
 /// the window is closed.
 struct AutomationEditorState {
-    automation_type: AutomationType,
-    /// Ticks of the currently selected points (tempo automation only has one
-    /// timeline today, so this doubles as "selected tempo points"). Multiple
-    /// points can be area-selected and moved/deleted together.
+    lane: AutomationLane,
+    /// The curve the selection and drag belong to; when the selected track
+    /// changes under per-track automation the selection no longer applies.
+    scope: Scope,
+    /// Ticks of the currently selected points. Multiple points can be
+    /// area-selected and moved/deleted together.
     selected_points: Vec<Tick>,
     /// Ticks-per-pixel for the automation graph, independent of the main
     /// staff's zoom.
@@ -460,9 +434,10 @@ struct AutomationEditorState {
 }
 
 impl AutomationEditorState {
-    fn new(selected_tick: Option<Tick>) -> Self {
+    fn new(selected_tick: Option<Tick>, scope: Scope) -> Self {
         Self {
-            automation_type: AutomationType::Tempo,
+            lane: AutomationLane::Tempo,
+            scope,
             selected_points: selected_tick.into_iter().collect(),
             pixels_per_tick: 0.07,
             snap_to_grid: true,
@@ -487,7 +462,8 @@ enum AppScreen {
 enum ClipboardAction {
     Copy,
     Cut,
-    /// The system clipboard's text, which says whether it is still our copy.
+    /// The text on the system clipboard, which says whether it is still our
+    /// copy. egui only reports a paste while the clipboard holds text.
     Paste(String),
 }
 
@@ -495,8 +471,9 @@ enum ClipboardAction {
 /// controls.
 #[derive(Clone, Copy)]
 enum MixEdit {
-    Variant(StringedVariant),
-    Program(u8),
+    Instrument(&'static InstrumentDef),
+    Sound(u16, u8),
+    SoundAutomatic,
     Volume(u8),
     Pan(i8),
     Solo(bool),
@@ -547,7 +524,9 @@ pub struct BetterWriterApp {
     shadow_timeline: ShadowTimeline,
     /// Clef and rest outlines, rasterized on the first editor frame.
     symbols: Option<Symbols>,
-    /// Song position in ticks while playing, polled once per frame.
+    /// Song position in seconds while playing, polled once per frame.
+    playback_seconds: Option<f64>,
+    /// `playback_seconds` as a tick of the selected track's own tempo curve.
     playback_tick: Option<f64>,
     /// `playback_tick` mapped back to a position in the selected track's
     /// score: a repeated region shows the playback line on every pass.
@@ -558,17 +537,13 @@ pub struct BetterWriterApp {
     /// A Play request is waiting for the soundfont to finish loading.
     audio_wait: bool,
     audio_preloaded: bool,
-    /// Sound pickers list every General MIDI sound, not just the ones for
-    /// the track's instrument type.
-    show_all_sounds: bool,
+    instrument_picker: Option<sound_picker::InstrumentPicker>,
     /// Notes last copied or cut, and the text put on the system clipboard
-    /// with them. egui only reports a paste while the system clipboard holds
-    /// text, and the text doubles as the check that it is still our copy.
+    /// with them, which says whether the clipboard still holds our copy.
     note_clipboard: Option<(NoteClip, String)>,
+    system_clipboard: system_clipboard::SystemClipboard,
     /// Vertical scroll of the track table and the bar timeline beside it.
     track_rows_scroll: f32,
-    /// Counts copies so each puts different text on the system clipboard.
-    copy_serial: u32,
     /// Project as it was before the volume or pan control being dragged
     /// started, so the whole drag becomes one undo step.
     mixer_edit_before: Option<BwxProject>,
@@ -580,6 +555,9 @@ pub struct BetterWriterApp {
     plugin_host: PluginHost,
     /// The FX Chain windows and the plug-in browser.
     fx: fx_chain::FxChainState,
+    /// The program's own native window, which plug-in editors are laid over
+    /// (0 when it is not known).
+    main_window: usize,
     /// Track being renamed in the track table and its text so far.
     renaming_track: Option<(u64, String)>,
     /// Bars selected in the bar timeline. A repeated copy of a bar selects
@@ -632,6 +610,8 @@ pub struct BetterWriterApp {
     /// Play count being typed for the repeat close at (track, bar start).
     repeat_picker: Option<(u64, Tick, u16)>,
     time_signature_denominator: u8,
+    /// Lets the denominator be any whole number instead of a power of two.
+    allow_irrational_time_signature: bool,
     screen: AppScreen,
     /// Most-recently-opened/saved project paths, newest first. Persisted to
     /// a small text file next to the executable so the Start Menu's recent
@@ -669,21 +649,23 @@ impl BetterWriterApp {
             background_image: None,
             shadow_timeline,
             symbols: None,
+            playback_seconds: None,
             playback_tick: None,
             playback_score_tick: None,
             playback_follow_row: None,
             audio: AudioRuntime::new(default_soundfont_path()),
             audio_wait: false,
             audio_preloaded: false,
-            show_all_sounds: false,
+            instrument_picker: None,
             note_clipboard: None,
-            copy_serial: 0,
+            system_clipboard: system_clipboard::SystemClipboard::default(),
             mixer_edit_before: None,
             show_fretboard: true,
             plugin_scanner: PluginScanner::start(),
             audio_graph_empty: true,
             plugin_host: PluginHost::new(),
             fx: fx_chain::FxChainState::default(),
+            main_window: 0,
             renaming_track: None,
             timeline_selection: BTreeSet::new(),
             timeline_anchor: None,
@@ -716,6 +698,7 @@ impl BetterWriterApp {
             time_signature_numerator: 4,
             repeat_picker: None,
             time_signature_denominator: 4,
+            allow_irrational_time_signature: false,
             screen: AppScreen::StartMenu,
             recent_projects: load_recent_projects(),
             new_project_dialog: None,
@@ -820,11 +803,20 @@ impl BetterWriterApp {
             return;
         }
         let mut open = true;
-        egui::Window::new("Theme")
-            .open(&mut open)
-            .resizable(false)
-            .default_width(380.0)
-            .show(ctx, |ui| self.theme_editor_ui(ui));
+        floating::floating_window(
+            ctx,
+            "theme_window",
+            "Theme",
+            Vec2::new(400.0, 620.0),
+            Vec2::new(340.0, 260.0),
+            self.main_window,
+            &mut open,
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.theme_editor_ui(ui));
+            },
+        );
         self.theme_window_open = open;
     }
 
@@ -1202,22 +1194,36 @@ impl BetterWriterApp {
         )
     }
 
-    /// Copies (or cuts) the selected notes. The text handed to the system
-    /// clipboard is what makes the next Ctrl+V reach `paste_notes`.
+    /// Copies (or cuts) the selected notes, onto the system clipboard as a
+    /// MIDI clip as well as into the editor's own clipboard.
     fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) -> bool {
         let ids = self.selected_note_ids();
-        let Some(clip) = self
-            .project
-            .track(self.selected_track_id)
-            .and_then(|track| NoteClip::from_track(track, &ids))
-        else {
+        let Some(track) = self.project.track(self.selected_track_id) else {
             return false;
         };
+        let Some(clip) = NoteClip::from_track(track, &ids) else {
+            return false;
+        };
+        let first_tick = track
+            .notes
+            .iter()
+            .filter(|note| ids.contains(&note.id))
+            .map(|note| note.abs_tick)
+            .min()
+            .unwrap_or(0);
+        let tempo_points = self
+            .project
+            .automation_points(AutomationLane::Tempo, self.project.scope_for(track.id));
+        let bpm = value_at(&tempo_points, first_tick).unwrap_or(120.0);
         let count = clip.len();
-        self.copy_serial += 1;
-        let marker = format!("BetterWriter: {count} notes (copy {})", self.copy_serial);
-        ctx.copy_text(marker.clone());
-        self.note_clipboard = Some((clip, marker));
+        // The text is what makes the next Ctrl+V reach `paste_notes`: egui
+        // only reports a paste while the clipboard holds text.
+        let text = clip.ascii_tab();
+        let midi = crate::core::smf::write_notes(&clip.midi_notes(), bpm);
+        if !self.system_clipboard.put_midi(midi, text.clone()) {
+            ctx.copy_text(text.clone());
+        }
+        self.note_clipboard = Some((clip, text));
 
         if !cut {
             self.status = format!("Copied {}.", note_count(count));
@@ -1236,10 +1242,21 @@ impl BetterWriterApp {
         true
     }
 
-    /// Pastes the copied notes at the cursor, and leaves exactly the new
-    /// notes selected.
-    fn paste_notes(&mut self) -> bool {
-        let Some((clip, _)) = self.note_clipboard.clone() else {
+    /// Pastes at the cursor what was last copied here, or else a MIDI clip
+    /// another program put on the system clipboard.
+    fn paste_notes(&mut self, from_system: bool) -> bool {
+        let clip = if from_system {
+            None
+        } else {
+            self.note_clipboard.as_ref().map(|(clip, _)| clip.clone())
+        };
+        let clip = clip.or_else(|| {
+            let bytes = self.system_clipboard.midi()?;
+            let notes = crate::core::smf::read_notes(&bytes)?;
+            NoteClip::from_midi(&notes, self.project.track(self.selected_track_id)?)
+        });
+        let Some(clip) = clip else {
+            self.status = "Nothing to paste.".to_owned();
             return false;
         };
         let track_id = self.selected_track_id;
@@ -1317,13 +1334,22 @@ impl BetterWriterApp {
                 return;
             };
             match edit {
-                MixEdit::Variant(variant) => {
-                    track.set_stringed_variant(variant);
-                    self.status = format!("{}: {}", track.name, variant.label());
+                MixEdit::Instrument(def) => {
+                    track.set_instrument(def);
+                    self.status = format!("{}: {}", track.name, def.title());
                 }
-                MixEdit::Program(program) => {
-                    track.program = program;
-                    self.status = format!("{}: {}", track.name, sound_name(program));
+                MixEdit::Sound(bank, program) => {
+                    track.set_sound(bank, program);
+                    self.status = format!("{}: {}", track.name, sound_label(bank, program));
+                }
+                MixEdit::SoundAutomatic => {
+                    track.set_sound_automatic();
+                    let (bank, program) = track.sound();
+                    self.status = format!(
+                        "{}: sound chosen automatically ({})",
+                        track.name,
+                        sound_label(bank, program)
+                    );
                 }
                 MixEdit::Volume(volume) => track.volume = volume,
                 MixEdit::Pan(pan) => track.pan = pan,
@@ -1366,7 +1392,8 @@ impl BetterWriterApp {
             .project
             .track(self.selected_track_id)
             .map_or(1, |track| track.bar_index_at(score_start) + 1);
-        match self.audio.play(&self.project, events, start_tick) {
+        let start_track = self.selected_track_id;
+        match self.audio.play(&self.project, &events, start_tick, start_track) {
             Ok(()) if self.audio.is_loading() => {
                 self.audio_wait = true;
                 self.status =
@@ -1422,6 +1449,19 @@ impl BetterWriterApp {
         let busy = self.audio.poll();
         self.audio.sync_mix(&self.project);
         self.sync_plugin_graph();
+        if let Some(seconds) = self.audio.take_resume() {
+            // A device change interrupted the song: carry on where it was.
+            let events = self.shadow_timeline.snapshot();
+            let tick = self
+                .project
+                .tempo_map_for(self.selected_track_id)
+                .tick_at(seconds)
+                .round() as Tick;
+            match self.audio.play(&self.project, &events, tick, self.selected_track_id) {
+                Ok(()) => self.audio_wait = self.audio.is_loading(),
+                Err(err) => self.status = format!("Could not resume playback: {err}"),
+            }
+        }
         if self.audio_wait && !self.audio.is_loading() {
             self.audio_wait = false;
             self.status = if self.audio.is_playing() {
@@ -1430,7 +1470,12 @@ impl BetterWriterApp {
                 self.audio.status().to_owned()
             };
         }
-        self.playback_tick = self.audio.playback_tick();
+        self.playback_seconds = self.audio.playback_seconds();
+        self.playback_tick = self.playback_seconds.map(|seconds| {
+            self.project
+                .tempo_map_for(self.selected_track_id)
+                .tick_at(seconds)
+        });
         self.playback_score_tick = self.playback_tick.map(|position| {
             self.project
                 .track(self.selected_track_id)
@@ -1443,9 +1488,15 @@ impl BetterWriterApp {
             );
         }
         if self.playback_tick.is_some() {
-            ctx.request_repaint();
+            // About 60 frames a second, not as many as can be drawn. A
+            // window that never has an empty message queue starves the
+            // timers of the plug-in editors in it, which freezes them.
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else if busy || self.plugin_scanner.is_scanning() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else {
+            // An idle app still notices the sound card changing its rate.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 
@@ -1617,6 +1668,9 @@ impl BetterWriterApp {
             let signature = track.signature_at(self.cursor.tick);
             self.time_signature_numerator = signature.numerator;
             self.time_signature_denominator = signature.denominator;
+            if !signature.is_regular() {
+                self.allow_irrational_time_signature = true;
+            }
         }
     }
 
@@ -1648,15 +1702,16 @@ impl BetterWriterApp {
     }
 
     /// Opens the Automation Editor (Tempo/Volume/Pan), pre-selecting the
-    /// tempo point nearest the edit cursor if one exists exactly there.
+    /// tempo point at the edit cursor if one exists exactly there.
     fn open_automation_editor(&mut self) {
+        let scope = self.automation_scope();
         let at_cursor = self
             .project
-            .tempo_points
+            .automation_points(AutomationLane::Tempo, scope)
             .iter()
             .find(|point| point.at_tick == self.cursor.tick)
             .map(|point| point.at_tick);
-        self.automation_editor = Some(AutomationEditorState::new(at_cursor));
+        self.automation_editor = Some(AutomationEditorState::new(at_cursor, scope));
     }
 
     /// Insert a new bar to the left of the selected bar (`Ctrl+Ins` /
@@ -2543,8 +2598,8 @@ impl BetterWriterApp {
                     let ours = self
                         .note_clipboard
                         .as_ref()
-                        .is_some_and(|(_, marker)| *marker == text);
-                    ours && self.paste_notes()
+                        .is_some_and(|(_, copied)| *copied == text);
+                    self.paste_notes(!ours)
                 }
             };
         }
@@ -2556,8 +2611,18 @@ impl BetterWriterApp {
     }
 }
 
+/// The Win32 window handle of the program's window, or 0 on other systems.
+fn native_window_handle(frame: &eframe::Frame) -> usize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get() as usize,
+        _ => 0,
+    }
+}
+
 impl eframe::App for BetterWriterApp {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.main_window = native_window_handle(frame);
         self.resolve_theme(root.ctx());
 
         match self.screen {
@@ -2646,6 +2711,7 @@ impl eframe::App for BetterWriterApp {
         self.show_new_project_dialog(root.ctx());
         self.show_automation_editor(root.ctx());
         self.show_fx_windows(root.ctx());
+        self.show_instrument_picker(root.ctx());
     }
 }
 
@@ -2719,7 +2785,8 @@ impl BetterWriterApp {
                 }
                 ui.separator();
                 let has_selection = !self.selected_note_ids().is_empty();
-                let can_paste = self.note_clipboard.is_some();
+                let can_paste =
+                    self.note_clipboard.is_some() || self.system_clipboard.midi().is_some();
                 if ui
                     .add_enabled(has_selection, egui::Button::new("Cut\tCtrl+X"))
                     .clicked()
@@ -2740,7 +2807,8 @@ impl BetterWriterApp {
                     .add_enabled(can_paste, egui::Button::new("Paste\tCtrl+V"))
                     .clicked()
                 {
-                    self.paste_notes();
+                    let ours = self.note_clipboard.is_some();
+                    self.paste_notes(!ours);
                     ui.close();
                 }
             });
@@ -2822,7 +2890,7 @@ impl BetterWriterApp {
                 ui.label("Enter ... place the buffered fret at the cursor");
                 ui.label("Space ... play from the cursor or selection / stop");
                 ui.label("Fretboard click ... write the note; Shift+click adds to the same beat");
-                ui.label("Mouse wheel ... zoom around the pointer; Shift+wheel scrolls");
+                ui.label("Mouse wheel ... scroll the score; Shift+wheel zooms around the pointer");
                 ui.label("Backspace / Del . delete note under cursor (or clear buffer)");
                 ui.label("Left / Right .... move cursor by the selected duration");
                 ui.label("Up / Down ....... change active string");
@@ -3083,43 +3151,50 @@ impl BetterWriterApp {
         };
         let mut keep_open = true;
 
-        egui::Window::new("Automation Editor")
-            .id(egui::Id::new("automation_editor_window"))
-            .open(&mut keep_open)
-            .default_size([760.0, 480.0])
-            .min_width(560.0)
-            .min_height(360.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+        floating::floating_window(
+            ctx,
+            "automation_editor_window",
+            "Automation Editor",
+            Vec2::new(760.0, 480.0),
+            Vec2::new(560.0, 360.0),
+            self.main_window,
+            &mut keep_open,
+            |ui| {
                 self.show_automation_editor_contents(ui, &mut state);
-            });
+                // Delete/Backspace removes the selected point(s) - but only
+                // when no widget has keyboard focus, so backspacing while
+                // typing into the bpm field doesn't also delete the point.
+                // Asked of the editor's own window, which has the keyboard.
+                let window = ui.ctx().clone();
+                let any_widget_focused = window.memory(|memory| memory.focused().is_some());
+                if !any_widget_focused
+                    && !state.selected_points.is_empty()
+                    && window.input(|input| {
+                        input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+                    })
+                {
+                    self.delete_automation_points(&mut state);
+                }
+            },
+        );
 
         if keep_open {
-            // Delete/Backspace removes the selected point(s) - but only when
-            // no widget has keyboard focus, so backspacing while typing into
-            // the bpm field doesn't also delete the point.
-            let any_widget_focused = ctx.memory(|memory| memory.focused().is_some());
-            if !any_widget_focused
-                && !state.selected_points.is_empty()
-                && ctx.input(|input| {
-                    input.key_pressed(egui::Key::Delete)
-                        || input.key_pressed(egui::Key::Backspace)
-                })
-            {
-                let before = self.project.clone();
-                let mut any = false;
-                for tick in state.selected_points.clone() {
-                    if self.project.delete_tempo_point(tick) {
-                        any = true;
-                    }
-                }
-                if any {
-                    self.record_project_edit(before);
-                }
-                state.selected_points.clear();
-            }
             self.automation_editor = Some(state);
         }
+    }
+
+    /// Where the curves shown for the selected track live.
+    fn automation_scope(&self) -> Scope {
+        self.project.scope_for(self.selected_track_id)
+    }
+
+    fn delete_automation_points(&mut self, state: &mut AutomationEditorState) {
+        let scope = self.automation_scope();
+        let before = self.project.clone();
+        for tick in state.selected_points.drain(..) {
+            self.project.delete_automation_point(state.lane, scope, tick);
+        }
+        self.record_project_edit(before);
     }
 
     fn show_automation_editor_contents(
@@ -3136,91 +3211,104 @@ impl BetterWriterApp {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("TYPE:").strong());
             egui::ComboBox::from_id_salt("automation_type")
-                .selected_text(state.automation_type.label())
+                .selected_text(state.lane.label())
                 .show_ui(ui, |ui| {
-                    for kind in AutomationType::ALL {
-                        ui.add_enabled_ui(kind.is_implemented(), |ui| {
-                            if ui
-                                .selectable_label(state.automation_type == kind, kind.label())
-                                .on_hover_text(if kind.is_implemented() {
-                                    "Available now"
-                                } else {
-                                    "Coming soon"
-                                })
-                                .clicked()
-                            {
-                                state.automation_type = kind;
-                            }
-                        });
+                    for lane in AutomationLane::ALL {
+                        if ui.selectable_label(state.lane == lane, lane.label()).clicked() {
+                            state.lane = lane;
+                            state.selected_points.clear();
+                            state.drag_mode = AutomationDragMode::Idle;
+                        }
                     }
                 });
             ui.add_space(16.0);
-            if state.automation_type == AutomationType::Tempo
-                && ui
-                    .button("Remove automations")
-                    .on_hover_text("Reset to a single flat tempo for the whole project")
-                    .clicked()
+            let per_track = self.project.per_track_automation;
+            if ui
+                .button("Remove automations")
+                .on_hover_text(if per_track {
+                    "Remove this track's points of this type"
+                } else {
+                    "Remove the project's points of this type"
+                })
+                .clicked()
             {
                 let before = self.project.clone();
-                let flat_bpm = self.project.tempo_at(0);
-                self.project.clear_tempo_automation(flat_bpm);
+                let scope = self.automation_scope();
+                self.project.clear_automation(state.lane, scope);
                 self.record_project_edit(before);
                 state.selected_points.clear();
+            }
+            ui.add_space(16.0);
+            let mut per_track_on = per_track;
+            if ui
+                .checkbox(&mut per_track_on, "Per-track automation")
+                .on_hover_text("Each track follows its own tempo, volume and pan curves")
+                .changed()
+            {
+                let before = self.project.clone();
+                self.project.set_per_track_automation(per_track_on);
+                self.record_project_edit(before);
+            }
+            if self.project.per_track_automation
+                && let Some(track) = self.project.track(self.selected_track_id)
+            {
+                ui.label(
+                    egui::RichText::new(format!("Track: {}", track.name))
+                        .color(egui::Color32::from_gray(180)),
+                );
             }
         });
         ui.separator();
 
-        match state.automation_type {
-            AutomationType::Tempo => {
-                let body_height = ui.available_height().max(220.0);
-                ui.horizontal(|ui| {
-                    // `top_down` is load-bearing, not decorative: a plain
-                    // `ui.allocate_ui` inherits this row's left-to-right
-                    // layout, which disables text wrapping, so the
-                    // point-settings text spills out of its column and
-                    // squeezes the graph column.
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(210.0, body_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.show_tempo_point_settings(ui, state);
-                        },
-                    );
-                    ui.separator();
-                    let graph_width = ui.available_width();
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(graph_width, body_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.show_tempo_graph(ui, state, body_height);
-                        },
-                    );
-                });
-            }
-            AutomationType::Volume | AutomationType::Pan => {
-                ui.add_space(24.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(format!(
-                        "{} automation is coming soon.",
-                        state.automation_type.label()
-                    ));
-                });
-            }
+        let scope = self.automation_scope();
+        if state.scope != scope {
+            state.scope = scope;
+            state.selected_points.clear();
+            state.drag_mode = AutomationDragMode::Idle;
+            state.drag_started_snapshot = None;
         }
+
+        let body_height = ui.available_height().max(220.0);
+        ui.horizontal(|ui| {
+            // `top_down` is load-bearing, not decorative: a plain
+            // `ui.allocate_ui` inherits this row's left-to-right
+            // layout, which disables text wrapping, so the
+            // point-settings text spills out of its column and
+            // squeezes the graph column.
+            ui.allocate_ui_with_layout(
+                Vec2::new(210.0, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.show_automation_point_settings(ui, state);
+                },
+            );
+            ui.separator();
+            let graph_width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                Vec2::new(graph_width, body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.show_automation_graph(ui, state, body_height);
+                },
+            );
+        });
     }
 
-    fn show_tempo_point_settings(&mut self, ui: &mut egui::Ui, state: &mut AutomationEditorState) {
+    fn show_automation_point_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &mut AutomationEditorState,
+    ) {
+        let lane = state.lane;
+        let scope = state.scope;
         ui.label(egui::RichText::new("POINT SETTINGS").strong());
         ui.separator();
 
+        let points = self.project.automation_points(lane, scope);
         let selected_count = state.selected_points.len();
         let single_point = if selected_count == 1 {
             let tick = state.selected_points[0];
-            self.project
-                .tempo_points
-                .iter()
-                .find(|point| point.at_tick == tick)
-                .copied()
+            points.iter().find(|point| point.at_tick == tick).copied()
         } else {
             None
         };
@@ -3242,24 +3330,41 @@ impl BetterWriterApp {
         );
 
         ui.add_space(8.0);
-        ui.label("Tempo:");
+        ui.label(format!("{}:", lane.label()));
         ui.horizontal_wrapped(|ui| {
-            let mut bpm = single_point
-                .map(|point| point.bpm)
-                .unwrap_or(self.project.interpolated_tempo_at(self.cursor.tick));
+            let track_level = self.project.track(self.selected_track_id).map(|track| match lane {
+                AutomationLane::Pan => f32::from(track.pan),
+                _ => f32::from(track.volume),
+            });
+            let mut value = single_point.map(|point| point.value).unwrap_or_else(|| {
+                interpolated_value_at(&points, self.cursor.tick)
+                    .or(track_level)
+                    .unwrap_or(0.0)
+            });
             ui.add_enabled_ui(selected_count == 1, |ui| {
-                let dragged = ui
-                    .add(
-                        egui::DragValue::new(&mut bpm)
-                            .range(20.0..=320.0)
-                            .suffix(" bpm"),
-                    )
-                    .changed();
-                let mut tapped_bpm = None;
-                if ui
-                    .button("TAP")
-                    .on_hover_text("Click in rhythm to set a tempo")
-                    .clicked()
+                let (low, high) = match lane {
+                    AutomationLane::Tempo => (20.0, 320.0),
+                    other => other.limits(),
+                };
+                let widget = egui::DragValue::new(&mut value)
+                    .range(low..=high)
+                    .max_decimals(1);
+                let widget = match lane {
+                    AutomationLane::Tempo => widget.suffix(" bpm"),
+                    AutomationLane::Volume => widget,
+                    AutomationLane::Pan => widget
+                        .custom_formatter(|value, _| {
+                            pan_label(value.round().clamp(-64.0, 63.0) as i8)
+                        })
+                        .custom_parser(parse_pan),
+                };
+                let dragged = ui.add(widget).changed();
+                let mut tapped = None;
+                if lane == AutomationLane::Tempo
+                    && ui
+                        .button("TAP")
+                        .on_hover_text("Click in rhythm to set a tempo")
+                        .clicked()
                 {
                     let now = std::time::Instant::now();
                     state
@@ -3275,25 +3380,30 @@ impl BetterWriterApp {
                             .as_secs_f32();
                         let intervals = state.tap_times.len() as f32 - 1.0;
                         if span > 0.0 {
-                            tapped_bpm = Some((60.0 * intervals / span).clamp(20.0, 320.0));
+                            tapped = Some((60.0 * intervals / span).clamp(20.0, 320.0));
                         }
                     }
                 }
-                if let Some(tapped_bpm) = tapped_bpm {
-                    bpm = tapped_bpm;
+                if let Some(tapped) = tapped {
+                    value = tapped;
                 }
-                if (dragged || tapped_bpm.is_some()) && let Some(point) = single_point {
+                if (dragged || tapped.is_some()) && let Some(point) = single_point {
                     let before = self.project.clone();
-                    if self.project.set_tempo_point(point.at_tick, bpm, point.transition) {
-                        self.record_project_edit(before);
-                    }
+                    self.project.set_automation_point(
+                        lane,
+                        scope,
+                        point.at_tick,
+                        value,
+                        point.transition,
+                    );
+                    self.record_project_edit(before);
                 }
             });
         });
         if selected_count == 0 {
             ui.label(
                 egui::RichText::new(format!(
-                    "(effective tempo at cursor, tick {})",
+                    "(effective value at cursor, tick {})",
                     self.cursor.tick
                 ))
                 .small()
@@ -3303,24 +3413,30 @@ impl BetterWriterApp {
 
         ui.add_space(8.0);
         ui.label("Transition:");
-        self.show_tempo_transition_brush(ui, state);
+        self.show_automation_transition_brush(ui, state);
 
-        ui.add_space(8.0);
-        ui.add_enabled_ui(selected_count == 1, |ui| {
-            let mut hidden = single_point.map(|point| point.hidden).unwrap_or(false);
-            if ui.checkbox(&mut hidden, "Hide automation label").changed()
-                && let Some(point) = single_point
-            {
-                let before = self.project.clone();
-                if self.project.set_tempo_point_hidden(point.at_tick, hidden) {
-                    self.record_project_edit(before);
+        if lane == AutomationLane::Tempo {
+            ui.add_space(8.0);
+            ui.add_enabled_ui(selected_count == 1, |ui| {
+                let mut hidden = single_point.map(|point| point.hidden).unwrap_or(false);
+                if ui.checkbox(&mut hidden, "Hide automation label").changed()
+                    && let Some(point) = single_point
+                {
+                    let before = self.project.clone();
+                    if self
+                        .project
+                        .set_automation_point_hidden(lane, scope, point.at_tick, hidden)
+                    {
+                        self.record_project_edit(before);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         ui.add_space(10.0);
-        let can_delete = selected_count > 1
-            || (selected_count == 1 && single_point.map(|point| point.at_tick) != Some(0));
+        let is_start_tempo = lane == AutomationLane::Tempo
+            && single_point.map(|point| point.at_tick) == Some(0);
+        let can_delete = selected_count > 1 || (selected_count == 1 && !is_start_tempo);
         ui.add_enabled_ui(can_delete, |ui| {
             let label = if selected_count > 1 {
                 "Delete selected points"
@@ -3329,24 +3445,14 @@ impl BetterWriterApp {
             };
             if ui
                 .button(label)
-                .on_hover_text(if selected_count == 1 && !can_delete {
-                    "The first point can't be removed - it sets the project's starting tempo"
+                .on_hover_text(if is_start_tempo {
+                    "The first point can't be removed - it sets the starting tempo"
                 } else {
                     "Remove the selected point(s)"
                 })
                 .clicked()
             {
-                let before = self.project.clone();
-                let mut any = false;
-                for tick in state.selected_points.clone() {
-                    if self.project.delete_tempo_point(tick) {
-                        any = true;
-                    }
-                }
-                if any {
-                    self.record_project_edit(before);
-                }
-                state.selected_points.clear();
+                self.delete_automation_points(state);
             }
         });
 
@@ -3354,8 +3460,8 @@ impl BetterWriterApp {
         ui.separator();
         ui.label(
             egui::RichText::new(
-                "Click a point to select it, drag a rectangle to select \
-                several, or click empty space to add a new point.",
+                "Click empty space to add a point, drag a point to move it, or \
+                drag a rectangle to select several. Hold Alt to move freely.",
             )
             .small()
             .color(egui::Color32::from_gray(140)),
@@ -3368,7 +3474,11 @@ impl BetterWriterApp {
     /// and, while a selection exists, an action that applies to it. It never
     /// resets itself to reflect whatever's currently selected: it's a
     /// persistent setting, not a readout.
-    fn show_tempo_transition_brush(&mut self, ui: &mut egui::Ui, state: &mut AutomationEditorState) {
+    fn show_automation_transition_brush(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &mut AutomationEditorState,
+    ) {
         let previous = state.default_transition;
         ui.radio_value(
             &mut state.default_transition,
@@ -3381,42 +3491,56 @@ impl BetterWriterApp {
             "Progressive to next point",
         );
         if state.default_transition != previous && !state.selected_points.is_empty() {
+            let (lane, scope) = (state.lane, state.scope);
             let transition = state.default_transition;
             let before = self.project.clone();
-            let mut any = false;
+            let points = self.project.automation_points(lane, scope);
             for tick in state.selected_points.clone() {
-                let bpm = self.project.tempo_at(tick);
-                if self.project.set_tempo_point(tick, bpm, transition) {
-                    any = true;
+                if let Some(value) = value_at(&points, tick) {
+                    self.project
+                        .set_automation_point(lane, scope, tick, value, transition);
                 }
             }
-            if any {
-                self.record_project_edit(before);
-            }
+            self.record_project_edit(before);
         }
     }
 
-    /// The scrollable tempo curve: bar gridlines from the selected track, a
-    /// step/ramp line through every tempo point, and draggable point
+    /// The scrollable automation curve: bar gridlines from the selected
+    /// track, a step/ramp line through every point, and draggable point
     /// handles. Points can be area-selected (drag from empty space) and then
     /// moved or deleted together.
-    fn show_tempo_graph(
+    ///
+    /// The drag is driven by raw pointer input rather than egui's drag
+    /// response: that only reports a drag after the pointer has travelled
+    /// several pixels or waited most of a second, by which time the press
+    /// position that picks the point is already lost.
+    fn show_automation_graph(
         &mut self,
         ui: &mut egui::Ui,
         state: &mut AutomationEditorState,
         available_height: f32,
     ) {
-        const MIN_BPM: f32 = 20.0;
-        const MAX_BPM: f32 = 320.0;
         const MIN_GRAPH_HEIGHT: f32 = 160.0;
-        const POINT_HIT_RADIUS: f32 = 8.0;
+        const POINT_HIT_RADIUS: f32 = 9.0;
         const POINT_DRAW_RADIUS: f32 = 5.0;
+        const CLICK_SLOP: f32 = 4.0;
+        const SNAP_THRESHOLD_PIXELS: f64 = 6.0;
+        const GRID_TICKS: Tick = TICKS_PER_QUARTER / 4;
+
+        let lane = state.lane;
+        let scope = state.scope;
+        let (graph_low, graph_high) = lane.graph_range();
+        let (limit_low, limit_high) = lane.limits();
 
         let zoom_row = ui.horizontal(|ui| {
             ui.label("Zoom:");
             ui.add(egui::Slider::new(&mut state.pixels_per_tick, 0.01..=0.2));
             ui.separator();
-            ui.checkbox(&mut state.snap_to_grid, "Snap to grid");
+            ui.checkbox(&mut state.snap_to_grid, "Snap to grid")
+                .on_hover_text(
+                    "Positions snap to sixteenth notes. Values always snap to whole \
+                    numbers; hold Alt to move freely.",
+                );
         });
         ui.add_space(4.0);
         // Explicitly passed down from `show_automation_editor_contents`
@@ -3428,6 +3552,9 @@ impl BetterWriterApp {
         let graph_height =
             (available_height - zoom_row.response.rect.height() - 8.0).max(MIN_GRAPH_HEIGHT);
 
+        let mut sorted_points = self.project.automation_points(lane, scope);
+        sorted_points.sort_by_key(|point| point.at_tick);
+
         let horizon_ticks = self
             .project
             .tracks
@@ -3436,8 +3563,7 @@ impl BetterWriterApp {
             .max()
             .unwrap_or(TICKS_PER_QUARTER * 4)
             .max(
-                self.project
-                    .tempo_points
+                sorted_points
                     .iter()
                     .map(|point| point.at_tick)
                     .max()
@@ -3447,9 +3573,13 @@ impl BetterWriterApp {
             + TICKS_PER_QUARTER * 4;
         let pixels_per_tick = state.pixels_per_tick;
         let content_width = (horizon_ticks as f32 * pixels_per_tick).max(200.0);
+        let track_level = self.project.track(self.selected_track_id).map(|track| match lane {
+            AutomationLane::Pan => f32::from(track.pan),
+            _ => f32::from(track.volume),
+        });
 
         egui::ScrollArea::both()
-            .id_salt("tempo_automation_scroll")
+            .id_salt("automation_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let (response, painter) = ui.allocate_painter(
@@ -3463,17 +3593,17 @@ impl BetterWriterApp {
                 // write several other `state` fields in the same scope.
                 let snap_to_grid = state.snap_to_grid;
 
-                let bpm_to_y = |bpm: f32| {
-                    let t = ((bpm - MIN_BPM) / (MAX_BPM - MIN_BPM)).clamp(0.0, 1.0);
+                let value_to_y = |value: f32| {
+                    let t = ((value - graph_low) / (graph_high - graph_low)).clamp(0.0, 1.0);
                     rect.bottom() - t * rect.height()
                 };
-                let y_to_bpm = |y: f32| {
+                let y_to_value = |y: f32| {
                     let t = ((rect.bottom() - y) / rect.height()).clamp(0.0, 1.0);
-                    MIN_BPM + t * (MAX_BPM - MIN_BPM)
+                    graph_low + t * (graph_high - graph_low)
                 };
                 let tick_to_x = |tick: Tick| rect.left() + tick as f32 * pixels_per_tick;
-                let x_to_tick =
-                    |x: f32| (((x - rect.left()) / pixels_per_tick).max(0.0)) as Tick;
+                let center_of =
+                    |point: &AutomationPoint| Pos2::new(tick_to_x(point.at_tick), value_to_y(point.value));
 
                 painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(24, 24, 28));
 
@@ -3484,91 +3614,125 @@ impl BetterWriterApp {
                         let x = tick_to_x(start);
                         painter.line_segment(
                             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                            Stroke::new(1.0, egui::Color32::from_gray(50)),
+                            Stroke::new(1.0_f32, egui::Color32::from_gray(50)),
                         );
                         cursor = end;
                     }
                 }
 
-                let mut bpm_line = (MIN_BPM / 20.0).ceil() * 20.0;
-                while bpm_line <= MAX_BPM {
-                    let y = bpm_to_y(bpm_line);
+                let grid_step = match lane {
+                    AutomationLane::Tempo => 20.0,
+                    _ => 16.0,
+                };
+                let mut grid_value = (graph_low / grid_step).ceil() * grid_step;
+                while grid_value <= graph_high {
+                    let y = value_to_y(grid_value);
                     painter.line_segment(
                         [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                        Stroke::new(1.0, egui::Color32::from_gray(40)),
+                        Stroke::new(1.0_f32, egui::Color32::from_gray(40)),
                     );
                     painter.text(
                         Pos2::new(rect.left() + 2.0, y),
                         Align2::LEFT_BOTTOM,
-                        format!("{bpm_line:.0}"),
+                        automation_value_text(lane, grid_value),
                         FontId::monospace(9.0),
                         egui::Color32::from_gray(140),
                     );
-                    bpm_line += 20.0;
+                    grid_value += grid_step;
                 }
 
-                let mut sorted_points = self.project.tempo_points.clone();
-                sorted_points.sort_by_key(|point| point.at_tick);
+                // Before its first point a volume or pan curve leaves the
+                // track at its own setting.
+                if lane != AutomationLane::Tempo
+                    && let Some(level) = track_level
+                {
+                    let end_x = sorted_points.first().map_or(rect.right(), |first| tick_to_x(first.at_tick));
+                    let y = value_to_y(level);
+                    painter.line_segment(
+                        [Pos2::new(rect.left(), y), Pos2::new(end_x, y)],
+                        Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
+                    );
+                }
 
                 for pair in sorted_points.windows(2) {
-                    let (a, b) = (pair[0], pair[1]);
-                    let (ax, ay) = (tick_to_x(a.at_tick), bpm_to_y(a.bpm));
-                    let (bx, by) = (tick_to_x(b.at_tick), bpm_to_y(b.bpm));
+                    let (a, b) = (&pair[0], &pair[1]);
+                    let (ax, ay) = (tick_to_x(a.at_tick), value_to_y(a.value));
+                    let (bx, by) = (tick_to_x(b.at_tick), value_to_y(b.value));
                     match a.transition {
                         TempoTransition::Progressive => {
                             painter.line_segment(
                                 [Pos2::new(ax, ay), Pos2::new(bx, by)],
-                                Stroke::new(2.0, self.theme.automation_color),
+                                Stroke::new(2.0_f32, self.theme.automation_color),
                             );
                         }
                         TempoTransition::Constant => {
                             painter.line_segment(
                                 [Pos2::new(ax, ay), Pos2::new(bx, ay)],
-                                Stroke::new(2.0, self.theme.automation_color),
+                                Stroke::new(2.0_f32, self.theme.automation_color),
                             );
                             painter.line_segment(
                                 [Pos2::new(bx, ay), Pos2::new(bx, by)],
-                                Stroke::new(1.0, egui::Color32::from_gray(120)),
+                                Stroke::new(1.0_f32, egui::Color32::from_gray(120)),
                             );
                         }
                     }
                 }
                 if let Some(last) = sorted_points.last() {
-                    let (lx, ly) = (tick_to_x(last.at_tick), bpm_to_y(last.bpm));
+                    let center = center_of(last);
                     painter.line_segment(
-                        [Pos2::new(lx, ly), Pos2::new(rect.right(), ly)],
-                        Stroke::new(1.0, egui::Color32::from_gray(90)),
+                        [center, Pos2::new(rect.right(), center.y)],
+                        Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
                     );
                 }
 
                 for point in &sorted_points {
-                    let center = Pos2::new(tick_to_x(point.at_tick), bpm_to_y(point.bpm));
                     let selected = state.selected_points.contains(&point.at_tick);
                     painter.circle(
-                        center,
+                        center_of(point),
                         POINT_DRAW_RADIUS,
                         if selected {
                             self.theme.automation_color
                         } else {
                             egui::Color32::from_rgb(224, 224, 224)
                         },
-                        Stroke::new(1.5, egui::Color32::BLACK),
+                        Stroke::new(1.5_f32, egui::Color32::BLACK),
                     );
                 }
 
-                let pointer_pos = response.interact_pointer_pos();
+                let (pressed, down, released, alt, pointer_pos, delta) = ui.input(|input| {
+                    (
+                        input.pointer.primary_pressed(),
+                        input.pointer.primary_down(),
+                        input.pointer.primary_released(),
+                        input.modifiers.alt,
+                        input.pointer.latest_pos(),
+                        input.pointer.delta(),
+                    )
+                });
                 let hit_test = |pos: Pos2| {
                     sorted_points
                         .iter()
-                        .find(|point| {
-                            let center = Pos2::new(tick_to_x(point.at_tick), bpm_to_y(point.bpm));
-                            (center - pos).length() <= POINT_HIT_RADIUS
-                        })
-                        .map(|point| point.at_tick)
+                        .map(|point| (point.at_tick, (center_of(point) - pos).length()))
+                        .filter(|&(_, distance)| distance <= POINT_HIT_RADIUS)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(tick, _)| tick)
                 };
+                let snap_value = |value: f32| if alt { value } else { value.round() };
 
-                if response.drag_started() {
-                    let start = pointer_pos.unwrap_or(rect.left_top());
+                if response.hovered()
+                    && !down
+                    && pointer_pos.is_some_and(|pos| hit_test(pos).is_some())
+                {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                if matches!(state.drag_mode, AutomationDragMode::MovingPoints { .. }) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+
+                if pressed
+                    && response.hovered()
+                    && let Some(start) = pointer_pos
+                {
                     state.drag_started_snapshot = Some(self.project.clone());
                     if let Some(hit_tick) = hit_test(start) {
                         if !state.selected_points.contains(&hit_tick) {
@@ -3583,19 +3747,18 @@ impl BetterWriterApp {
                             .selected_points
                             .iter()
                             .map(|tick| {
-                                self.project
-                                    .tempo_points
+                                sorted_points
                                     .iter()
                                     .find(|point| point.at_tick == *tick)
-                                    .map(|point| (point.at_tick, point.bpm))
-                                    .unwrap_or((*tick, 120.0))
+                                    .map(|point| (point.at_tick, point.value))
+                                    .unwrap_or((*tick, graph_low))
                             })
                             .collect();
                         state.drag_mode = AutomationDragMode::MovingPoints {
                             original_points,
                             anchor_index,
                             raw_offset_ticks: 0.0,
-                            raw_offset_bpm: 0.0,
+                            raw_offset_value: 0.0,
                         };
                     } else {
                         state.drag_mode = AutomationDragMode::AreaSelecting {
@@ -3605,135 +3768,122 @@ impl BetterWriterApp {
                     }
                 }
 
-                if response.dragged() {
-                    let delta = response.drag_delta();
+                if down && delta != Vec2::ZERO {
                     match &mut state.drag_mode {
                         AutomationDragMode::MovingPoints {
                             original_points,
                             anchor_index,
                             raw_offset_ticks,
-                            raw_offset_bpm,
+                            raw_offset_value,
                         } => {
-                            *raw_offset_ticks += delta.x as f64 / pixels_per_tick as f64;
-                            *raw_offset_bpm += -(delta.y / rect.height()) * (MAX_BPM - MIN_BPM);
+                            *raw_offset_ticks += f64::from(delta.x) / f64::from(pixels_per_tick);
+                            *raw_offset_value += -(delta.y / rect.height()) * (graph_high - graph_low);
 
-                            // Only the grabbed point's raw (unsnapped)
-                            // position decides whether the drag is
-                            // "close enough" to a grid line right now -
-                            // recomputed fresh each frame from the
-                            // fixed drag-start baseline, so a small
-                            // nudge can never compound into a runaway
-                            // snap. Below the threshold, everyone just
-                            // moves by the exact raw offset.
-                            let (anchor_original_tick, _) = original_points[*anchor_index];
-                            let anchor_raw_tick = anchor_original_tick as f64 + *raw_offset_ticks;
-                            let effective_offset_ticks = if snap_to_grid {
-                                let grid = (TICKS_PER_QUARTER / 4) as f64;
+                            // Only the grabbed point decides how the drag
+                            // snaps; the rest follow the same offset. Both
+                            // offsets are recomputed each frame from the
+                            // fixed drag-start baseline and the total raw
+                            // distance, so a small nudge never compounds
+                            // into a runaway jump.
+                            let (anchor_tick, anchor_value) = original_points[*anchor_index];
+                            let anchor_raw_tick = anchor_tick as f64 + *raw_offset_ticks;
+                            let effective_offset_ticks = if alt || !snap_to_grid {
+                                raw_offset_ticks.round()
+                            } else {
+                                let grid = GRID_TICKS as f64;
                                 let nearest_grid_line = (anchor_raw_tick / grid).round() * grid;
-                                const SNAP_THRESHOLD_PIXELS: f64 = 6.0;
-                                let snap_threshold_ticks =
-                                    SNAP_THRESHOLD_PIXELS / pixels_per_tick as f64;
-                                let snapped_anchor_tick = if (anchor_raw_tick
-                                    - nearest_grid_line)
-                                    .abs()
-                                    <= snap_threshold_ticks
-                                {
+                                let threshold = SNAP_THRESHOLD_PIXELS / f64::from(pixels_per_tick);
+                                let snapped = if (anchor_raw_tick - nearest_grid_line).abs() <= threshold {
                                     nearest_grid_line
                                 } else {
                                     anchor_raw_tick.round()
                                 };
-                                snapped_anchor_tick - anchor_original_tick as f64
-                            } else {
-                                raw_offset_ticks.round()
+                                snapped - anchor_tick as f64
                             };
+                            let anchor_target =
+                                snap_value(anchor_value + *raw_offset_value).clamp(limit_low, limit_high);
+                            let effective_offset_value = anchor_target - anchor_value;
 
                             let moving = state.selected_points.clone();
                             let mut updated = Vec::with_capacity(moving.len());
                             for (index, tick) in moving.iter().enumerate() {
-                                let (original_tick, original_bpm) = original_points[index];
-                                let is_anchor = original_tick == 0;
-                                let new_tick = if is_anchor {
+                                let (original_tick, original_value) = original_points[index];
+                                // The first tempo point sets the starting
+                                // tempo and stays at tick 0; no other tempo
+                                // point may land on it.
+                                let pinned = lane == AutomationLane::Tempo && original_tick == 0;
+                                let min_tick = if lane == AutomationLane::Tempo { 1 } else { 0 };
+                                let new_tick = if pinned {
                                     0
                                 } else {
-                                    (original_tick + effective_offset_ticks as Tick).max(0)
+                                    (original_tick + effective_offset_ticks as Tick).max(min_tick)
                                 };
-                                let new_bpm =
-                                    (original_bpm + *raw_offset_bpm).clamp(MIN_BPM, MAX_BPM);
-                                if !is_anchor && new_tick != *tick {
-                                    self.project
-                                        .tempo_points
-                                        .retain(|existing| existing.at_tick != *tick);
+                                let new_value = (original_value + effective_offset_value)
+                                    .clamp(limit_low, limit_high);
+                                let (transition, hidden) = self
+                                    .project
+                                    .automation_points(lane, scope)
+                                    .iter()
+                                    .find(|point| point.at_tick == *tick)
+                                    .map_or((state.default_transition, false), |point| {
+                                        (point.transition, point.hidden)
+                                    });
+                                if !pinned && new_tick != *tick {
+                                    self.project.delete_automation_point(lane, scope, *tick);
                                 }
-                                let transition = self
-                                    .project
-                                    .tempo_points
-                                    .iter()
-                                    .find(|point| point.at_tick == *tick)
-                                    .map(|point| point.transition)
-                                    .unwrap_or(state.default_transition);
-                                let hidden = self
-                                    .project
-                                    .tempo_points
-                                    .iter()
-                                    .find(|point| point.at_tick == *tick)
-                                    .map(|point| point.hidden)
-                                    .unwrap_or(false);
-                                self.project.set_tempo_point(new_tick, new_bpm, transition);
-                                self.project.set_tempo_point_hidden(new_tick, hidden);
+                                self.project
+                                    .set_automation_point(lane, scope, new_tick, new_value, transition);
+                                self.project
+                                    .set_automation_point_hidden(lane, scope, new_tick, hidden);
                                 updated.push(new_tick);
                             }
                             state.selected_points = updated;
                         }
-                        AutomationDragMode::AreaSelecting { start_pos, .. } => {
-                            let current = pointer_pos.unwrap_or(*start_pos);
-                            state.drag_mode = AutomationDragMode::AreaSelecting {
-                                start_pos: *start_pos,
-                                current_pos: current,
-                            };
+                        AutomationDragMode::AreaSelecting { current_pos, .. } => {
+                            if let Some(pos) = pointer_pos {
+                                *current_pos = pos;
+                            }
                         }
                         AutomationDragMode::Idle => {}
                     }
                 }
 
-                if response.drag_stopped() {
-                    if let AutomationDragMode::AreaSelecting {
-                        start_pos,
-                        current_pos,
-                    } = &state.drag_mode
-                    {
-                        let selection_rect = Rect::from_two_pos(*start_pos, *current_pos);
-                        state.selected_points = sorted_points
-                            .iter()
-                            .filter(|point| {
-                                let center =
-                                    Pos2::new(tick_to_x(point.at_tick), bpm_to_y(point.bpm));
-                                selection_rect.contains(center)
-                            })
-                            .map(|point| point.at_tick)
-                            .collect();
+                if released {
+                    match std::mem::replace(&mut state.drag_mode, AutomationDragMode::Idle) {
+                        AutomationDragMode::AreaSelecting {
+                            start_pos,
+                            current_pos,
+                        } => {
+                            if (current_pos - start_pos).length() < CLICK_SLOP {
+                                let raw_tick = f64::from((start_pos.x - rect.left()) / pixels_per_tick).max(0.0);
+                                let tick = if alt || !snap_to_grid {
+                                    raw_tick.round()
+                                } else {
+                                    let grid = GRID_TICKS as f64;
+                                    (raw_tick / grid).round() * grid
+                                } as Tick;
+                                let value = snap_value(y_to_value(start_pos.y));
+                                self.project.set_automation_point(
+                                    lane,
+                                    scope,
+                                    tick,
+                                    value,
+                                    state.default_transition,
+                                );
+                                state.selected_points = vec![tick];
+                            } else {
+                                let selection_rect = Rect::from_two_pos(start_pos, current_pos);
+                                state.selected_points = sorted_points
+                                    .iter()
+                                    .filter(|point| selection_rect.contains(center_of(point)))
+                                    .map(|point| point.at_tick)
+                                    .collect();
+                            }
+                        }
+                        AutomationDragMode::MovingPoints { .. } | AutomationDragMode::Idle => {}
                     }
-                    state.drag_mode = AutomationDragMode::Idle;
                     if let Some(before) = state.drag_started_snapshot.take() {
                         self.record_project_edit(before);
-                    }
-                }
-
-                if response.clicked() && !response.dragged() {
-                    if let Some(pos) = pointer_pos {
-                        if let Some(hit_tick) = hit_test(pos) {
-                            state.selected_points = vec![hit_tick];
-                        } else {
-                            let mut tick = x_to_tick(pos.x);
-                            if snap_to_grid {
-                                tick = snap_tick(tick, TICKS_PER_QUARTER / 4);
-                            }
-                            let bpm = y_to_bpm(pos.y);
-                            let before = self.project.clone();
-                            self.project
-                                .set_tempo_point(tick, bpm, state.default_transition);
-                            self.record_project_edit(before);
-                            state.selected_points = vec![tick];
-                        }
                     }
                 }
 
@@ -3761,7 +3911,7 @@ impl BetterWriterApp {
                     painter.rect_stroke(
                         selection_rect,
                         0.0,
-                        Stroke::new(1.0, egui::Color32::from_rgb(80, 140, 255)),
+                        Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 140, 255)),
                         StrokeKind::Middle,
                     );
                 }
@@ -4173,22 +4323,33 @@ impl BetterWriterApp {
                     .prefix(" "),
             );
             ui.label("/");
-            // A list-scrolling `DragValue` rather than a `ComboBox`: a
-            // ComboBox opens its own popup, which conflicts with being nested
-            // inside a menu. It steps through {1,2,4,8,16,32} instead of every
-            // integer.
-            const DENOMINATORS: [u8; 6] = [1, 2, 4, 8, 16, 32];
-            const DENOMINATOR_LABELS: [&str; 6] = ["1", "2", "4", "8", "16", "32"];
-            if let Some(new_denominator) = list_drag_value(
-                ui,
-                "context_time_signature_denominator",
-                &DENOMINATORS,
-                &DENOMINATOR_LABELS,
-                self.time_signature_denominator,
-            ) {
-                self.time_signature_denominator = new_denominator;
+            if self.allow_irrational_time_signature {
+                ui.add(egui::DragValue::new(&mut self.time_signature_denominator).range(1..=255));
+            } else {
+                // A list-scrolling `DragValue` rather than a `ComboBox`: a
+                // ComboBox opens its own popup, which conflicts with being
+                // nested inside a menu.
+                const DENOMINATORS: [u8; 6] = [1, 2, 4, 8, 16, 32];
+                const DENOMINATOR_LABELS: [&str; 6] = ["1", "2", "4", "8", "16", "32"];
+                if let Some(new_denominator) = list_drag_value(
+                    ui,
+                    "context_time_signature_denominator",
+                    &DENOMINATORS,
+                    &DENOMINATOR_LABELS,
+                    self.time_signature_denominator,
+                ) {
+                    self.time_signature_denominator = new_denominator;
+                }
             }
         });
+        if ui
+            .checkbox(&mut self.allow_irrational_time_signature, "Allow irrational")
+            .on_hover_text("Any denominator, such as 4/6 or 5/12. Standard formats cannot store these.")
+            .changed()
+            && !self.allow_irrational_time_signature
+        {
+            self.time_signature_denominator = nearest_regular_denominator(self.time_signature_denominator);
+        }
         if ui.button("Apply to this track").clicked() {
             self.apply_time_signature_at_cursor();
             ui.close();
@@ -4196,7 +4357,6 @@ impl BetterWriterApp {
     }
 
     fn show_track_table(&mut self, ui: &mut egui::Ui) {
-        let show_all_sounds = self.show_all_sounds;
         let widths = track_column_widths(ui, &self.project.tracks);
         let mut mix_events: Vec<MixEvent> = Vec::new();
         let full_size = ui.available_size();
@@ -4212,7 +4372,7 @@ impl BetterWriterApp {
                     ui.spacing_mut().slider_width = 52.0;
                     if let Some(track) = self.project.track(self.selected_track_id) {
                         ui.add(
-                            egui::Label::new(format!("{} {}", track.name, track.program))
+                            egui::Label::new(format!("{} {}", track.name, track.sound().1))
                                 .truncate(),
                         );
                         ui.add(
@@ -4254,13 +4414,6 @@ impl BetterWriterApp {
                 ui.separator();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.x = TRACK_COLUMN_GAP;
-                    let sound_column_start: f32 = widths[..SOUND_COLUMN].iter().sum::<f32>()
-                        + TRACK_COLUMN_GAP * (SOUND_COLUMN as f32 - 1.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(sound_column_start);
-                        ui.checkbox(&mut self.show_all_sounds, "All sounds")
-                            .on_hover_text("List every sound, not only those for the instrument type");
-                    });
                     ui.horizontal(|ui| {
                         for (index, (heading, _)) in TRACK_COLUMNS.iter().enumerate() {
                             table_cell(ui, widths[index], |ui| ui.strong(*heading));
@@ -4269,6 +4422,7 @@ impl BetterWriterApp {
                     let mut selected_after = None;
                     let mut rename_started: Option<u64> = None;
                     let mut fx_toggled: Option<u64> = None;
+                    let mut instrument_picker_for: Option<u64> = None;
                     let mut rename_committed: Option<(u64, String)> = None;
                     let mut rename_cancelled = false;
                     let reveal = std::mem::take(&mut self.reveal_selected_track);
@@ -4426,55 +4580,26 @@ impl BetterWriterApp {
                                         }
                                     });
                                     table_cell(ui, widths[5], |ui| {
-                                        egui::ComboBox::from_id_salt(("track_instrument", track.id))
-                                            .selected_text(track.stringed_variant.label())
-                                            .width(widths[5] - 8.0)
-                                            .show_ui(ui, |ui| {
-                                                for variant in StringedVariant::ALL {
-                                                    if ui
-                                                        .selectable_label(
-                                                            variant == track.stringed_variant,
-                                                            variant.label(),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        mix_events.push(MixEvent {
-                                                            track_id: track.id,
-                                                            edit: Some(MixEdit::Variant(variant)),
-                                                            commit: true,
-                                                        });
-                                                    }
-                                                }
-                                            });
+                                        let name = track
+                                            .instrument_def()
+                                            .map_or_else(|| "Instrument".to_owned(), InstrumentDef::title);
+                                        let button = egui::Button::new(name).truncate()
+                                            .min_size(Vec2::new(widths[5] - 8.0, 0.0));
+                                        if ui
+                                            .add(button)
+                                            .on_hover_text("Choose the instrument")
+                                            .clicked()
+                                        {
+                                            instrument_picker_for = Some(track.id);
+                                        }
                                     });
                                     table_cell(ui, widths[6], |ui| {
-                                        egui::ComboBox::from_id_salt(("track_sound", track.id))
-                                            .selected_text(sound_name(track.program))
-                                            .width(widths[6] - 8.0)
-                                            .height(360.0)
-                                            .show_ui(ui, |ui| {
-                                                for program in sound_choices(
-                                                    track.stringed_variant,
-                                                    track.program,
-                                                    show_all_sounds,
-                                                ) {
-                                                    let label =
-                                                        format!("{program}  {}", sound_name(program));
-                                                    if ui
-                                                        .selectable_label(
-                                                            program == track.program,
-                                                            label,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        mix_events.push(MixEvent {
-                                                            track_id: track.id,
-                                                            edit: Some(MixEdit::Program(program)),
-                                                            commit: true,
-                                                        });
-                                                    }
-                                                }
-                                            });
+                                        sound_picker::sound_menu_button(
+                                            ui,
+                                            track,
+                                            widths[6],
+                                            &mut mix_events,
+                                        );
                                     });
                                     table_cell(ui, widths[7], |ui| {
                                         let mut volume = track.volume;
@@ -4539,6 +4664,9 @@ impl BetterWriterApp {
                     if let Some(track_id) = fx_toggled {
                         // The track's own button opens its own FX Chain.
                         self.toggle_fx_window(fx_chain::FxTarget::Track(track_id));
+                    }
+                    if let Some(track_id) = instrument_picker_for {
+                        self.instrument_picker = Some(sound_picker::InstrumentPicker::new(track_id));
                     }
                     if let Some(track_id) = rename_started {
                         let name = self
@@ -4845,8 +4973,8 @@ impl BetterWriterApp {
         }
     }
 
-    /// Mouse wheel zooms the score around the pointer (Ctrl+wheel and pinch
-    /// do too); Shift+wheel scrolls it vertically.
+    /// Mouse wheel scrolls the score vertically; Shift+wheel, Ctrl+wheel and
+    /// pinch zoom it around the pointer.
     fn handle_canvas_scroll(&mut self, ui: &egui::Ui, response: &egui::Response, page: Rect) {
         let Some(track) = self.project.track(self.selected_track_id) else {
             return;
@@ -4879,17 +5007,19 @@ impl BetterWriterApp {
                     input.pointer.hover_pos(),
                 )
             });
-            if shift {
-                self.scroll_y = (self.scroll_y - (scroll.x + scroll.y)).clamp(0.0, max_scroll);
-            } else {
+            if shift || (pinch - 1.0).abs() > 1e-6 {
+                // Some systems turn Shift+wheel into horizontal scrolling.
+                let wheel = scroll.x + scroll.y;
                 let factor = if (pinch - 1.0).abs() > 1e-6 {
                     pinch
                 } else {
-                    (scroll.y * WHEEL_ZOOM_PER_POINT).exp()
+                    (wheel * WHEEL_ZOOM_PER_POINT).exp()
                 };
                 if (factor - 1.0).abs() > 1e-6 {
                     self.zoom_score_at(factor, pointer.unwrap_or(page.center()), page);
                 }
+            } else {
+                self.scroll_y = (self.scroll_y - scroll.y).clamp(0.0, max_scroll);
             }
         }
         let max_scroll = self
@@ -4900,7 +5030,7 @@ impl BetterWriterApp {
     }
 
     /// A vertical scrollbar along the right edge of the score area. The
-    /// wheel zooms, so this and Shift+wheel are how the score scrolls.
+    /// wheel scrolls it too; Shift+wheel zooms.
     fn show_score_scrollbar(
         &mut self,
         ui: &mut egui::Ui,
@@ -5831,7 +5961,10 @@ impl BetterWriterApp {
     ) {
         let system_origin_tick = system.start_tick;
         let system_ticks = system.tick_span();
-        for point in self.project.tempo_points.iter().filter(|point| {
+        let points = self
+            .project
+            .automation_points(AutomationLane::Tempo, self.automation_scope());
+        for point in points.iter().filter(|point| {
             !point.hidden
                 && point.at_tick >= system_origin_tick
                 && point.at_tick < system_origin_tick + system_ticks
@@ -5840,7 +5973,7 @@ impl BetterWriterApp {
             painter.text(
                 Pos2::new(x, staff_y - 12.0),
                 Align2::LEFT_BOTTOM,
-                format!("♩={}", point.bpm.round() as i32),
+                format!("♩={}", point.value.round() as i32),
                 FontId::proportional(12.0),
                 self.theme.notation_foreground,
             );
@@ -7691,8 +7824,8 @@ fn fx_button_pair(
 
 /// Track table columns: heading and least width. The Name, Instrument and
 /// Sound columns grow to their longest entry (`track_column_widths`); the
-/// others stay fixed. One set of widths serves the header, the "All sounds"
-/// checkbox and every row, so they all line up.
+/// others stay fixed. One set of widths serves the header and every row, so
+/// they all line up.
 const TRACK_COLUMNS: [(&str, f32); 10] = [
     ("N", 24.0),
     ("S", 20.0),
@@ -7729,13 +7862,20 @@ fn track_column_widths(ui: &egui::Ui, tracks: &[InstrumentTrack]) -> [f32; 10] {
     widths[0] = widths[0].max(ids + 14.0);
     let names = longest(&mut tracks.iter().map(|track| track.name.clone()));
     widths[4] = widths[4].max((names + 16.0).min(MAX_NAME_WIDTH));
-    let variants = longest(&mut StringedVariant::ALL.iter().map(|variant| variant.label().to_owned()));
-    widths[5] = widths[5].max((variants + COMBO_EXTRA_WIDTH).min(MAX_SOUND_WIDTH));
-    let sounds = longest(&mut tracks.iter().map(|track| sound_name(track.program).to_owned()));
+    let instruments = longest(&mut tracks.iter().map(|track| {
+        track
+            .instrument_def()
+            .map_or_else(String::new, InstrumentDef::title)
+    }));
+    widths[5] = widths[5].max((instruments + COMBO_EXTRA_WIDTH).min(MAX_SOUND_WIDTH));
+    let sounds = longest(&mut tracks.iter().map(|track| {
+        let (bank, program) = track.sound();
+        let label = sound_label(bank, program);
+        if track.sound_auto { format!("Auto: {label}") } else { label }
+    }));
     widths[6] = widths[6].max((sounds + COMBO_EXTRA_WIDTH).min(MAX_SOUND_WIDTH));
     widths
 }
-const SOUND_COLUMN: usize = 6;
 
 /// The theme's background image, decoded once. `loaded` is `None` when the
 /// file could not be read, so it is not retried every frame.
@@ -7862,6 +8002,13 @@ fn pan_label(pan: i8) -> String {
         0 => "C".to_owned(),
         pan if pan < 0 => format!("L{}", -(pan as i16)),
         pan => format!("R{pan}"),
+    }
+}
+
+fn automation_value_text(lane: AutomationLane, value: f32) -> String {
+    match lane {
+        AutomationLane::Tempo | AutomationLane::Volume => format!("{}", value.round() as i32),
+        AutomationLane::Pan => pan_label(value.round().clamp(-64.0, 63.0) as i8),
     }
 }
 
@@ -8117,11 +8264,15 @@ fn string_label(midi: u8) -> &'static str {
     }
 }
 
+/// The bundled soundfont: in the `assets` folder next to the program (how
+/// a release is packaged), else in the source tree it was built from.
 fn default_soundfont_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("soundfonts")
-        .join("MS Basic.sf3")
+    let relative = Path::new("assets").join("soundfonts").join("MS Basic.sf3");
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&relative)))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
 }
 
 fn default_save_name(project: &BwxProject) -> String {
@@ -8305,6 +8456,14 @@ fn list_drag_value<T: Copy + PartialEq>(
         .inner
         .changed();
     changed.then(|| values[index.clamp(0, max_index) as usize])
+}
+
+/// The power-of-two denominator (up to 32) closest to `denominator`.
+fn nearest_regular_denominator(denominator: u8) -> u8 {
+    [1_u8, 2, 4, 8, 16, 32]
+        .into_iter()
+        .min_by_key(|candidate| candidate.abs_diff(denominator))
+        .unwrap_or(4)
 }
 
 fn small_tool_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {

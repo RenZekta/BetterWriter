@@ -237,6 +237,9 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             },
             channel: melodic_channel(track_index),
             program,
+            bank: 0,
+            sound_auto: false,
+            instrument_id: String::new(),
             solo: track_flags & TRACK_SOLO != 0,
             mute: track_flags & TRACK_MUTE != 0,
             volume,
@@ -255,6 +258,9 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             bar_marks: Vec::new(),
             sound_chain: Vec::new(),
             fx_bypassed: false,
+            tempo_points: Vec::new(),
+            volume_points: Vec::new(),
+            pan_points: Vec::new(),
         });
     }
 
@@ -266,6 +272,9 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             title
         },
         tempo_points: tempo_points(&headers),
+        volume_points: Vec::new(),
+        pan_points: Vec::new(),
+        per_track_automation: false,
         tracks,
         next_note_id,
         master_chain: Vec::new(),

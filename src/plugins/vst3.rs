@@ -11,7 +11,10 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
 
 use vst3::{Class, ComPtr, ComRef, ComWrapper, Interface, Steinberg::Vst::*, Steinberg::*};
 
@@ -359,8 +362,9 @@ pub struct NoteEvent {
     pub velocity: f32,
 }
 
+/// Reused for every block, so the audio thread never allocates for events.
 struct EventList {
-    events: Vec<Event>,
+    events: Mutex<Vec<Event>>,
 }
 
 impl Class for EventList {
@@ -369,11 +373,14 @@ impl Class for EventList {
 
 impl IEventListTrait for EventList {
     unsafe fn getEventCount(&self) -> int32 {
-        self.events.len() as int32
+        self.events.lock().map_or(0, |events| events.len() as int32)
     }
 
     unsafe fn getEvent(&self, index: int32, event: *mut Event) -> tresult {
-        match self.events.get(index as usize) {
+        let Ok(events) = self.events.lock() else {
+            return kInvalidArgument;
+        };
+        match events.get(index as usize) {
             Some(found) => {
                 unsafe { *event = *found };
                 kResultOk
@@ -415,9 +422,21 @@ fn note_event(note: &NoteEvent) -> Event {
     event
 }
 
+/// One changed parameter. Made once, refilled for every block.
 struct ParamQueue {
-    id: ParamID,
-    value: ParamValue,
+    id: AtomicU32,
+    value: AtomicU64,
+}
+
+impl ParamQueue {
+    fn set(&self, id: ParamID, value: ParamValue) {
+        self.id.store(id, Ordering::Relaxed);
+        self.value.store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    fn value(&self) -> ParamValue {
+        f64::from_bits(self.value.load(Ordering::Relaxed))
+    }
 }
 
 impl Class for ParamQueue {
@@ -426,7 +445,7 @@ impl Class for ParamQueue {
 
 impl IParamValueQueueTrait for ParamQueue {
     unsafe fn getParameterId(&self) -> ParamID {
-        self.id
+        self.id.load(Ordering::Relaxed)
     }
 
     unsafe fn getPointCount(&self) -> int32 {
@@ -444,7 +463,7 @@ impl IParamValueQueueTrait for ParamQueue {
         }
         unsafe {
             *sample_offset = 0;
-            *value = self.value;
+            *value = self.value();
         }
         kResultOk
     }
@@ -459,8 +478,29 @@ impl IParamValueQueueTrait for ParamQueue {
     }
 }
 
+/// How many different parameters one block can carry; more wait for the next.
+const MAX_PARAM_CHANGES: usize = 64;
+
 struct ParamChanges {
     queues: Vec<ComWrapper<ParamQueue>>,
+    /// The queues in use this block.
+    count: AtomicUsize,
+}
+
+impl ParamChanges {
+    fn new() -> Self {
+        Self {
+            queues: (0..MAX_PARAM_CHANGES)
+                .map(|_| {
+                    ComWrapper::new(ParamQueue {
+                        id: AtomicU32::new(0),
+                        value: AtomicU64::new(0),
+                    })
+                })
+                .collect(),
+            count: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl Class for ParamChanges {
@@ -469,10 +509,13 @@ impl Class for ParamChanges {
 
 impl IParameterChangesTrait for ParamChanges {
     unsafe fn getParameterCount(&self) -> int32 {
-        self.queues.len() as int32
+        self.count.load(Ordering::Relaxed) as int32
     }
 
     unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
+        if index < 0 || index as usize >= self.count.load(Ordering::Relaxed) {
+            return std::ptr::null_mut();
+        }
         self.queues
             .get(index as usize)
             .and_then(|queue| queue.as_com_ref::<IParamValueQueue>())
@@ -589,6 +632,13 @@ pub struct Instance {
     pub outputs: usize,
     scratch_in: [Vec<f32>; 2],
     scratch_out: [Vec<f32>; 2],
+    /// Host objects handed to every `process` call, reused so the audio
+    /// thread does not allocate.
+    events: ComWrapper<EventList>,
+    changes: ComWrapper<ParamChanges>,
+    /// Parameter changes that did not fit the block they were taken in.
+    pending: Vec<(u32, f64)>,
+    sample_rate: f64,
     running: bool,
     /// Declared last so it drops last: the library must stay loaded until
     /// every object the plug-in handed out has been released.
@@ -748,6 +798,12 @@ impl Instance {
                 outputs,
                 scratch_in: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
                 scratch_out: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
+                events: ComWrapper::new(EventList {
+                    events: Mutex::new(Vec::with_capacity(512)),
+                }),
+                changes: ComWrapper::new(ParamChanges::new()),
+                pending: Vec::with_capacity(256),
+                sample_rate,
                 running: true,
             })
         }
@@ -760,6 +816,10 @@ impl Instance {
         if frames == 0 || !self.running {
             return;
         }
+        // A plug-in that reports silence need not write its output, so the
+        // buffers start clean and are never left holding an earlier block.
+        self.scratch_out[0][..frames].fill(0.0);
+        self.scratch_out[1][..frames].fill(0.0);
         self.scratch_in[0][..frames].copy_from_slice(&left[..frames]);
         self.scratch_in[1][..frames].copy_from_slice(&right[..frames]);
 
@@ -776,18 +836,36 @@ impl Instance {
             __field0: AudioBusBuffers__type0 { channelBuffers32: out_ptrs.as_mut_ptr() },
         };
 
-        let events = ComWrapper::new(EventList { events: notes.iter().map(note_event).collect() });
-        let pending: Vec<(u32, f64)> = self
-            .edits
-            .try_lock()
-            .map(|mut edits| std::mem::take(&mut *edits))
-            .unwrap_or_default();
-        let changes = ComWrapper::new(ParamChanges {
-            queues: pending
-                .into_iter()
-                .map(|(id, value)| ComWrapper::new(ParamQueue { id, value }))
-                .collect(),
-        });
+        if let Ok(mut events) = self.events.events.lock() {
+            events.clear();
+            events.extend(notes.iter().map(note_event));
+        }
+        if let Ok(mut edits) = self.edits.try_lock() {
+            self.pending.extend(edits.drain(..));
+        }
+        // One queue per parameter with its latest value; what does not fit
+        // stays pending for the next block.
+        let mut used = 0;
+        let mut index = 0;
+        while index < self.pending.len() {
+            let (id, value) = self.pending[index];
+            let same = (0..used).find(|&queue| {
+                self.changes.queues[queue].id.load(Ordering::Relaxed) == id
+            });
+            if let Some(queue) = same {
+                self.changes.queues[queue].set(id, value);
+                self.pending.remove(index);
+            } else if used < MAX_PARAM_CHANGES {
+                self.changes.queues[used].set(id, value);
+                used += 1;
+                self.pending.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        self.changes.count.store(used, Ordering::Relaxed);
+        let events = &self.events;
+        let changes = &self.changes;
 
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as int32,
@@ -810,12 +888,43 @@ impl Instance {
         // SAFETY: every pointer in `data` outlives this call and the buffers
         // hold `frames` samples.
         let result = unsafe { self.processor.process(&mut data) };
+        let silent = output_bus.silenceFlags;
+        for channel in 0..2 {
+            if silent & (1 << channel) != 0 {
+                self.scratch_out[channel][..frames].fill(0.0);
+            }
+        }
         if ok(result) {
             left[..frames].copy_from_slice(&self.scratch_out[0][..frames]);
             right[..frames].copy_from_slice(
                 &self.scratch_out[if self.outputs > 1 { 1 } else { 0 }][..frames],
             );
         }
+    }
+
+    /// Tells the plug-in the sound card now runs at another rate. The plug-in
+    /// is stopped, set up again and restarted, which keeps its settings and
+    /// its open editor.
+    pub fn set_sample_rate(&mut self, sample_rate: f64) {
+        if !self.running || (sample_rate - self.sample_rate).abs() < 0.5 {
+            return;
+        }
+        let mut setup = ProcessSetup {
+            processMode: ProcessModes_::kRealtime as int32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
+            maxSamplesPerBlock: MAX_BLOCK as int32,
+            sampleRate: sample_rate,
+        };
+        // SAFETY: plain COM calls in the order the specification gives for a
+        // change of setup: stop, deactivate, set up, activate, start.
+        unsafe {
+            self.processor.setProcessing(0);
+            self.component.setActive(0);
+            self.processor.setupProcessing(&mut setup);
+            self.component.setActive(1);
+            self.processor.setProcessing(1);
+        }
+        self.sample_rate = sample_rate;
     }
 
     /// The plug-in's saved settings.
@@ -871,6 +980,15 @@ pub struct ControllerHandle {
     edits: EditQueue,
 }
 
+impl Clone for ControllerHandle {
+    fn clone(&self) -> Self {
+        Self {
+            controller: self.controller.clone(),
+            edits: self.edits.clone(),
+        }
+    }
+}
+
 impl ControllerHandle {
     pub fn controller(&self) -> &ComPtr<IEditController> {
         &self.controller
@@ -899,6 +1017,7 @@ impl ControllerHandle {
                     title: wide_to_string(&info.title),
                     units: wide_to_string(&info.units),
                     steps: info.stepCount.max(0) as u32,
+                    default: info.defaultNormalizedValue.clamp(0.0, 1.0),
                     read_only,
                 });
             }
@@ -946,6 +1065,8 @@ pub struct ParameterDesc {
     /// 0 for a continuous parameter, otherwise the number of steps.
     #[allow(dead_code)]
     pub steps: u32,
+    /// The value the plug-in starts with, 0.0 to 1.0.
+    pub default: f64,
     pub read_only: bool,
 }
 
@@ -1058,7 +1179,12 @@ impl Editor {
         self.requested.lock().ok().and_then(|mut requested| requested.take())
     }
 
-    #[allow(dead_code)]
+    /// Whether the editor can be made another size than its own.
+    pub fn can_resize(&self) -> bool {
+        // SAFETY: plain COM call.
+        unsafe { self.view.canResize() == kResultTrue }
+    }
+
     pub fn resize(&self, width: i32, height: i32) {
         let mut rect = ViewRect { left: 0, top: 0, right: width, bottom: height };
         // SAFETY: `rect` is a valid in-parameter.
