@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::automation::{AutomationPoint, value_at};
+use super::automation::AutomationPoint;
 
 pub type Tick = i64;
 pub const TICKS_PER_QUARTER: Tick = 960;
@@ -479,6 +479,38 @@ impl InstrumentTrack {
         }
     }
 
+    /// The preset one note sounds with when it is not the track's usual one:
+    /// palm muted, slapped or popped notes take the instrument's own preset
+    /// for that technique. Only while the sound is automatic.
+    pub fn note_sound(&self, note: &TabNote) -> Option<(u16, u8)> {
+        use crate::core::instruments::{Technique, technique_sound};
+        if !self.sound_auto {
+            return None;
+        }
+        let effects = &note.effects;
+        let technique = if effects.slapping {
+            Technique::Slap
+        } else if effects.popping {
+            Technique::Pop
+        } else if effects.palm_mute {
+            Technique::Mute
+        } else {
+            return None;
+        };
+        technique_sound(self.instrument_def()?.id, technique).filter(|&sound| sound != self.sound())
+    }
+
+    /// The preset the track is sounding at `tick`: the one the latest note
+    /// started by then asked for, else the track's usual one.
+    pub fn sound_at(&self, tick: Tick) -> (u16, u8) {
+        self.notes
+            .iter()
+            .filter(|note| note.abs_tick <= tick && !self.is_tied_continuation(note))
+            .max_by_key(|note| note.abs_tick)
+            .and_then(|note| self.note_sound(note))
+            .unwrap_or_else(|| self.sound())
+    }
+
     /// Makes the track another instrument: its tab-view type follows, and so
     /// does the sound while it is automatic. A sound that was picked by hand
     /// stays, as do the tuning and the notes.
@@ -655,6 +687,48 @@ impl InstrumentTrack {
             .min(127)
     }
 
+    /// Stretches of palm muting as (first onset, last onset): consecutive
+    /// onsets that carry the effect. An onset without it ends the stretch;
+    /// rests do not.
+    pub fn palm_mute_runs(&self) -> Vec<(Tick, Tick)> {
+        let mut onsets: Vec<(Tick, bool)> = Vec::new();
+        let mut sorted: Vec<&TabNote> = self.notes.iter().collect();
+        sorted.sort_by_key(|note| note.abs_tick);
+        for note in sorted {
+            match onsets.last_mut() {
+                Some((tick, muted)) if *tick == note.abs_tick => *muted |= note.effects.palm_mute,
+                _ => onsets.push((note.abs_tick, note.effects.palm_mute)),
+            }
+        }
+        let mut runs: Vec<(Tick, Tick)> = Vec::new();
+        let mut open: Option<(Tick, Tick)> = None;
+        for (tick, muted) in onsets {
+            match (muted, open.as_mut()) {
+                (true, Some(run)) => run.1 = tick,
+                (true, None) => open = Some((tick, tick)),
+                (false, _) => runs.extend(open.take()),
+            }
+        }
+        runs.extend(open);
+        runs
+    }
+
+    /// The tick where each palm muting stretch of `palm_mute_runs` stops
+    /// sounding: the end of the longest muted note on its last onset.
+    pub fn palm_mute_ends(&self) -> Vec<Tick> {
+        self.palm_mute_runs()
+            .into_iter()
+            .map(|(_, last)| {
+                self.notes
+                    .iter()
+                    .filter(|note| note.abs_tick == last && note.effects.palm_mute)
+                    .map(|note| note.end_tick())
+                    .max()
+                    .unwrap_or(last)
+            })
+            .collect()
+    }
+
     pub fn sort_notes(&mut self) {
         self.notes.sort_by_key(|note| {
             (
@@ -680,6 +754,17 @@ impl InstrumentTrack {
         cursor
     }
 
+    /// Appends bars until the track's bars reach at least `end_tick`, the
+    /// way pasting past the last bar does. Returns how many were added.
+    pub fn grow_bars_to_cover(&mut self, end_tick: Tick) -> u32 {
+        let mut added = 0;
+        while self.bars_end_tick() < end_tick {
+            self.bar_count = self.bar_count.max(1) + 1;
+            added += 1;
+        }
+        added
+    }
+
     /// 0-based index of the bar containing `tick`, clamped to the last bar
     /// that actually exists (`bar_count - 1`).
     pub fn bar_index_at(&self, tick: Tick) -> u32 {
@@ -702,8 +787,7 @@ pub struct BwxProject {
     pub schema_version: u16,
     pub title: String,
     /// Shared tempo curve. Always has at least one point; the point at or
-    /// before tick 0 governs playback until the next point takes over. See
-    /// `tempo_at`.
+    /// before tick 0 governs playback until the next point takes over.
     pub tempo_points: Vec<TempoPoint>,
     /// Shared volume and pan curves, applied to every track. They are empty
     /// until a point is added; before the first point a track plays at its
@@ -922,13 +1006,21 @@ impl BwxProject {
         self.tracks.iter_mut().find(|track| track.id == id)
     }
 
-    /// The flat bpm of the shared tempo curve at `tick`: the latest point at
-    /// or before it. Falls back to 120 if the project somehow has no points
-    /// at all (every constructor seeds one at tick 0, so this is only a
-    /// defensive floor).
-    pub fn tempo_at(&self, tick: Tick) -> f32 {
-        let points: Vec<AutomationPoint> = self.tempo_points.iter().map(Into::into).collect();
-        value_at(&points, tick).unwrap_or(120.0)
+    /// Moves a track to place `to` (0-based, counted after the move) in the
+    /// track order. The track keeps its id, channel and everything else, so
+    /// only its row in the table, its timeline row and its place in exports
+    /// change. Returns whether the order changed.
+    pub fn move_track(&mut self, track_id: u64, to: usize) -> bool {
+        let Some(from) = self.tracks.iter().position(|track| track.id == track_id) else {
+            return false;
+        };
+        let to = to.min(self.tracks.len() - 1);
+        if from == to {
+            return false;
+        }
+        let track = self.tracks.remove(from);
+        self.tracks.insert(to, track);
+        true
     }
 
     pub fn allocate_note_id(&mut self) -> u64 {
@@ -948,6 +1040,78 @@ fn default_track_pan() -> i8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_sound_follows_the_technique_of_each_note() {
+        use crate::core::instruments::instrument;
+        let mut project = BwxProject::demo();
+        let id = project.tracks[0].id;
+        let note = project.insert_note(id, 0, TICKS_PER_QUARTER, 0, 3).unwrap();
+        let track = project.track_mut(id).unwrap();
+        track.set_instrument(instrument("electric-guitar").unwrap());
+        track.sound_auto = true;
+        let mut played = track.notes.iter().find(|n| n.id == note).unwrap().clone();
+        assert_eq!(track.note_sound(&played), None);
+        played.effects.palm_mute = true;
+        assert_eq!(track.note_sound(&played), Some((0, 28)));
+        // A technique the instrument has no preset for changes nothing.
+        played.effects.slapping = true;
+        assert_eq!(track.note_sound(&played), None);
+        track.set_instrument(instrument("electric-bass").unwrap());
+        assert_eq!(track.note_sound(&played), Some((0, 36)));
+        played.effects.slapping = false;
+        played.effects.popping = true;
+        assert_eq!(track.note_sound(&played), Some((0, 37)));
+        // A sound picked by hand stays for every note.
+        track.set_sound(0, 30);
+        assert_eq!(track.note_sound(&played), None);
+    }
+
+    #[test]
+    fn the_sound_at_the_playhead_is_that_of_the_latest_started_note() {
+        use crate::core::instruments::instrument;
+        let mut project = BwxProject::demo();
+        let id = project.tracks[0].id;
+        project.tracks[0].notes.clear();
+        project.insert_note(id, 0, TICKS_PER_QUARTER, 0, 3).unwrap();
+        let muted = project
+            .insert_note(id, TICKS_PER_QUARTER * 2, TICKS_PER_QUARTER, 0, 5)
+            .unwrap();
+        let track = project.track_mut(id).unwrap();
+        track.set_instrument(instrument("electric-guitar").unwrap());
+        track.set_sound_automatic();
+        track.notes.iter_mut().find(|n| n.id == muted).unwrap().effects.palm_mute = true;
+        let usual = track.sound();
+        assert_eq!(track.sound_at(0), usual);
+        assert_eq!(track.sound_at(TICKS_PER_QUARTER), usual);
+        assert_eq!(track.sound_at(TICKS_PER_QUARTER * 2), (0, 28));
+        // The preset holds through the rest after the muted note.
+        assert_eq!(track.sound_at(TICKS_PER_QUARTER * 3), (0, 28));
+    }
+
+    #[test]
+    fn palm_muting_runs_from_the_first_to_the_last_muted_onset() {
+        let q = TICKS_PER_QUARTER;
+        let mut project = BwxProject::demo();
+        let id = project.tracks[0].id;
+        project.tracks[0].notes.clear();
+        for (index, muted) in [true, true, false, true, false, true].into_iter().enumerate() {
+            let note = project.insert_note(id, q * index as Tick, q, 0, 3).unwrap();
+            let track = project.track_mut(id).unwrap();
+            track.notes.iter_mut().find(|n| n.id == note).unwrap().effects.palm_mute = muted;
+        }
+        // A second, unmuted note on a muted onset does not break the run.
+        project.insert_note(id, 0, q, 1, 2).unwrap();
+        let runs = project.track(id).unwrap().palm_mute_runs();
+        assert_eq!(runs, [(0, q), (q * 3, q * 3), (q * 5, q * 5)]);
+        // Each stretch lasts to the end of its last muted note.
+        assert_eq!(
+            project.track(id).unwrap().palm_mute_ends(),
+            [q * 2, q * 4, q * 6]
+        );
+        project.tracks[0].notes.clear();
+        assert!(project.tracks[0].palm_mute_runs().is_empty());
+    }
+
     #[test]
     fn irrational_signatures_have_whole_tick_bars() {
         assert_eq!(TimeSignature::new(4, 6).measure_ticks(), 2560);
@@ -1111,5 +1275,64 @@ mod tests {
         let id = project.add_track_like(1).unwrap();
         let added = project.track(id).unwrap();
         assert!(!added.mute && !added.solo);
+    }
+}
+
+#[cfg(test)]
+mod grow_bars_tests {
+    use super::*;
+
+    #[test]
+    fn bars_grow_until_they_cover_the_tick() {
+        let mut project = BwxProject::demo();
+        let track = &mut project.tracks[0];
+        track.bar_count = 2;
+        let end = track.bars_end_tick();
+        assert_eq!(track.grow_bars_to_cover(end), 0);
+        assert_eq!(track.grow_bars_to_cover(end + 1), 1);
+        assert_eq!(track.bar_count, 3);
+        assert!(track.bars_end_tick() > end);
+        assert_eq!(track.grow_bars_to_cover(track.bars_end_tick() + 1), 1);
+    }
+}
+
+#[cfg(test)]
+mod move_track_tests {
+    use super::*;
+
+    fn order(project: &BwxProject) -> Vec<u64> {
+        project.tracks.iter().map(|track| track.id).collect()
+    }
+
+    #[test]
+    fn a_track_moves_to_the_place_asked_for_and_keeps_its_content() {
+        let mut project = BwxProject::demo();
+        let first_id = project.tracks[0].id;
+        project.add_track_like(first_id).unwrap();
+        let ids = order(&project);
+        assert!(ids.len() >= 3);
+        let first = project.tracks[0].clone();
+
+        assert!(project.move_track(ids[0], 2));
+        let mut expected = ids.clone();
+        expected.remove(0);
+        expected.insert(2, ids[0]);
+        assert_eq!(order(&project), expected);
+        assert_eq!(project.tracks[2], first);
+
+        // Moving it back restores the order; so does asking past the end.
+        assert!(project.move_track(ids[0], 0));
+        assert_eq!(order(&project), ids);
+        assert!(project.move_track(ids[0], 99));
+        assert_eq!(*order(&project).last().unwrap(), ids[0]);
+    }
+
+    #[test]
+    fn moving_a_track_where_it_is_or_one_that_is_missing_changes_nothing() {
+        let mut project = BwxProject::demo();
+        let ids = order(&project);
+        assert!(!project.move_track(ids[1], 1));
+        assert!(!project.move_track(u64::MAX, 0));
+        assert_eq!(order(&project), ids);
     }
 }

@@ -1,15 +1,15 @@
-use std::{
-    fs::File,
-    io::{Cursor, Write},
-    path::Path,
-};
+use std::path::Path;
 
 use thiserror::Error;
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::core::{BwxProject, CompatibilityReport, StandardExportFormat};
+use crate::core::BwxProject;
 
+pub mod guitarpro;
+pub mod midi;
+pub mod musescore;
+pub mod score;
 pub mod tuxguitar;
+pub mod xml;
 
 #[derive(Debug, Error)]
 pub enum FormatError {
@@ -65,10 +65,7 @@ pub fn save_project(path: impl AsRef<Path>, project: &BwxProject) -> Result<(), 
     let path = path.as_ref();
     match extension(path).as_deref() {
         Some("bwx") => save_bwx(path, project),
-        Some("tg") => {
-            std::fs::write(path, tuxguitar::write_tg(project)?)?;
-            Ok(())
-        }
+        Some("tg") => export_project(path, project),
         Some(other) => Err(FormatError::UnsupportedFormat(format!(
             ".{other} saving is not implemented yet"
         ))),
@@ -76,69 +73,29 @@ pub fn save_project(path: impl AsRef<Path>, project: &BwxProject) -> Result<(), 
     }
 }
 
-pub fn write_multitrack_bundle(
-    path: impl AsRef<Path>,
-    project: &BwxProject,
-    selected_track_ids: &[u64],
-    format: StandardExportFormat,
-    report: &CompatibilityReport,
-) -> Result<(), FormatError> {
-    if !report.standard_exports_enabled {
-        return Err(FormatError::Incompatible(
-            report.warning.clone().unwrap_or_else(|| {
-                "The current project cannot be flattened to a standard tab format.".to_owned()
-            }),
-        ));
-    }
-
-    let mut archive = ZipWriter::new(Cursor::new(Vec::<u8>::new()));
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-
-    for track_id in selected_track_ids {
-        let Some(track) = project.track(*track_id) else {
-            continue;
-        };
-        let file_name = format!("{}{}", sanitize_file_name(&track.name), format.label());
-        archive.start_file(file_name, options)?;
-
-        // A flattened text listing per track, not a native .tg/.gp file; the
-        // compatibility validator decides which projects reach this path.
-        let mut text = String::new();
-        text.push_str("# BetterWriter compatibility export\n");
-        text.push_str(&format!("# Track: {}\n", track.name));
-        text.push_str("# Events are absolute ticks in a flattened standard timeline.\n");
-        for note in &track.notes {
-            text.push_str(&format!(
-                "note tick={} duration={} string={} fret={} velocity={}\n",
-                note.abs_tick, note.duration_ticks, note.string_index, note.fret, note.velocity
+/// Writes `project` in the standard format its extension names: `.tg`, `.gp`,
+/// `.mid` or `.mscz` / `.mscx`.
+pub fn export_project(path: impl AsRef<Path>, project: &BwxProject) -> Result<(), FormatError> {
+    let path = path.as_ref();
+    let bytes = match extension(path).as_deref() {
+        Some("tg") => tuxguitar::write_tg(project)?,
+        Some("gp") => guitarpro::write_gp(project)?,
+        Some("mid" | "midi") => midi::write_midi(project)?,
+        Some("mscz") => musescore::write_mscz(project)?,
+        Some("mscx") => musescore::write_mscx(project)?,
+        Some(other) => {
+            return Err(FormatError::UnsupportedFormat(format!(
+                ".{other} export is not implemented"
+            )));
+        }
+        None => {
+            return Err(FormatError::UnsupportedFormat(
+                "file has no extension".to_owned(),
             ));
         }
-        archive.write_all(text.as_bytes())?;
-    }
-
-    let cursor = archive.finish()?;
-    let mut file = File::create(path)?;
-    file.write_all(&cursor.into_inner())?;
+    };
+    std::fs::write(path, bytes)?;
     Ok(())
-}
-
-fn sanitize_file_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        "track".to_owned()
-    } else {
-        sanitized
-    }
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -150,6 +107,35 @@ fn extension(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_picks_the_format_from_the_extension() {
+        let dir = std::env::temp_dir().join(format!("bw_export_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = score::aligned_demo();
+        for (name, magic) in [
+            ("a.tg", &b"\x00"[..]),
+            ("a.gp", &b"PK"[..]),
+            ("a.mid", &b"MThd"[..]),
+            ("a.mscz", &b"PK"[..]),
+            ("a.mscx", &b"<?xml"[..]),
+        ] {
+            let path = dir.join(name);
+            export_project(&path, &project).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(bytes.windows(magic.len()).any(|w| w == magic) || name == "a.tg", "{name}");
+            assert!(!bytes.is_empty(), "{name}");
+        }
+        assert!(matches!(
+            export_project(dir.join("a.pdf"), &project),
+            Err(FormatError::UnsupportedFormat(_))
+        ));
+        assert!(matches!(
+            export_project(dir.join("a.gp"), &BwxProject::demo()),
+            Err(FormatError::Incompatible(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn bwx_round_trip_preserves_tracks() {

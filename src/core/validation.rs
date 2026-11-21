@@ -2,26 +2,14 @@ use serde::{Deserialize, Serialize};
 
 use super::project::{BwxProject, Tick};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StandardExportFormat {
-    TuxGuitar,
-    GuitarPro,
-}
-
-impl StandardExportFormat {
-    pub fn label(self) -> &'static str {
-        match self {
-            StandardExportFormat::TuxGuitar => ".tg",
-            StandardExportFormat::GuitarPro => ".gp",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompatibilityReport {
     pub has_polymeter: bool,
     pub has_unaligned_bar_boundaries: bool,
     pub has_irrational_meter: bool,
+    /// Tracks disagree on repeat signs or, with per-track automation, on the
+    /// tempo; standard formats keep both once for the whole score.
+    pub has_diverging_tracks: bool,
     pub standard_exports_enabled: bool,
     pub warning: Option<String>,
 }
@@ -58,23 +46,39 @@ impl CompatibilityReport {
                 != first_signature
         });
 
+        // Denominators past a 64th have no note value in the target formats.
         let has_irrational_meter = project.tracks.iter().any(|track| {
             track
                 .time_signature_changes
                 .iter()
-                .any(|change| !change.signature.is_regular())
+                .any(|change| !change.signature.is_regular() || change.signature.denominator > 64)
         });
 
-        let incompatible = has_polymeter || has_unaligned_bar_boundaries || has_irrational_meter;
-        let warning = if has_irrational_meter && !(has_polymeter || has_unaligned_bar_boundaries) {
+        let first = project.tracks.first();
+        let has_diverging_tracks = project.tracks.iter().skip(1).any(|track| {
+            let first = first.expect("a second track implies a first");
+            track.bar_marks != first.bar_marks
+                || (project.per_track_automation && track.tempo_points != first.tempo_points)
+        });
+
+        let incompatible = has_polymeter
+            || has_unaligned_bar_boundaries
+            || has_irrational_meter
+            || has_diverging_tracks;
+        let warning = if has_polymeter || has_unaligned_bar_boundaries {
+            Some("Polyrhythms detected, incompatible format.".to_owned())
+        } else if has_irrational_meter {
             Some("Irrational time signature, incompatible format.".to_owned())
+        } else if has_diverging_tracks {
+            Some("Tracks differ in repeats or tempo, incompatible format.".to_owned())
         } else {
-            incompatible.then(|| "Polyrhythms detected, incompatible format.".to_owned())
+            None
         };
         Self {
             has_polymeter,
             has_unaligned_bar_boundaries,
             has_irrational_meter,
+            has_diverging_tracks,
             standard_exports_enabled: !incompatible,
             warning,
         }

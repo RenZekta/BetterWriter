@@ -18,6 +18,8 @@ pub struct MidiPlaybackEvent {
     pub channel: u8,
     pub key: u8,
     pub velocity: u8,
+    /// Preset the note sounds with when it is not the track's usual one.
+    pub sound: Option<(u16, u8)>,
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +57,7 @@ fn compile_track(written: &InstrumentTrack, events: &mut Vec<MidiPlaybackEvent>)
                 channel: track.channel,
                 key,
                 velocity: note.velocity,
+                sound: track.note_sound(note),
             });
         }
         if !is_continued(note) {
@@ -65,6 +68,7 @@ fn compile_track(written: &InstrumentTrack, events: &mut Vec<MidiPlaybackEvent>)
                 channel: track.channel,
                 key,
                 velocity: 0,
+                sound: None,
             });
         }
     }

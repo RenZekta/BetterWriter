@@ -1,7 +1,7 @@
 //! Standard note lengths: a note value with up to two augmentation dots, and
 //! recognizing one from a length in ticks.
 
-use super::project::{DurationChoice, TICKS_PER_QUARTER, Tick};
+use super::project::{DurationChoice, TICKS_PER_QUARTER, TimeSignature, Tick};
 
 /// Most augmentation dots a length can carry.
 pub const MAX_DOTS: u8 = 2;
@@ -19,38 +19,94 @@ pub fn dotted_ticks(value: u32, dots: u8) -> Option<Tick> {
     (numerator % denominator == 0).then_some(numerator / denominator)
 }
 
+/// How the written note values of a bar map onto ticks. A bar with an
+/// irrational time signature counts in tuplets: in 4/6 or 5/12 the
+/// denominator note is a triplet of the power of two below it, in 5/7 a
+/// septuplet, so every note value is shortened by the same ratio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LengthScale {
+    numerator: Tick,
+    denominator: Tick,
+}
+
+impl LengthScale {
+    /// Note values mean what they say.
+    pub const PLAIN: LengthScale = LengthScale {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    pub fn of(signature: TimeSignature) -> Self {
+        if signature.is_regular() {
+            return Self::PLAIN;
+        }
+        let denominator = Tick::from(signature.denominator.max(1));
+        Self {
+            numerator: 1 << denominator.ilog2(),
+            denominator,
+        }
+    }
+
+    /// Ticks of a whole note in a bar counted this way.
+    pub fn whole_note(self) -> Tick {
+        self.apply(TICKS_PER_QUARTER * 4)
+    }
+
+    /// `ticks` of a plain bar, as counted in a bar with this scale.
+    pub fn apply(self, ticks: Tick) -> Tick {
+        (ticks * self.numerator + self.denominator / 2) / self.denominator
+    }
+}
+
+#[cfg(test)]
 /// Every standard length as `(ticks, note value, dots)`, longest first.
 /// Note values run from whole to 128th.
 pub fn standard_lengths() -> Vec<(Tick, u32, u8)> {
+    standard_lengths_in(LengthScale::PLAIN)
+}
+
+/// The standard lengths of a bar counted with `scale`. Lengths that round to
+/// the same tick keep only the first.
+pub fn standard_lengths_in(scale: LengthScale) -> Vec<(Tick, u32, u8)> {
     let mut lengths = Vec::new();
     for value in [1_u32, 2, 4, 8, 16, 32, 64, 128] {
         for dots in 0..=MAX_DOTS {
             if let Some(ticks) = dotted_ticks(value, dots) {
-                lengths.push((ticks, value, dots));
+                lengths.push((scale.apply(ticks), value, dots));
             }
         }
     }
     lengths.sort_by(|a, b| b.0.cmp(&a.0));
+    lengths.dedup_by_key(|length| length.0);
     lengths
 }
 
 /// The note value and dots whose length is exactly `ticks`.
 pub fn detect_length(ticks: Tick) -> Option<(u32, u8)> {
-    standard_lengths()
+    detect_length_in(ticks, LengthScale::PLAIN)
+}
+
+pub fn detect_length_in(ticks: Tick, scale: LengthScale) -> Option<(u32, u8)> {
+    standard_lengths_in(scale)
         .into_iter()
         .find(|(length, _, _)| *length == ticks)
         .map(|(_, value, dots)| (value, dots))
 }
 
+#[cfg(test)]
 /// Cuts a length into standard lengths, longest first, that add up to it: a quarter stretched by a sixteenth is a quarter plus a
 /// sixteenth. A length that is already standard comes back whole. A leftover
 /// shorter than the smallest standard length is folded into the last piece
 /// rather than becoming a piece of its own.
 pub fn standard_pieces(ticks: Tick) -> Vec<Tick> {
-    if ticks <= 0 || detect_length(ticks).is_some() {
+    standard_pieces_in(ticks, LengthScale::PLAIN)
+}
+
+pub fn standard_pieces_in(ticks: Tick, scale: LengthScale) -> Vec<Tick> {
+    if ticks <= 0 || detect_length_in(ticks, scale).is_some() {
         return vec![ticks];
     }
-    let lengths = standard_lengths();
+    let lengths = standard_lengths_in(scale);
     let smallest = lengths.last().map_or(1, |(length, _, _)| *length);
     let mut pieces = Vec::new();
     let mut remaining = ticks;
@@ -226,5 +282,28 @@ mod tests {
         assert_eq!(DurationChoice::Quarter.label_dotted(1), "1/4.");
         assert_eq!(DurationChoice::Eighth.label_dotted(2), "1/8..");
         assert_eq!(DurationChoice::Whole.label_dotted(1), "1.");
+    }
+
+    #[test]
+    fn an_irrational_bar_counts_its_denominator_note_as_a_tuplet() {
+        let sixths = LengthScale::of(TimeSignature::new(4, 6));
+        let twelfths = LengthScale::of(TimeSignature::new(5, 12));
+        // A bar of 4/6 is a triplet whole note, a bar of 5/12 a triplet half
+        // note plus a triplet eighth.
+        assert_eq!(detect_length_in(Q * 4 * 2 / 3, sixths), Some((1, 0)));
+        assert_eq!(standard_pieces_in(1600, twelfths), vec![1280, 320]);
+        assert_eq!(standard_pieces_in(Q * 4 * 2 / 3, twelfths), vec![2560]);
+        assert_eq!(LengthScale::of(TimeSignature::new(3, 4)), LengthScale::PLAIN);
+        assert_eq!(detect_length_in(Q, LengthScale::PLAIN), Some((4, 0)));
+    }
+
+    #[test]
+    fn odd_denominators_scale_by_the_power_of_two_below_them() {
+        let sevenths = LengthScale::of(TimeSignature::new(5, 7));
+        // The 7th note: a quarter squeezed into 4/7.
+        assert_eq!(detect_length_in(TimeSignature::new(1, 7).measure_ticks(), sevenths), Some((4, 0)));
+        let pieces = standard_pieces_in(TimeSignature::new(5, 7).measure_ticks(), sevenths);
+        assert_eq!(pieces.iter().sum::<Tick>(), TimeSignature::new(5, 7).measure_ticks());
+        assert!(pieces.iter().all(|piece| detect_length_in(*piece, sevenths).is_some()));
     }
 }

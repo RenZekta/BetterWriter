@@ -170,6 +170,10 @@ impl Module {
                 }
                 (LibraryHandle::from_raw(raw), exit)
             };
+            // Loading is refused on macOS above, so this only keeps the
+            // other platforms' shape (and lets the code build there).
+            #[cfg(not(any(windows, target_os = "linux")))]
+            let exit: Option<unsafe extern "system" fn() -> bool> = None;
             let get_factory = library
                 .get::<unsafe extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory\0")
                 .map_err(|err| format!("{}: {err}", binary.display()))?;

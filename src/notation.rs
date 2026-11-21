@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::length::{detect_length, standard_lengths};
+use crate::core::length::{LengthScale, detect_length_in, standard_lengths_in};
 use crate::core::ties::note_slices;
 
 use crate::core::project::{
@@ -126,16 +126,22 @@ impl NoteValue {
     }
 }
 
+#[cfg(test)]
 /// How `ticks` is notated. A length that is exactly a note value with up to
 /// two dots shows as that, so a brick of one and a half quarters reads as a
 /// dotted quarter. Any other length shows as the longest standard length that
 /// fits, capped at a whole note and floored at a 128th.
 pub fn note_value_for(ticks: Tick) -> NoteValue {
-    if let Some((value, dots)) = detect_length(ticks) {
+    note_value_in(ticks, LengthScale::PLAIN)
+}
+
+/// `note_value_for` in a bar counted with `scale`.
+pub fn note_value_in(ticks: Tick, scale: LengthScale) -> NoteValue {
+    if let Some((value, dots)) = detect_length_in(ticks, scale) {
         return NoteValue { value, dots };
     }
-    let whole = TICKS_PER_QUARTER * 4;
-    standard_lengths()
+    let whole = scale.whole_note();
+    standard_lengths_in(scale)
         .into_iter()
         .find(|(length, _, _)| *length <= ticks && *length <= whole)
         .map(|(_, value, dots)| NoteValue { value, dots })
@@ -232,6 +238,7 @@ pub fn score_bar(
     rests: &[RestNode],
     beat_ticks: Tick,
 ) -> BarScore {
+    let scale = LengthScale::of(track.signature_at(bar_start));
     let mut onsets: Vec<Onset> = Vec::new();
     for note in track
         .notes
@@ -280,7 +287,7 @@ pub fn score_bar(
             .map(|onset| onset.length)
             .min()
             .unwrap_or(TICKS_PER_QUARTER);
-        let value = note_value_for(shortest);
+        let value = note_value_in(shortest, scale);
 
         let heads: Vec<Head> = group
             .iter()
@@ -319,7 +326,7 @@ pub fn score_bar(
     for rest in rests {
         items.push(ScoreItem::Rest {
             tick: rest.abs_tick,
-            value: note_value_for(rest.duration_ticks),
+            value: note_value_in(rest.duration_ticks, scale),
         });
     }
     items.sort_by_key(ScoreItem::tick);
@@ -419,6 +426,7 @@ pub fn beat_ticks_for(numerator: u32, denominator: u32) -> Tick {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::length::standard_lengths;
     use crate::core::{InstrumentFamily, StringedVariant};
 
     fn guitar() -> InstrumentTrack {
@@ -686,5 +694,16 @@ mod tests {
             .find(|chord| chord.heads[0].note_id == 2)
             .unwrap();
         assert_eq!(tied.heads[0].tie_from, Some((1, q)));
+    }
+
+    #[test]
+    fn notes_in_an_irrational_bar_read_as_tuplets() {
+        let scale = LengthScale::of(crate::core::TimeSignature::new(4, 6));
+        // The bar's own unit, 1/6 of a whole note, is a triplet quarter.
+        assert_eq!(note_value_in(640, scale), NoteValue { value: 4, dots: 0 });
+        assert_eq!(note_value_in(2560, scale), NoteValue { value: 1, dots: 0 });
+        // Longer than any value in the bar is capped at its whole note.
+        assert_eq!(note_value_in(9000, scale), NoteValue { value: 1, dots: 0 });
+        assert_eq!(note_value_in(960, LengthScale::PLAIN), NoteValue { value: 4, dots: 0 });
     }
 }

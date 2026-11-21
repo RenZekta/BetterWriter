@@ -2,7 +2,9 @@ pub mod automation;
 pub mod bars;
 pub mod clipboard;
 pub mod edit;
+pub mod ghost;
 pub mod instruments;
+pub mod keyboard_entry;
 pub mod length;
 pub mod project;
 pub mod shadow;
@@ -22,4 +24,4 @@ pub use project::{
 };
 pub use shadow::{MidiEventKind, MidiPlaybackEvent, ShadowTimeline};
 pub use tempo::TempoMap;
-pub use validation::{CompatibilityReport, StandardExportFormat};
+pub use validation::CompatibilityReport;

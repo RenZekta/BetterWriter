@@ -12,7 +12,7 @@ pub struct SmfNote {
     pub velocity: u8,
 }
 
-fn push_variable_length(out: &mut Vec<u8>, mut value: u32) {
+pub(crate) fn push_variable_length(out: &mut Vec<u8>, mut value: u32) {
     let mut bytes = vec![(value & 0x7f) as u8];
     value >>= 7;
     while value > 0 {

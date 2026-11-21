@@ -40,6 +40,8 @@ enum Action {
     Volume(u8),
     /// Controller 10 value from pan automation.
     Pan(u8),
+    /// Another preset for the notes that follow on this channel.
+    Sound { bank: u16, program: u8 },
 }
 
 /// An event with the moment it sounds, in seconds from the start of the
@@ -57,7 +59,7 @@ impl Scheduled {
     /// note ends before note starts.
     fn rank(&self) -> u8 {
         match self.action {
-            Action::Volume(_) | Action::Pan(_) => 0,
+            Action::Volume(_) | Action::Pan(_) | Action::Sound { .. } => 0,
             Action::NoteOff { .. } => 1,
             Action::NoteOn { .. } => 2,
         }
@@ -106,6 +108,40 @@ fn build_schedule(
         })
         .collect();
     let last_note = events.iter().map(|event| event.seconds).fold(0.0_f64, f64::max);
+
+    // A note that sounds with another preset than its track's gets a preset
+    // change just before it, and the track's own preset is restored for the
+    // next note that uses it. A chord shares the preset of its last note.
+    let base_sounds: std::collections::HashMap<u8, (u16, u8)> = project
+        .tracks
+        .iter()
+        .map(|track| (track.channel, track.sound()))
+        .collect();
+    let mut onsets: Vec<(f64, u8, Option<(u16, u8)>)> = notes
+        .iter()
+        .filter(|event| event.kind == MidiEventKind::NoteOn)
+        .map(|event| (seconds_of(event.track_id, event.tick, &mut maps), event.channel, event.sound))
+        .filter(|&(seconds, ..)| seconds >= start_seconds)
+        .collect();
+    onsets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut in_use = base_sounds.clone();
+    for (seconds, channel, sound) in onsets {
+        let Some(&base) = base_sounds.get(&channel) else {
+            continue;
+        };
+        let wanted = sound.unwrap_or(base);
+        if wanted != base || in_use.get(&channel) != Some(&wanted) {
+            events.push(Scheduled {
+                seconds,
+                channel,
+                action: Action::Sound {
+                    bank: wanted.0,
+                    program: wanted.1,
+                },
+            });
+            in_use.insert(channel, wanted);
+        }
+    }
     let song_end = project
         .tracks
         .iter()
@@ -219,21 +255,11 @@ pub fn channel_setups(project: &BwxProject) -> Vec<ChannelSetup> {
 /// (the drum kits) is controller 0 = 1 and controller 32 = 0.
 fn setup_events(setup: ChannelSetup) -> [MidiEvent; 5] {
     let channel = setup.channel;
+    let [bank_high, bank_low, program] = sound_events(channel, setup.bank, setup.program);
     [
-        MidiEvent::ControlChange {
-            channel,
-            ctrl: 0,
-            value: ((setup.bank >> 7) & 0x7f) as u8,
-        },
-        MidiEvent::ControlChange {
-            channel,
-            ctrl: 32,
-            value: (setup.bank & 0x7f) as u8,
-        },
-        MidiEvent::ProgramChange {
-            channel,
-            program_id: setup.program,
-        },
+        bank_high,
+        bank_low,
+        program,
         MidiEvent::ControlChange {
             channel,
             ctrl: 7,
@@ -243,6 +269,26 @@ fn setup_events(setup: ChannelSetup) -> [MidiEvent; 5] {
             channel,
             ctrl: 10,
             value: setup.pan,
+        },
+    ]
+}
+
+/// Events that select a preset on a channel.
+fn sound_events(channel: u8, bank: u16, program: u8) -> [MidiEvent; 3] {
+    [
+        MidiEvent::ControlChange {
+            channel,
+            ctrl: 0,
+            value: ((bank >> 7) & 0x7f) as u8,
+        },
+        MidiEvent::ControlChange {
+            channel,
+            ctrl: 32,
+            value: (bank & 0x7f) as u8,
+        },
+        MidiEvent::ProgramChange {
+            channel,
+            program_id: program,
         },
     ]
 }
@@ -264,6 +310,8 @@ enum AudioCommand {
     },
     /// Applies new channel setups without touching playback.
     SetChannels(Arc<Vec<ChannelSetup>>),
+    /// A key played live; velocity 0 releases it.
+    Live { channel: u8, key: u8, velocity: u8 },
     Stop,
 }
 
@@ -646,6 +694,16 @@ impl AudioRuntime {
         }
     }
 
+    /// Sounds a key on `channel` right away (velocity 0 releases it), for
+    /// keys played on a MIDI keyboard. Silent until the soundfont is ready.
+    pub fn live_note(&mut self, channel: u8, key: u8, velocity: u8) {
+        if self.synth_installed {
+            let _ = self
+                .producer
+                .try_push(AudioCommand::Live { channel, key, velocity });
+        }
+    }
+
     pub fn stop(&mut self) -> Result<(), AudioError> {
         self.pending_play = None;
         if self.stream.is_none() {
@@ -944,6 +1002,14 @@ impl CallbackState {
                     self.flags.playing.store(true, Ordering::Relaxed);
                 }
                 AudioCommand::SetChannels(channels) => self.apply_channels(&channels),
+                AudioCommand::Live { channel, key, velocity } => {
+                    let action = if velocity > 0 {
+                        Action::NoteOn { key, velocity }
+                    } else {
+                        Action::NoteOff { key }
+                    };
+                    self.dispatch(Scheduled { seconds: 0.0, channel, action }, 0);
+                }
                 AudioCommand::Stop => self.stop_playback(),
             }
         }
@@ -1037,6 +1103,13 @@ impl CallbackState {
             Action::Pan(value) => {
                 self.channel_mix[channel].1 = value;
                 self.send_controller(event.channel, 10, value);
+            }
+            Action::Sound { bank, program } => {
+                if let Some(synth) = self.synth.as_mut() {
+                    for event in sound_events(event.channel, bank, program) {
+                        let _ = synth.send_event(event);
+                    }
+                }
             }
         }
     }
@@ -1333,6 +1406,7 @@ mod tests {
             channel: track_id as u8 - 1,
             key: 60,
             velocity: 100,
+            sound: None,
         }
     }
 
@@ -1408,6 +1482,61 @@ mod tests {
         assert_eq!(times[0].0, project.tracks[1].channel);
         assert!(schedule.events.iter().all(|event| event.seconds >= 1.0));
         let _ = a;
+    }
+
+    fn sound_changes(schedule: &Schedule, channel: u8) -> Vec<(f64, u16, u8)> {
+        schedule
+            .events
+            .iter()
+            .filter(|event| event.channel == channel)
+            .filter_map(|event| match event.action {
+                Action::Sound { bank, program } => Some((event.seconds, bank, program)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_muted_note_gets_its_preset_and_the_next_plain_note_the_tracks_own() {
+        let project = BwxProject::demo();
+        let track = &project.tracks[0];
+        let (id, channel, base) = (track.id, track.channel, track.sound());
+        let note = |tick: Tick, kind, sound| MidiPlaybackEvent {
+            tick,
+            kind,
+            track_id: id,
+            channel,
+            key: 60,
+            velocity: 100,
+            sound,
+        };
+        let q = TICKS_PER_QUARTER;
+        let notes = [
+            note(0, MidiEventKind::NoteOn, None),
+            note(q, MidiEventKind::NoteOff, None),
+            note(q, MidiEventKind::NoteOn, Some((0, 28))),
+            note(q * 2, MidiEventKind::NoteOff, None),
+            note(q * 2, MidiEventKind::NoteOn, Some((0, 28))),
+            note(q * 3, MidiEventKind::NoteOff, None),
+            note(q * 3, MidiEventKind::NoteOn, None),
+            note(q * 4, MidiEventKind::NoteOff, None),
+        ];
+        let schedule = build_schedule(&project, &notes, 0, id);
+        let changes = sound_changes(&schedule, channel);
+        assert_eq!(
+            changes,
+            [(0.5, 0, 28), (1.0, 0, 28), (1.5, base.0, base.1)]
+        );
+        // The change lands before the note it is for.
+        let at = |action: fn(&Action) -> bool| {
+            schedule.events.iter().position(|e| e.seconds == 0.5 && action(&e.action)).unwrap()
+        };
+        assert!(at(|a| matches!(a, Action::Sound { .. })) < at(|a| matches!(a, Action::NoteOn { .. })));
+        // Starting after the muted notes begins with the track's own sound.
+        let later = build_schedule(&project, &notes, q * 3, id);
+        assert!(sound_changes(&later, channel).is_empty());
+        let muted_later = build_schedule(&project, &notes, q * 2, id);
+        assert_eq!(sound_changes(&muted_later, channel)[0], (1.0, 0, 28));
     }
 
     #[test]
@@ -1666,6 +1795,35 @@ mod tests {
         let preset = state.synth.as_ref().unwrap().channel_preset(0);
         assert_eq!(preset.as_ref().map(|preset| preset.name()), Some("Fingered Bass"));
         assert!(peak > 0.001, "the note should be audible");
+    }
+
+    #[test]
+    #[ignore = "slow: loads the real 51 MB soundfont"]
+    fn real_soundfont_has_every_automatic_and_technique_sound() {
+        use crate::core::instruments::INSTRUMENTS;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("soundfonts")
+            .join("MS Basic.sf3");
+        let mut synth = build_synth(48_000.0, &path).expect("soundfont should load");
+        let mut missing = Vec::new();
+        let mut wanted: Vec<(u16, u8)> = INSTRUMENTS.iter().map(|def| (def.bank, def.program)).collect();
+        wanted.extend([(0, 28), (0, 36), (0, 37)]);
+        wanted.sort_unstable();
+        wanted.dedup();
+        for (bank, program) in wanted {
+            for event in sound_events(0, bank, program) {
+                let _ = synth.send_event(event);
+            }
+            match synth.channel_preset(0) {
+                Some(preset) if bank == 0 && [28, 36, 37].contains(&program) => {
+                    eprintln!("{bank}/{program}: {}", preset.name());
+                }
+                Some(_) => {}
+                None => missing.push((bank, program)),
+            }
+        }
+        assert!(missing.is_empty(), "no such preset: {missing:?}");
     }
 
     /// The test plug-ins come from the vst3 crate's `gain` example (effect)

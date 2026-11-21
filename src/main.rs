@@ -4,6 +4,7 @@ mod core;
 mod format;
 mod fretboard;
 mod icons;
+mod midi_input;
 mod notation;
 mod plugins;
 mod symbols;

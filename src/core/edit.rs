@@ -1,5 +1,6 @@
+use super::length::LengthScale;
 use super::project::{
-    BwxProject, NoteEffects, RestNode, TICKS_PER_QUARTER, TabNote,
+    BwxProject, InstrumentTrack, NoteEffects, RestNode, TICKS_PER_QUARTER, TabNote,
     Tick, TimeSignature,
 };
 
@@ -459,9 +460,16 @@ impl BwxProject {
     /// policy. A bar with nothing sounding in it is always one bar-length
     /// rest, whatever its time signature.
     pub fn bar_rests(&self, track_id: u64, measure_tick: Tick, fill: RestFill) -> Vec<RestNode> {
-        let Some(track) = self.track(track_id) else {
-            return Vec::new();
-        };
+        self.track(track_id)
+            .map(|track| track.bar_rests(measure_tick, fill))
+            .unwrap_or_default()
+    }
+}
+
+impl InstrumentTrack {
+    /// `BwxProject::bar_rests` for a track held on its own.
+    pub fn bar_rests(&self, measure_tick: Tick, fill: RestFill) -> Vec<RestNode> {
+        let track = self;
         let (measure_start, measure_end) = track.measure_bounds_at(measure_tick);
 
         // Sounding spans clipped to the bar, merged. A note sustaining in
@@ -497,24 +505,27 @@ impl BwxProject {
             RestFill::BarEnd => None,
             RestFill::AllGaps { preferred } => Some(preferred),
         };
+        let scale = LengthScale::of(track.signature_at(measure_start));
         let mut rests = Vec::new();
         if preferred.is_some() {
             let mut cursor = measure_start;
             for &(start, end) in &merged {
-                rests.extend(split_rest_gap_preferring(
+                rests.extend(split_rest_gap_in(
                     measure_start,
                     cursor,
                     start,
                     preferred,
+                    scale,
                 ));
                 cursor = cursor.max(end);
             }
         }
-        rests.extend(split_rest_gap_preferring(
+        rests.extend(split_rest_gap_in(
             measure_start,
             last_end,
             measure_end,
             preferred,
+            scale,
         ));
         rests
     }
@@ -589,6 +600,7 @@ pub enum RestFill {
     AllGaps { preferred: Tick },
 }
 
+#[cfg(test)]
 /// Splits the gap `[start_tick, end_tick)` into standard rest durations.
 /// Each rest is the longest standard value that fits the remaining gap and
 /// starts on a multiple of its own length counted from `bar_start`, so a
@@ -602,9 +614,21 @@ pub fn split_rest_gap_preferring(
     end_tick: Tick,
     preferred: Option<Tick>,
 ) -> Vec<RestNode> {
+    split_rest_gap_in(bar_start, start_tick, end_tick, preferred, LengthScale::PLAIN)
+}
+
+/// Like `split_rest_gap_preferring`, with the rest lengths counted by the
+/// bar's `scale` so a bar in an irrational signature fills with tuplet rests.
+pub fn split_rest_gap_in(
+    bar_start: Tick,
+    start_tick: Tick,
+    end_tick: Tick,
+    preferred: Option<Tick>,
+    scale: LengthScale,
+) -> Vec<RestNode> {
     let mut rests = Vec::new();
     let mut cursor = start_tick;
-    let standard = [
+    let standard: Vec<Tick> = [
         TICKS_PER_QUARTER * 4,
         TICKS_PER_QUARTER * 2,
         TICKS_PER_QUARTER,
@@ -613,11 +637,16 @@ pub fn split_rest_gap_preferring(
         TICKS_PER_QUARTER / 8,
         TICKS_PER_QUARTER / 16,
         TICKS_PER_QUARTER / 32,
-    ];
+    ]
+    .into_iter()
+    .map(|ticks| scale.apply(ticks))
+    .filter(|ticks| *ticks > 0)
+    .collect();
 
     while cursor < end_tick {
         let remaining = end_tick - cursor;
-        let fits = |ticks: Tick| ticks <= remaining && (cursor - bar_start) % ticks == 0;
+        let fits =
+            |ticks: Tick| ticks > 0 && ticks <= remaining && (cursor - bar_start) % ticks == 0;
         let duration = preferred
             .filter(|ticks| *ticks > 0 && fits(*ticks))
             .or_else(|| standard.iter().copied().find(|ticks| fits(*ticks)))
@@ -969,6 +998,22 @@ mod tests {
         let rests = split_rest_gap_preferring(0, q, q * 4, Some(q * 2));
         let lengths: Vec<Tick> = rests.iter().map(|rest| rest.duration_ticks).collect();
         assert_eq!(lengths, vec![q, q * 2]);
+    }
+
+    #[test]
+    fn a_gap_in_an_irrational_bar_fills_with_tuplet_rests() {
+        // The plain grid would split the second half of a 4/6 bar (1280
+        // ticks) into a quarter, an eighth and smaller pieces; counted by the
+        // bar's scale it is one half-note rest.
+        let bar = TICKS_PER_QUARTER * 4 * 2 / 3;
+        let scale = LengthScale::of(TimeSignature {
+            numerator: 4,
+            denominator: 6,
+        });
+        let rests = split_rest_gap_in(0, bar / 2, bar, None, scale);
+        let lengths: Vec<Tick> = rests.iter().map(|rest| rest.duration_ticks).collect();
+        assert_eq!(lengths.iter().sum::<Tick>(), bar / 2);
+        assert_eq!(lengths, vec![bar / 2]);
     }
 
     #[test]

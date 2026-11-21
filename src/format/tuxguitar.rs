@@ -7,7 +7,10 @@ use crate::core::{
     sounds::{melodic_channel, midi_pan, pan_from_midi, variant_for_program},
 };
 
-use super::FormatError;
+use super::{
+    FormatError,
+    score::{self, ExportBar},
+};
 
 const TG_VERSION: &str = "TuxGuitar File Format - 1.5.0";
 const TG_START_OFFSET: Tick = TICKS_PER_QUARTER;
@@ -108,6 +111,8 @@ struct MeasureHeader {
     start: Tick,
     signature: TimeSignature,
     tempo: u16,
+    repeat_open: bool,
+    repeat_close: u16,
 }
 
 pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
@@ -167,9 +172,10 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
         if flags & MEASURE_HEADER_TEMPO != 0 {
             last_tempo = reader.read_i16()?.max(1) as u16;
         }
-        let _repeat_open = flags & MEASURE_HEADER_REPEAT_OPEN != 0;
+        let repeat_open = flags & MEASURE_HEADER_REPEAT_OPEN != 0;
+        let mut repeat_close = 0;
         if flags & MEASURE_HEADER_REPEAT_CLOSE != 0 {
-            let _ = reader.read_i16()?;
+            repeat_close = reader.read_i16()?.max(0) as u16;
         }
         if flags & MEASURE_HEADER_REPEAT_ALTERNATIVE != 0 {
             let _ = reader.read_u8()?;
@@ -185,6 +191,8 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             start,
             signature: last_signature,
             tempo: last_tempo,
+            repeat_open,
+            repeat_close,
         });
         start += length;
     }
@@ -262,6 +270,17 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             volume_points: Vec::new(),
             pan_points: Vec::new(),
         });
+        if let Some(track) = tracks.last_mut() {
+            for header in &headers {
+                let at = header.start - TG_START_OFFSET;
+                if header.repeat_open {
+                    track.set_repeat_open(at, true);
+                }
+                if header.repeat_close > 0 {
+                    track.set_repeat_close(at, header.repeat_close);
+                }
+            }
+        }
     }
 
     let mut project = BwxProject {
@@ -288,6 +307,7 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
 }
 
 pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
+    let song = score::prepare(project)?;
     let mut writer = TgWriter::default();
     writer.write_ubyte_string(TG_VERSION)?;
     writer.write_ubyte_string(&project.title)?;
@@ -298,9 +318,10 @@ pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
 
     writer.write_u8(project.tracks.len().min(255) as u8);
     for (index, track) in project.tracks.iter().enumerate() {
+        let (bank, program) = track.sound();
         writer.write_i16((index + 1).min(i16::MAX as usize) as i16);
-        writer.write_u8(0);
-        writer.write_u8(track.program.min(127));
+        writer.write_u8(if bank < 128 { bank as u8 } else { 0 });
+        writer.write_u8(program.min(127));
         writer.write_u8(track.volume.min(127));
         writer.write_u8(midi_pan(track.pan));
         writer.write_u8(0);
@@ -311,31 +332,41 @@ pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
         writer.write_i16(0);
     }
 
-    let headers = build_headers(project);
-    writer.write_i16(headers.len().min(i16::MAX as usize) as i16);
+    writer.write_i16(song.grid.len().min(i16::MAX as usize) as i16);
     let mut last_signature = None;
     let mut last_tempo = None;
-    for header in &headers {
+    for (index, bar) in song.grid.iter().enumerate() {
+        let tempo = song.bar_tempo(index);
         let mut flags = 0;
-        if last_signature != Some(header.signature) {
+        if last_signature != Some(bar.signature) {
             flags |= MEASURE_HEADER_TIMESIGNATURE;
         }
-        if last_tempo != Some(header.tempo) {
+        if last_tempo != Some(tempo) {
             flags |= MEASURE_HEADER_TEMPO;
+        }
+        if bar.repeat_open {
+            flags |= MEASURE_HEADER_REPEAT_OPEN;
+        }
+        if bar.repeat_close > 0 {
+            flags |= MEASURE_HEADER_REPEAT_CLOSE;
         }
         writer.write_u8(flags);
         if flags & MEASURE_HEADER_TIMESIGNATURE != 0 {
-            writer.write_time_signature(header.signature);
+            writer.write_time_signature(bar.signature);
         }
         if flags & MEASURE_HEADER_TEMPO != 0 {
-            writer.write_i16(header.tempo as i16);
+            writer.write_i16(tempo as i16);
         }
-        last_signature = Some(header.signature);
-        last_tempo = Some(header.tempo);
+        if flags & MEASURE_HEADER_REPEAT_CLOSE != 0 {
+            writer.write_i16(bar.repeat_close.min(i16::MAX as u16) as i16);
+        }
+        last_signature = Some(bar.signature);
+        last_tempo = Some(tempo);
     }
 
     writer.write_u8(project.tracks.len().min(255) as u8);
-    for (track_index, track) in project.tracks.iter().enumerate() {
+    for (track_index, exported) in song.tracks.iter().enumerate() {
+        let track = exported.track;
         let mut flags = 0;
         if track.solo {
             flags |= TRACK_SOLO;
@@ -346,8 +377,8 @@ pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
         writer.write_u8(flags);
         writer.write_ubyte_string(&track.name)?;
         writer.write_i16((track_index + 1).min(i16::MAX as usize) as i16);
-        for (measure_index, header) in headers.iter().enumerate() {
-            writer.write_measure(track, header, measure_index == 0)?;
+        for (measure_index, bar) in exported.bars.iter().enumerate() {
+            writer.write_measure(bar, song.grid[measure_index].start, measure_index == 0);
         }
         writer.write_u8(track.tuning.len().min(255) as u8);
         for string in &track.tuning {
@@ -404,52 +435,6 @@ fn tempo_points(headers: &[MeasureHeader]) -> Vec<crate::core::TempoPoint> {
     points
 }
 
-fn build_headers(project: &BwxProject) -> Vec<MeasureHeader> {
-    let base_track = project.tracks.first();
-    let mut cursor = TG_START_OFFSET;
-    // Exports as many measures as the widest track declares, extended to
-    // cover note content in case a note sits past the declared bar count.
-    let horizon = project
-        .tracks
-        .iter()
-        .map(|track| {
-            let bars_end = track.bars_end_tick();
-            let notes_end = track
-                .notes
-                .iter()
-                .map(|note| note.end_tick())
-                .max()
-                .unwrap_or(0);
-            bars_end.max(notes_end)
-        })
-        .max()
-        .unwrap_or(TICKS_PER_QUARTER * 4);
-    let mut headers = Vec::new();
-    while cursor - TG_START_OFFSET < horizon.max(TICKS_PER_QUARTER * 4) {
-        let local_tick = cursor - TG_START_OFFSET;
-        let signature = base_track
-            .map(|track| track.signature_at(local_tick))
-            .unwrap_or(TimeSignature::new(4, 4));
-        headers.push(MeasureHeader {
-            start: cursor,
-            signature,
-            tempo: project
-                .tempo_at(local_tick)
-                .round()
-                .clamp(1.0, i16::MAX as f32) as u16,
-        });
-        cursor += signature.measure_ticks().max(TICKS_PER_QUARTER / 4);
-    }
-    if headers.is_empty() {
-        headers.push(MeasureHeader {
-            start: TG_START_OFFSET,
-            signature: TimeSignature::new(4, 4),
-            tempo: project.tempo_at(0).round().clamp(1.0, i16::MAX as f32) as u16,
-        });
-    }
-    headers
-}
-
 struct TgReader<'a> {
     cursor: Cursor<&'a [u8]>,
 }
@@ -470,9 +455,10 @@ impl<'a> TgReader<'a> {
         let flags = self.read_u8()?;
         let mut voices = [VoiceData::new(header.start), VoiceData::new(header.start)];
         let mut beat_header = BEAT_HAS_NEXT;
+        let mut current = header.start;
         while beat_header & BEAT_HAS_NEXT != 0 {
             beat_header = self.read_u8()?;
-            let beat_start = current_start(&mut voices);
+            let beat_start = next_beat_start(&voices, &mut current);
             for (voice_index, voice) in voices.iter_mut().enumerate() {
                 let shift = (voice_index * 2) as u8;
                 if beat_header & (BEAT_HAS_VOICE << shift) == 0 {
@@ -692,59 +678,16 @@ impl TgWriter {
         self.bytes
     }
 
-    fn write_measure(
-        &mut self,
-        track: &InstrumentTrack,
-        header: &MeasureHeader,
-        first: bool,
-    ) -> Result<(), FormatError> {
-        let measure_start = header.start - TG_START_OFFSET;
-        let measure_end = measure_start + header.signature.measure_ticks();
-        let mut note_items: Vec<BeatItem> = track
-            .notes
-            .iter()
-            .filter(|note| note.abs_tick >= measure_start && note.abs_tick < measure_end)
-            .cloned()
-            .map(BeatItem::note)
-            .collect();
-        note_items.sort_by_key(|item| (item.start, item.duration));
-        let mut items: Vec<BeatItem> = Vec::new();
-        for item in note_items {
-            if let Some(last) = items.last_mut()
-                && last.start == item.start
-                && last.duration == item.duration
-            {
-                last.notes.extend(item.notes);
-                continue;
-            }
-            items.push(item);
-        }
-
-        let mut beats = Vec::new();
-        let mut cursor = measure_start;
-        for item in items {
-            if item.start > cursor {
-                beats.push(BeatItem::rest(cursor, item.start - cursor));
-            }
-            cursor = cursor.max(item.start + item.duration);
-            beats.push(item);
-        }
-        if beats.is_empty() {
-            beats.push(BeatItem::rest(
-                measure_start,
-                header.signature.measure_ticks(),
-            ));
-        }
-
+    fn write_measure(&mut self, bar: &ExportBar, bar_start: Tick, first: bool) {
         let mut measure_flags = 0;
         if first {
             measure_flags |= MEASURE_CLEF | MEASURE_KEYSIGNATURE;
         }
         self.write_u8(measure_flags);
 
-        let mut voice = VoiceData::new(header.start);
-        for (index, beat) in beats.iter().enumerate() {
-            let mut beat_flags = if index + 1 < beats.len() {
+        let mut voice = VoiceData::new(bar_start + TG_START_OFFSET);
+        for (index, beat) in bar.beats.iter().enumerate() {
+            let mut beat_flags = if index + 1 < bar.beats.len() {
                 BEAT_HAS_NEXT
             } else {
                 0
@@ -764,25 +707,23 @@ impl TgWriter {
                 self.write_duration(beat.duration);
                 voice.duration = duration_from_ticks(beat.duration);
             }
-            if voice_flags & VOICE_HAS_NOTES != 0 {
-                for (note_index, note) in beat.notes.iter().enumerate() {
-                    let mut note_flags = NOTE_VELOCITY;
-                    if note_index + 1 < beat.notes.len() {
-                        note_flags |= NOTE_HAS_NEXT;
-                    }
-                    if has_effects(&note.effects) {
-                        note_flags |= NOTE_EFFECT;
-                    }
-                    if note.tied_from_previous.is_some() {
-                        note_flags |= NOTE_TIED;
-                    }
-                    self.write_u8(note_flags);
-                    self.write_u8(note.fret);
-                    self.write_u8((note.string_index + 1).min(255) as u8);
-                    self.write_u8(note.velocity.min(127));
-                    if note_flags & NOTE_EFFECT != 0 {
-                        self.write_note_effects(&note.effects);
-                    }
+            for (note_index, note) in beat.notes.iter().enumerate() {
+                let mut note_flags = NOTE_VELOCITY;
+                if note_index + 1 < beat.notes.len() {
+                    note_flags |= NOTE_HAS_NEXT;
+                }
+                if has_effects(&note.effects) {
+                    note_flags |= NOTE_EFFECT;
+                }
+                if note.tied {
+                    note_flags |= NOTE_TIED;
+                }
+                self.write_u8(note_flags);
+                self.write_u8(note.fret);
+                self.write_u8((note.string_index + 1).min(255) as u8);
+                self.write_u8(note.velocity.min(127));
+                if note_flags & NOTE_EFFECT != 0 {
+                    self.write_note_effects(&note.effects);
                 }
             }
             voice.start += beat.duration;
@@ -792,7 +733,6 @@ impl TgWriter {
             self.write_u8(0);
             self.write_u8(0);
         }
-        Ok(())
     }
 
     fn write_time_signature(&mut self, signature: TimeSignature) {
@@ -897,39 +837,19 @@ impl TgWriter {
     }
 }
 
-#[derive(Clone)]
-struct BeatItem {
-    start: Tick,
-    duration: Tick,
-    notes: Vec<TabNote>,
-}
-
-impl BeatItem {
-    fn note(note: TabNote) -> Self {
-        Self {
-            start: note.abs_tick,
-            duration: note.duration_ticks,
-            notes: vec![note],
-        }
+/// Where the next beat starts, as TuxGuitar's `TGBeatData.getCurrentStart`
+/// decides it: the earliest voice position that lies past the previous beat.
+/// A voice that has no beats yet stays put and so never holds the others back.
+fn next_beat_start(voices: &[VoiceData; 2], current: &mut Tick) -> Tick {
+    let next = voices
+        .iter()
+        .map(|voice| voice.start)
+        .filter(|start| *start > *current)
+        .min();
+    if let Some(next) = next {
+        *current = next;
     }
-
-    fn rest(start: Tick, duration: Tick) -> Self {
-        Self {
-            start,
-            duration,
-            notes: Vec::new(),
-        }
-    }
-}
-
-fn current_start(voices: &mut [VoiceData; 2]) -> Tick {
-    let current = voices.iter().map(|voice| voice.start).min().unwrap_or(0);
-    for voice in voices {
-        if voice.start < current {
-            voice.start = current;
-        }
-    }
-    current
+    *current
 }
 
 fn duration_from_ticks(ticks: Tick) -> TgDuration {
@@ -969,7 +889,7 @@ mod tests {
 
     #[test]
     fn tg_subset_round_trips_betterwriter_project() {
-        let project = BwxProject::demo();
+        let project = score::aligned_demo();
         let bytes = write_tg(&project).unwrap();
         let decoded = read_tg(&bytes).unwrap();
         assert_eq!(decoded.tracks.len(), project.tracks.len());
@@ -977,8 +897,39 @@ mod tests {
     }
 
     #[test]
+    fn tg_round_trip_keeps_repeat_signs() {
+        let mut project = score::aligned_demo();
+        let bars = project.tracks[0].bar_spans();
+        for track in &mut project.tracks {
+            track.set_repeat_open(bars[0].start, true);
+            track.set_repeat_close(bars[1].start, 2);
+        }
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        let marks = &decoded.tracks[0].bar_marks;
+        assert_eq!(marks.len(), 2);
+        assert!(marks[0].repeat_open && marks[0].repeat_close == 0);
+        assert_eq!((marks[1].at_tick, marks[1].repeat_close), (bars[1].start, 2));
+    }
+
+    #[test]
+    fn tg_writes_a_note_across_a_barline_as_tied_beats() {
+        let q = TICKS_PER_QUARTER;
+        let mut project = score::aligned_demo();
+        project.tracks.truncate(1);
+        let id = project.tracks[0].id;
+        project.tracks[0].notes.clear();
+        project.insert_note(id, q * 3, q * 2, 0, 5).unwrap();
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        let notes = &decoded.tracks[0].notes;
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].abs_tick, notes[0].duration_ticks), (q * 3, q));
+        assert_eq!(notes[1].abs_tick, q * 4);
+        assert!(notes[1].tied_from_previous.is_some());
+    }
+
+    #[test]
     fn tg_round_trip_keeps_sound_volume_and_pan() {
-        let mut project = BwxProject::demo();
+        let mut project = score::aligned_demo();
         project.tracks[0].program = 29;
         project.tracks[0].volume = 80;
         project.tracks[0].pan = -20;
@@ -997,7 +948,7 @@ mod tests {
     #[test]
     fn tg_round_trip_keeps_dotted_and_double_dotted_lengths() {
         let q = TICKS_PER_QUARTER;
-        let mut project = BwxProject::demo();
+        let mut project = score::aligned_demo();
         let track_id = project.tracks[0].id;
         project.tracks[0].notes.clear();
         // One whole bar: dotted quarter, eighth, double-dotted quarter,
@@ -1019,7 +970,7 @@ mod tests {
 
     #[test]
     fn imported_tracks_skip_the_drum_channel() {
-        let mut project = BwxProject::demo();
+        let mut project = score::aligned_demo();
         let template = project.tracks[0].clone();
         for index in 3..=11 {
             let mut track = template.clone();

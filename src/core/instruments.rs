@@ -617,7 +617,7 @@ pub static INSTRUMENTS: &[InstrumentDef] = &[
     InstrumentDef { id: "bass-guitar", name: "Bass Guitar", trait_name: "", group: 10, genres: 71, bank: 0, program: 34, drumset: false, bass_clef: false },
     InstrumentDef { id: "electric-bass", name: "Electric Bass", trait_name: "", group: 10, genres: 7, bank: 0, program: 33, drumset: false, bass_clef: false },
     InstrumentDef { id: "fretless-electric-bass", name: "Fretless Electric Bass", trait_name: "", group: 10, genres: 6, bank: 0, program: 35, drumset: false, bass_clef: false },
-    InstrumentDef { id: "acoustic-bass", name: "Acoustic Bass", trait_name: "", group: 10, genres: 5, bank: 0, program: 36, drumset: false, bass_clef: false },
+    InstrumentDef { id: "acoustic-bass", name: "Acoustic Bass", trait_name: "", group: 10, genres: 5, bank: 0, program: 32, drumset: false, bass_clef: false },
     InstrumentDef { id: "electric-bass-4-str-tab", name: "Electric Bass", trait_name: "", group: 10, genres: 3, bank: 0, program: 33, drumset: false, bass_clef: false },
     InstrumentDef { id: "banjo", name: "Banjo", trait_name: "", group: 10, genres: 7, bank: 0, program: 105, drumset: false, bass_clef: false },
     InstrumentDef { id: "tenor-banjo", name: "Tenor Banjo", trait_name: "", group: 10, genres: 0, bank: 0, program: 105, drumset: false, bass_clef: false },
@@ -762,6 +762,61 @@ pub fn groups_of(genre: Option<usize>) -> Vec<usize> {
         .collect()
 }
 
+/// Playing techniques that sound a note with another preset than the
+/// instrument's usual one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Technique {
+    /// Palm muting.
+    Mute,
+    Slap,
+    Pop,
+}
+
+/// The preset (bank, program) each technique uses on the instruments that
+/// define one, from the instrument's technique channels in instruments.xml.
+static TECHNIQUE_SOUNDS: &[(&str, Technique, u16, u8)] = &[
+    ("soprano-guitar", Technique::Mute, 0, 28),
+    ("alto-guitar", Technique::Mute, 0, 28),
+    ("electric-guitar", Technique::Mute, 0, 28),
+    ("guitar-steel", Technique::Mute, 0, 28),
+    ("guitar-nylon", Technique::Mute, 0, 28),
+    ("guitar-nylon-treble-clef", Technique::Mute, 0, 28),
+    ("pedal-steel-guitar", Technique::Mute, 0, 28),
+    ("contra-guitar", Technique::Mute, 0, 28),
+    ("11-string-alto-guitar", Technique::Mute, 0, 28),
+    ("12-string-guitar", Technique::Mute, 0, 28),
+    ("5-string-electric-bass", Technique::Slap, 0, 36),
+    ("5-string-electric-bass", Technique::Pop, 0, 37),
+    ("5-string-electric-bass-high-c", Technique::Slap, 0, 36),
+    ("5-string-electric-bass-high-c", Technique::Pop, 0, 37),
+    ("5-string-electric-bass-tab", Technique::Slap, 0, 36),
+    ("5-string-electric-bass-tab", Technique::Pop, 0, 37),
+    ("5-string-electric-bass-tab-high-c", Technique::Slap, 0, 36),
+    ("5-string-electric-bass-tab-high-c", Technique::Pop, 0, 37),
+    ("6-string-electric-bass", Technique::Slap, 0, 36),
+    ("6-string-electric-bass", Technique::Pop, 0, 37),
+    ("6-string-electric-bass-tab", Technique::Slap, 0, 36),
+    ("6-string-electric-bass-tab", Technique::Pop, 0, 37),
+    ("bass-guitar", Technique::Slap, 0, 36),
+    ("bass-guitar", Technique::Pop, 0, 37),
+    ("electric-bass", Technique::Slap, 0, 36),
+    ("electric-bass", Technique::Pop, 0, 37),
+    ("fretless-electric-bass", Technique::Slap, 0, 36),
+    ("fretless-electric-bass", Technique::Pop, 0, 37),
+    ("acoustic-bass", Technique::Slap, 0, 36),
+    ("acoustic-bass", Technique::Pop, 0, 37),
+    ("electric-bass-4-str-tab", Technique::Slap, 0, 36),
+    ("electric-bass-4-str-tab", Technique::Pop, 0, 37),
+];
+
+/// The preset `technique` sounds with on an instrument, when it has one.
+pub fn technique_sound(id: &str, technique: Technique) -> Option<(u16, u8)> {
+    TECHNIQUE_SOUNDS
+        .iter()
+        .find(|(candidate, kind, ..)| *candidate == id && *kind == technique)
+        .map(|&(.., bank, program)| (bank, program))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,5 +874,31 @@ mod tests {
         let all = groups_of(None);
         assert_eq!(all.len(), GROUPS.len());
         assert!(groups_of(Some(COMMON_GENRE)).len() <= all.len());
+    }
+
+    #[test]
+    fn technique_sounds_belong_to_listed_instruments_and_existing_presets() {
+        use crate::core::sounds::preset_name;
+        for &(id, _, bank, program) in TECHNIQUE_SOUNDS {
+            assert!(instrument(id).is_some(), "{id}");
+            assert!(preset_name(bank, program).is_some(), "{id} {bank}/{program}");
+        }
+    }
+
+    #[test]
+    fn guitars_mute_and_basses_slap_and_pop() {
+        assert_eq!(technique_sound("electric-guitar", Technique::Mute), Some((0, 28)));
+        assert_eq!(technique_sound("guitar-nylon", Technique::Mute), Some((0, 28)));
+        assert_eq!(technique_sound("electric-bass", Technique::Slap), Some((0, 36)));
+        assert_eq!(technique_sound("electric-bass-4-str-tab", Technique::Pop), Some((0, 37)));
+        assert_eq!(technique_sound("electric-bass", Technique::Mute), None);
+        assert_eq!(technique_sound("electric-guitar", Technique::Slap), None);
+        assert_eq!(technique_sound("flute", Technique::Mute), None);
+    }
+
+    #[test]
+    fn a_plucked_acoustic_bass_starts_as_an_acoustic_bass() {
+        let def = instrument("acoustic-bass").unwrap();
+        assert_eq!((def.bank, def.program), (0, 32));
     }
 }

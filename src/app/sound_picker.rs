@@ -157,16 +157,19 @@ impl BetterWriterApp {
 }
 
 /// The Sound menu of one track, as a button in the track table. Picks go to
-/// `events`.
+/// `events`. While the track plays with an automatic sound, `playing` is the
+/// preset sounding at the playhead and the button shows it.
 pub(super) fn sound_menu_button(
     ui: &mut egui::Ui,
     track: &InstrumentTrack,
+    playing: Option<(u16, u8)>,
     width: f32,
     events: &mut Vec<MixEvent>,
 ) {
     let (bank, program) = track.sound();
+    let (shown_bank, shown_program) = playing.filter(|_| track.sound_auto).unwrap_or((bank, program));
     let label = if track.sound_auto {
-        format!("Auto: {}", sounds::sound_label(bank, program))
+        format!("Auto: {}", sounds::sound_label(shown_bank, shown_program))
     } else {
         sounds::sound_label(bank, program)
     };
@@ -212,7 +215,10 @@ pub(super) fn sound_menu_button(
             return;
         }
 
-        ui.add_enabled(false, egui::Button::selectable(true, sounds::sound_label(bank, program)));
+        ui.add_enabled(
+            false,
+            egui::Button::selectable(true, sounds::sound_label(shown_bank, shown_program)),
+        );
         ui.separator();
         ui.menu_button("SoundFonts", |ui| {
             ui.menu_button("MS Basic", |ui| {

@@ -278,10 +278,7 @@ impl BwxProject {
                 },
             });
         }
-        while track.bars_end_tick() < last_end {
-            track.bar_count += 1;
-            bars_added += 1;
-        }
+        bars_added += track.grow_bars_to_cover(last_end);
         track.sort_notes();
 
         Some(PasteOutcome {

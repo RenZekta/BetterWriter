@@ -9,7 +9,7 @@
 //! returning to brick view, so ties the user wrote deliberately
 //! (`TieOrigin::User`) survive as separate notes.
 
-use super::length::standard_pieces;
+use super::length::{LengthScale, standard_pieces_in};
 use super::project::{BwxProject, InstrumentTrack, NoteEffects, TabNote, Tick, TieOrigin};
 
 impl BwxProject {
@@ -73,9 +73,7 @@ impl BwxProject {
         }
 
         let last_end = slices.last().map(|slice| slice.1).unwrap_or(0);
-        while track.bars_end_tick() < last_end {
-            track.bar_count += 1;
-        }
+        track.grow_bars_to_cover(last_end);
         track.sort_notes();
         true
     }
@@ -232,7 +230,8 @@ pub fn note_slices(track: &InstrumentTrack, start: Tick, end: Tick) -> Vec<(Tick
     let mut slices = Vec::new();
     for (slice_start, slice_end) in bar_slices(track, start, end) {
         let mut cursor = slice_start;
-        for length in standard_pieces(slice_end - slice_start) {
+        let scale = LengthScale::of(track.signature_at(slice_start));
+        for length in standard_pieces_in(slice_end - slice_start, scale) {
             slices.push((cursor, cursor + length));
             cursor += length;
         }
@@ -548,5 +547,39 @@ mod tests {
         let id = project.insert_note(1, 0, TICKS_PER_QUARTER, 0, top).unwrap();
         assert_eq!(project.shift_note_frets(1, &[id], 1), None);
         assert_eq!(project.shift_note_frets(1, &[], 1), Some(0));
+    }
+
+    #[test]
+    fn a_note_filling_an_irrational_bar_stays_whole_and_longer_ones_cut_at_its_barline() {
+        let mut project = project_with_bars(3);
+        project.set_track_time_signature(1, 0, crate::core::TimeSignature::new(4, 6));
+        let bar = crate::core::TimeSignature::new(4, 6).measure_ticks();
+        assert_eq!(bar, 2560);
+        let id = project.insert_note(1, 0, bar, 0, 5).unwrap();
+        assert!(!project.split_bricks_at_barlines());
+        assert_eq!(project.tracks[0].notes.len(), 1);
+
+        let longer = project.insert_note(1, bar, bar + 640, 1, 3).unwrap();
+        assert!(project.split_bricks_at_barlines());
+        let pieces: Vec<Tick> = project.tracks[0]
+            .notes
+            .iter()
+            .filter(|note| note.string_index == 1)
+            .map(|note| note.duration_ticks)
+            .collect();
+        assert_eq!(pieces.iter().sum::<Tick>(), bar + 640);
+        assert!(pieces.contains(&bar));
+        let _ = (id, longer);
+    }
+
+    #[test]
+    fn a_five_twelfths_bar_splits_a_full_length_note_into_triplet_values() {
+        let mut project = project_with_bars(1);
+        project.set_track_time_signature(1, 0, crate::core::TimeSignature::new(5, 12));
+        let _ = project.insert_note(1, 0, 1600, 0, 5).unwrap();
+        assert!(project.split_bricks_at_barlines());
+        let mut lengths: Vec<Tick> = project.tracks[0].notes.iter().map(|note| note.duration_ticks).collect();
+        lengths.sort_unstable();
+        assert_eq!(lengths, [320, 1280]);
     }
 }

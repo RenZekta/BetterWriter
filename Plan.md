@@ -260,7 +260,7 @@ the *same-string overlap* prevention from that pass stays.
       right border if it keeps going into the next row, no left border on
       the continuation piece that picks up at the start of that row). Only
       the very first (onset) fragment carries the standard-notation
-      dot/stem, the fret digit, and effect labels like "P.M." — continuation
+      dot/stem and the fret digit — continuation
       fragments are a bare connecting block, so the whole thing reads as one
       continuous sound rather than a second note. Works for a note spanning
       any number of rows, not just one.
@@ -545,7 +545,7 @@ Another round of testing feedback, seven items plus a build warning.
 - [x] Toolbar **Tab** / **Bricks** button (and View ▸ Notes) switches
       `EditorViewMode`. Tab view draws bare fret numbers on the strings with
       a backing patch so the string doesn't strike through them; selection,
-      the edit cursor and effect labels (P.M.) work as in brick view.
+      the edit cursor work as in brick view.
 - [x] **Real tie support** in the model: `TabNote::tied_from_previous:
       Option<TieOrigin>`, with `TieOrigin::BrickSplit` (a slice cut from a
       brick) or `TieOrigin::User` (a tie the user wrote). A tie only counts
@@ -1108,7 +1108,7 @@ right-click submenus and the move / stretch drag previews.
 - [x] Rhythm marks under the strings: a longer stem, beams that keep their
       spacing and flags for short values, in tab view with or without the
       classic staff. The playback line runs down over them
-      (`tab_rhythm_depth`) and the "P.M." label sits below them.
+      (`tab_rhythm_depth`). Palm muting is a line above the staff (19.11.2026, item 11).
 
 ### 7. Plug-in scan at launch
 - [x] `src/plugins/scan.rs` (was `vst_scan.rs`) looks for plug-ins in the
@@ -1525,14 +1525,263 @@ right-click submenus and the move / stretch drag previews.
       resumed after a device change now continues at the interrupted time
       (seconds) on the selected track.
 
+### 11. Palm muting drawn as a line (like Guitar Pro)
+- [x] Palm muting is no longer "P.M." on every muted note (that is what
+      TuxGuitar does and it is not wanted). It is now drawn as in Guitar Pro:
+      a "P.M." label at the start of a run, then a dashed line **above**
+      the track's tab staff, ending in a small vertical tick at the last muted
+      note (`paint_palm_mutes`). MuseScore also draws a line, but at the
+      bottom of the track's score; Guitar Pro's placement above is the
+      reference. The earlier wording "like in MuseScore or Tuxguitar" in this
+      file was wrong.
+- [x] A run (`InstrumentTrack::palm_mute_runs`) goes from the first muted
+      onset to the last muted onset of consecutive muted onsets; an unmuted
+      onset ends it, a rest does not, and an onset counts as muted when any
+      note on it is. A run that wraps to the next row of the score is drawn
+      as a dashed line in each row, the label only where it starts and the
+      end tick only where it ends. Tab-only view got 12 more pixels above the
+      strings (`tab_offset` 16 to 28) so the line has room.
+- [x] In brick view the line runs to the end of the last muted brick
+      (`InstrumentTrack::palm_mute_ends`: the end of the longest muted note on
+      the run's last onset), not to its start; tab view still ends at the fret
+      number of the last muted note.
+
+### 12. Automatic sounds per note (MS Basic)
+- [x] "Choose automatically" now also follows each note's technique. The
+      table is taken from MuseScore's `instruments.xml` (tag v4.4.4, the
+      `mute`, `slap` and `pop` channels, all bank 0): guitars play palm-muted
+      notes with program 28 (Palm Muted Guitar), basses play slapped notes
+      with 36 (Slap Bass) and popped notes with 37 (Pop Bass)
+      (`core/instruments.rs`: `Technique`, `TECHNIQUE_SOUNDS`,
+      `technique_sound`; 32 instrument ids, tab variants included). Priority
+      for one note: slapping, then popping, then palm muting
+      (`InstrumentTrack::note_sound`). It only applies while the track's
+      sound is on "Choose automatically" and only when the preset differs from
+      the track's own sound.
+- [x] Playback: `MidiPlaybackEvent::sound` carries the note's preset; the
+      scheduler (`build_schedule`) puts a bank + program change
+      (`Action::Sound`) right before such a note on the track's channel, and
+      another one back to the track's own preset before the next plain note.
+      It follows the notes from the playback start on, so starting in the
+      middle of a muted passage is right too.
+- [x] Fixed on the way: the Acoustic Bass default program was 36 (Slap Bass),
+      now 32 (Acoustic Bass) as in MuseScore.
+- [x] Checked: unit tests for the table (every id exists, presets exist,
+      guitars mute, basses slap and pop), for the per-note choice and for the
+      schedule; plus an ignored test (`real_soundfont_has_every_automatic_and_technique_sound`)
+      that opens the real `MS Basic.sf3` and confirms programs 28, 36 and 37
+      exist and print as Palm Muted Guitar, Slap Bass and Pop Bass. It was run
+      once and passed. Not listened to in the running app.
+- [ ] Limits: a chord shares one MIDI channel, so all its notes sound with the
+      preset of its last note. MuseScore's other channels (brick mutes,
+      harmonics, distortion, overdriven) are not triggered by any note effect
+      here, so they are not mapped.
+
+### 13. Irrational bars: note lengths follow the bar
+- [x] In a bar like 4/6 or 5/12 the standard lengths are counted by the
+      bar's denominator (`length::LengthScale`): the power of two at or below
+      the denominator against the denominator itself, so a 4/6 bar's beat is a
+      triplet of a plain quarter (2/3 of it) and a 5/7 bar's beat a
+      septuplet-like 4/7. Plain signatures are unchanged.
+- [x] What "autoreadjust" means here: the tab view cut notes at barlines into
+      standard lengths (`note_slices`) and that now uses the bar's scale, so a
+      note filling a 4/6 bar stays one whole-bar note instead of being cut into
+      pieces of the plain grid; the notation values, rest values and dots in
+      the score read the same scale (`notation::note_value_in`); rests that
+      fill a bar's gaps use it too (`split_rest_gap_in`).
+- [ ] Not checked: how the length buttons and the grid snapping behave when
+      writing notes in an irrational bar; only how notes are cut, drawn and
+      filled with rests was changed.
+
+### 14. macOS build
+- [x] The macOS release failed to compile: `Module::load` in
+      `plugins/vst3.rs` only defined the module-exit function on Windows and
+      Linux, so the macOS build had no `exit` value. Other platforms now get
+      `None` there (loading plug-ins on macOS is still refused earlier). Not
+      built for macOS here (no such target in this environment), so the next
+      release run is the check.
+
+### 15. Build and tests (items 11 to 14)
+- [x] `cargo test`: 296 passed, 3 ignored (including the real-soundfont
+      check). `cargo check --all-targets`: only the warnings that were already
+      there. Palm-mute line, preset changes during playback and tuplet rests
+      are not looked at or listened to in a running app.
+
+## 20.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Export: TuxGuitar, Guitar Pro, MIDI, MuseScore
+- [x] File > Export... writes `.tg`, `.gp` (Guitar Pro 7/8), `.mid` and
+      `.mscz` / `.mscx` (MuseScore 4) by the extension picked in the dialog
+      (`format::export_project`). The placeholder text bundle and its
+      hard-coded path are gone. The entry is disabled, with the compatibility
+      warning as its tooltip, when the project cannot be flattened. The Open
+      dialog lists only what loads (`.bwx`, `.tg`).
+- [x] All four formats share one preparation step (`format/score.rs`): the
+      first track's bars are the single bar grid, notes are quantized to
+      64ths, each bar is cut into beats that tile it (rests fill the gaps),
+      lengths become note values with dots or are split into tied notes, ties
+      run across beats and barlines, and overlapping notes on one string are
+      trimmed. The compatibility check refuses what the formats cannot hold:
+      polymeter, bars that do not line up between tracks, irrational meters or
+      denominators over 64, tracks that disagree on repeat signs or tempo.
+- [x] `.tg`: rewritten on that step. The field layout was read from the
+      TuxGuitar 1.6.6 classes. Repeat signs are written and read. The reader
+      put a note after a tie across a barline at the wrong tick; the start of
+      each beat is now tracked.
+- [x] `.gp`: a zip with `VERSION` (`7.0`, the only version TuxGuitar's
+      importer accepts) and `Content/score.gpif`. Strings count from the
+      lowest, tunings list the lowest first, tempo changes are automations at
+      a bar and position (progressive ones are linear), repeats carry the
+      number of plays, ties, palm mute, hammer-on, slide, dead, ghost, accents,
+      slap and pop, and the track's sound and mix.
+- [x] `.mid`: format 1 with a conductor track (tempo, time signatures) and a
+      track per instrument with its bank, program, volume and pan.
+- [x] `.mscz` / `.mscx`: MuseScore 4.4 format, one tablature part per track
+      with its tuning, frets, sound and mix. Structure follows the templates
+      shipped with MuseScore 4.4; ties are spanners with locations.
+- [x] Checked: unit tests per writer (well-formed XML, string and tuning
+      order, ties, repeats, tempo, effects, escaping), `.tg` round trips
+      through our own reader, and a comparison of the TuxGuitar writer and
+      its GP7 importer (`Repeat count` is read as plays minus one, `VERSION`
+      must be `7.0`) with what is written.
+- [ ] Not checked: the files have not been opened in TuxGuitar, Guitar Pro or
+      MuseScore (running them was not possible where this was written).
+      Likeliest trouble spots: tie spanners and the instrument block in
+      MuseScore, the missing Guitar Pro style blobs in `.gp`.
+- [ ] Not exported: chords with notes of different lengths (cut to the beat),
+      tempo changes inside a bar for `.tg`, per-note sound switching, most
+      effects in `.mid` and `.mscz` (palm mute, let ring, vibrato, hammer-on,
+      slide), dynamics marks. Other TuxGuitar exports (MusicXML, LilyPond,
+      ASCII, PDF, `.gp3` to `.gp5`) are not planned yet.
+
+### 2. Note effects follow the selection
+- [x] Effect buttons and the Note and Effects menus show the state of the
+      selection: on only when every selected note has the effect, so a mixed
+      selection shows off and one click gives the effect to the rest. Clicking
+      an effect that all of them have removes it.
+- [x] With no selection the buttons set the effect used for new notes. Selecting
+      notes or applying an effect to them no longer changes that, so notes
+      written afterwards no longer inherit palm mute. Typing a fret over an
+      existing note keeps its effects.
+
+### 3. The Sound menu shows what is playing
+- [x] While playing, a track with an automatic sound shows the preset that
+      sounds at the playhead (`InstrumentTrack::sound_at`): the one the latest
+      started note asked for, e.g. the palm-muted guitar after a muted note,
+      and the track's usual one otherwise.
+
+### 4. MIDI keyboard
+- [x] Tools > MIDI Keyboard lists the input devices (Refresh devices, Disconnect).
+      Keys sound on the selected track's channel and are written at the cursor
+      like the fretboard does: keys that arrive in the same frame form a chord
+      (`keyboard_entry::assign_strings`: lowest keys first, each on the free
+      string needing the lowest fret), the cursor moves on after it.
+- [ ] Key velocity and how long a key is held do not set the note's dynamic
+      or length (the selected ones apply). The chosen device is not
+      remembered between runs. Not tried with a real keyboard.
+
+### 5. Ctrl+click multi-selection
+- [x] Ctrl+click (Cmd on macOS) adds a note to the selection or removes it;
+      Ctrl+drag on empty space adds the notes inside the rectangle.
+
+### 6. Writing a note past the last bar adds one
+- [x] Typing a fret (keyboard, Enter, fretboard) at the end of the last bar
+      grows the track by the bars the note needs, as pasting does
+      (`InstrumentTrack::grow_bars_to_cover`); the status line says so.
+
+### 7. Ghost track
+- [x] The ghost view is one of the two ways to show tracks picked together
+      (see 8). The notes of each ghost track are drawn faintly (35 % opacity)
+      on the track being edited, with the painters of a real track: fret
+      numbers in tab view, bricks with their numbers in brick view and
+      noteheads in classic notation, with stems, beams and ties; no rests.
+      The ghost track's bar lines are drawn as faint lines through the staff
+      (`core::ghost::ghost_layers`, `ghost_marks_in`; one or several ghost
+      tracks). Positions are matched in time, through each track's own tempo
+      map, not by tick; in tab view they are placed between the beat
+      columns of the edited track. A ghost with fewer strings is lined up
+      from the lowest string (a bass lies on the low strings of a guitar) and
+      keeps its pitches in notation. A note played the same on every pass of
+      a folded loop is drawn once. The picked tracks are not saved with the
+      project and reset when another project opens.
+- [x] The ghost track is shown as it plays, repeats unrolled, so every pass
+      of a repeated region has its own guide lines.
+- [x] While ghost tracks are on, the track being edited is unrolled too
+      when it has repeats they do not all repeat in step with
+      (`core::ghost::unrolled_view`). A repeated pass folds into its first
+      pass while every ghost track repeats with it: the same pass of the same
+      earlier bars, starting at the same moment. From the first bar played
+      where any of them parts ways, every pass is drawn. A loop played 6 times
+      against the ghost's 4 shows its first 4 passes as the one written
+      loop and the last 2 drawn out; the playback line runs along that
+      layout (`UnrolledView::shown_tick_at_playback`). When every repeated
+      pass folds, as with loops in step or a focused loop with fewer
+      passes, the track stays as written. This applies to whichever track
+      is selected.
+- [x] The unrolled track is `core::bars::UnrolledView`: the bars shown, with
+      time signatures per bar played and no repeat signs, every note a copy
+      that names the written note it came from. The canvas lays out, draws
+      and hit-tests that copy; a click, selection, drag, stretch, delete or
+      effect on any pass is made on the written note, so every pass changes
+      together. A click on empty space puts the cursor on the written bar
+      the pass repeats, and the cursor is drawn on every pass. Drag and
+      stretch previews show on every pass.
+- [x] Notes in repeated passes are drawn in the theme's accent 2, as the
+      repeated blocks of the bar timeline are: the brick fill in brick
+      view, the fret number in tab view.
+- [ ] Not tried in a running app: the unrolled canvas is covered by the
+      logic tests of `UnrolledView` and `unrolled_view` only.
+      Repeat signs are not drawn on the unrolled track. Bars are not
+      numbered by pass.
+- [ ] Notes' lengths are not drawn, only onsets.
+
+### 8. Multi-track view and track order
+- [x] Ctrl+click on a track's number or name in the track table picks it
+      together with the focused one (Ctrl+click again drops it); a click
+      without Ctrl leaves the multi-track view and focuses that track (the
+      track already in focus keeps its cursor and only loses the others).
+      Picking is not done in the block timeline.
+- [x] A switch decides what picked tracks are: Stacked or Ghost, next to
+      "+ Track" in the table while tracks are picked, and in View >
+      Multi-Track View. It is remembered while the app runs.
+- [x] Stacked: every picked track is drawn on the canvas in table order,
+      one band per track in every row, like MuseScore's systems. All tracks
+      break their rows at the same bar numbers; in tab view bar number n is
+      as wide as the widest bar n of any track, so barlines line up
+      (`MultiPlan`). A track with fewer bars ends early. Each band shows the
+      track's name at the start of the row (accent 1 for the one in focus).
+      A press on a track's staff makes it the focused track: cursor,
+      selection, typing and the playback line follow it. Each track has its
+      own tempo map for the playback line.
+- [x] Ghost: the track in focus when it began stays the one edited, and
+      the other picked tracks are ghosted on it. Ctrl+click on the focused
+      track does nothing. Several ghost tracks merge their marks by position.
+- [x] In the table, the number and name of picked tracks are accent 1 when
+      stacked; in the ghost view the focused track is accent 1 and the ghost
+      tracks accent 2.
+- [x] Tracks can be reordered by dragging the track number in the table;
+      a line shows where it lands. The track keeps its id, channel and
+      everything else, and the table, the block timeline, exports and
+      playback order follow (`BwxProject::move_track`, undoable).
+- [ ] Stacked tracks are aligned by bar number, not by time, so tracks with
+      different time signatures or tempo do not line up in time (use the
+      ghost view for that). The ghost view is not drawn while stacked, and
+      the unrolled view of repeats is only for the ghost view. Dragging
+      scrolls nothing at the edges of the table. Not tried in a running app:
+      only the core pieces (`move_track`, ghost logic) have tests.
+
+### 9. Build and tests
+- [x] `cargo test`: 379 passed, 3 ignored. `cargo check --all-targets`: only
+      the warnings that were already there. The new `midir` dependency
+      (MIDI input) changed `Cargo.lock`. Nothing in this pass was tried in a
+      running app: the effect buttons, Ctrl+click, the ghost track, the Sound menu during
+      playback and the MIDI keyboard are covered by the logic tests only.
+
 ---
 
 ## 🚧 Not yet done / future work
 
 ### Current issues:
-- [ ] "Choose automatically" for MS Basic soundfont does not choose palm muted guitar on palm muted notes, all per-note autochoosing requires verification
-- [ ] Palm muting just says P. M. on an affected note instead of showing a dashed line like in MuseScore or Tuxguitar. Needs reimplementation.
-- [ ] Note lengths aren't autoreadjusted for bars with irrational time signatures
 - [ ] Theme switching (19.08.2026, item 2) covers the biggest-impact colors
       but not every hardcoded one in `app.rs` — smaller accents (e.g. the
       P.M. label, playhead, selection-rectangle colors) weren't audited
@@ -1554,10 +1803,7 @@ right-click submenus and the move / stretch drag previews.
       for text; Edit > Paste takes it. Which clipboard formats a given DAW
       or Guitar Pro 8 reads is unchecked.
 - [ ] Irrational time signatures stop at denominators of 255 and are not
-      exported to `.tg` / `.gp`; the numerator still stops at 32.
-- [ ] `.tg` export writes a brick that spans a barline as one over-long
-      beat; exporting from tab view (where it is already split into tied
-      notes) is the faithful path. Unverified against TuxGuitar itself.
+      exported to any standard format; the numerator still stops at 32.
 
 ### Core notation engine (Phase 2)
 - Right mouse click (RMB) in an area to open context menu with options:
@@ -1693,11 +1939,11 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Hosting for VST2, CLAP, LV2 and AU, and VST3 loading on macOS.
 
 ### File formats (Phase 4)
-- [ ] **`.tg` import/export** beyond the current TuxGuitar subset reader. Export can't be tested, blocked due to inability to delete test instrument with polythithms
-- [ ] **`.gp` (Guitar Pro)** reader/writer (export path is a placeholder text
-      bundle today).
-- [ ] Multi-track bundle export wizard with a per-track checklist (currently
-      exports all tracks unconditionally).
+- [ ] Open the exported `.tg`, `.gp`, `.mid` and `.mscz` files in TuxGuitar,
+      Guitar Pro and MuseScore and fix what they reject.
+- [ ] **Import** of `.gp`, `.mid` and `.mscz`; the `.tg` reader covers a
+      TuxGuitar subset.
+- [ ] Export of a chosen set of tracks (the dialog exports all of them).
 
 ### UI / UX
 - [ ] **Custom theme palette editor** (`EditorTheme` exists but is not

@@ -1,7 +1,7 @@
 //! Bar-level structure of a track: bar spans, repeat signs and how they
 //! unroll into playback order, and moving whole bars along or between tracks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::project::{
     BarMark, BwxProject, InstrumentTrack, TabNote, TimeSignature, TimeSignatureChange, Tick,
@@ -222,20 +222,44 @@ impl InstrumentTrack {
     /// when the track has no repeats. Notes that run on across a barline
     /// stay joined only where the next bar played is the next bar written.
     pub fn unrolled_for_playback(&self) -> Option<InstrumentTrack> {
+        self.unrolled_with_origins(None).map(|unrolled| unrolled.track)
+    }
+
+    /// `unrolled_for_playback` with only the bars played whose entry in
+    /// `keep` is set (every bar when `None`), placed one after another.
+    fn unrolled_with_origins(&self, keep: Option<&[bool]>) -> Option<Unrolled> {
         if !self.has_repeats() {
             return None;
         }
         let spans = self.bar_spans();
-        let played = self.played_bars();
+        let mut cursor = 0;
+        let bars: Vec<(PlayedBar, BarSpan)> = self
+            .played_bars()
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| keep.is_none_or(|keep| keep.get(*index).copied().unwrap_or(true)))
+            .map(|(_, played)| {
+                let span = spans[played.bar];
+                let length = span.end - span.start;
+                let placed = PlayedBar {
+                    bar: played.bar,
+                    start: cursor,
+                    end: cursor + length,
+                    repeated: played.repeated,
+                };
+                cursor += length;
+                (placed, span)
+            })
+            .collect();
         let mut notes: Vec<TabNote> = Vec::new();
-        for (position, bar) in played.iter().enumerate() {
-            let span = spans[bar.bar];
+        let mut origins: HashMap<u64, u64> = HashMap::new();
+        for (position, (bar, span)) in bars.iter().enumerate() {
             let follows_written = position
                 .checked_sub(1)
-                .is_some_and(|before| played[before].bar + 1 == bar.bar);
-            let continues_written = played
+                .is_some_and(|before| bars[before].0.bar + 1 == bar.bar);
+            let continues_written = bars
                 .get(position + 1)
-                .is_some_and(|after| after.bar == bar.bar + 1);
+                .is_some_and(|(after, _)| after.bar == bar.bar + 1);
             for note in self
                 .notes
                 .iter()
@@ -253,13 +277,14 @@ impl InstrumentTrack {
                 {
                     copy.tied_from_previous = None;
                 }
+                origins.insert(copy.id, note.id);
                 notes.push(copy);
             }
         }
         let mut track = self.clone();
         track.notes = notes;
         track.sort_notes();
-        Some(track)
+        Some(Unrolled { track, origins, bars })
     }
 
     /// End of the unrolled song for this track: the end of the last played
@@ -280,6 +305,147 @@ impl InstrumentTrack {
             })
             .map(|played| played.end)
             .max()
+    }
+}
+
+struct Unrolled {
+    track: InstrumentTrack,
+    origins: HashMap<u64, u64>,
+    bars: Vec<(PlayedBar, BarSpan)>,
+}
+
+/// A track with its repeats written out in playing order, for editing a
+/// repeated section where its passes are on show. Each copy of a note keeps
+/// the id of the written note it came from in `origin`, so an edit made on
+/// any pass can be made once, on the written section, and shows on all.
+#[derive(Clone, Debug)]
+pub struct UnrolledView {
+    /// The unrolled track: one bar per bar shown, no repeat signs.
+    pub track: InstrumentTrack,
+    origins: HashMap<u64, u64>,
+    /// Each bar shown, with the written bar it repeats.
+    bars: Vec<(PlayedBar, BarSpan)>,
+    /// Each bar played, as `(start, end, shown start)`: where it stands in
+    /// playing order and where on the unrolled track it is drawn.
+    playback: Vec<(Tick, Tick, Tick)>,
+}
+
+impl UnrolledView {
+    /// Every pass of every repeat shown; `None` when the track has no
+    /// repeats and is shown as written.
+    #[cfg(test)]
+    pub fn of(track: &InstrumentTrack) -> Option<Self> {
+        Self::partial(track, None)
+    }
+
+    /// Only the passes whose entry in `keep` (one per bar played) is set are
+    /// shown; a pass left out is drawn as the first pass of its bar, which
+    /// must be kept.
+    pub fn partial(track: &InstrumentTrack, keep: Option<&[bool]>) -> Option<Self> {
+        let Unrolled { track: mut view, origins, bars } = track.unrolled_with_origins(keep)?;
+        let mut shown_so_far = 0;
+        let playback: Vec<(Tick, Tick, Tick)> = track
+            .played_bars()
+            .iter()
+            .enumerate()
+            .map(|(index, played)| {
+                let kept = keep.is_none_or(|keep| keep.get(index).copied().unwrap_or(true));
+                let shown = if kept {
+                    shown_so_far += 1;
+                    bars.get(shown_so_far - 1).map(|(bar, _)| bar.start)
+                } else {
+                    bars.iter()
+                        .find(|(bar, _)| bar.bar == played.bar)
+                        .map(|(bar, _)| bar.start)
+                };
+                (played.start, played.end, shown.unwrap_or(played.start))
+            })
+            .collect();
+
+        let mut changes: Vec<TimeSignatureChange> = Vec::new();
+        let mut previous: Option<(TimeSignature, bool)> = None;
+        for (played, span) in &bars {
+            let needs_change = match previous {
+                None => true,
+                Some((signature, partial)) => signature != span.signature || partial,
+            };
+            if needs_change {
+                changes.push(TimeSignatureChange {
+                    at_tick: played.start,
+                    signature: span.signature,
+                });
+            }
+            previous = Some((
+                span.signature,
+                span.end - span.start != span.signature.measure_ticks(),
+            ));
+        }
+        view.time_signature_changes = changes;
+        view.bar_marks.clear();
+        view.bar_count = bars.len() as u32;
+        Some(Self { track: view, origins, bars, playback })
+    }
+
+    /// Where a playing position (on the track's unrolled playing axis) is
+    /// drawn. A pass that is not shown is drawn on its first pass.
+    pub fn shown_tick_at_playback(&self, position: f64) -> f64 {
+        match self
+            .playback
+            .iter()
+            .find(|(start, end, _)| position >= *start as f64 && position < *end as f64)
+        {
+            Some((start, _, shown)) => *shown as f64 + (position - *start as f64),
+            None => match (self.playback.last(), self.bars.last()) {
+                (Some((_, end, _)), Some((last, _))) => last.end as f64 + (position - *end as f64),
+                _ => position,
+            },
+        }
+    }
+
+    /// The written note a note of the unrolled track is a copy of. An id
+    /// that is not a copy is returned unchanged.
+    pub fn origin(&self, copy_id: u64) -> u64 {
+        self.origins.get(&copy_id).copied().unwrap_or(copy_id)
+    }
+
+    /// The written tick under `tick` of the unrolled track. Past the last
+    /// bar it carries on from the end of the last written bar played.
+    pub fn written_tick(&self, tick: Tick) -> Tick {
+        let found = self
+            .bars
+            .iter()
+            .find(|(played, _)| tick >= played.start && tick < played.end);
+        match (found, self.bars.last()) {
+            (Some((played, span)), _) => span.start + (tick - played.start),
+            (None, Some((played, span))) if tick >= played.end => span.end + (tick - played.end),
+            _ => tick,
+        }
+    }
+
+    /// Whether `tick` of the unrolled track lies in a bar that is a repeat
+    /// of one already played.
+    pub fn is_repeated_at(&self, tick: Tick) -> bool {
+        self.bars
+            .iter()
+            .any(|(played, _)| played.repeated && tick >= played.start && tick < played.end)
+    }
+
+    /// Every place a written tick is shown: once per pass of its bar. A
+    /// tick on the end of the last written bar sits on the end of its last
+    /// pass.
+    pub fn view_ticks(&self, tick: Tick) -> Vec<Tick> {
+        let mut ticks: Vec<Tick> = self
+            .bars
+            .iter()
+            .filter(|(_, span)| tick >= span.start && tick < span.end)
+            .map(|(played, span)| played.start + (tick - span.start))
+            .collect();
+        if ticks.is_empty()
+            && let Some((played, span)) = self.bars.iter().rev().find(|(_, span)| tick == span.end)
+        {
+            ticks.push(played.end + (tick - span.end));
+        }
+        ticks
     }
 }
 
@@ -593,6 +759,128 @@ mod tests {
         track.set_repeat_close(BAR * 2, 1);
         // A one-bar loop inside a larger one: the larger one is the group.
         assert_eq!(track.loop_bars(2), [1, 2, 3]);
+    }
+
+    fn looped_project() -> BwxProject {
+        // Bars 0..4 with bar 1 and 2 repeated once: 0 1 2 1 2 3.
+        let mut project = project_with_bars(4);
+        let id = project.tracks[0].id;
+        for (bar, fret) in [(0, 10), (1, 11), (2, 12), (3, 13)] {
+            note_at_bar(&mut project, id, bar, fret);
+        }
+        let track = &mut project.tracks[0];
+        track.set_repeat_open(BAR, true);
+        track.set_repeat_close(BAR * 2, 1);
+        project
+    }
+
+    #[test]
+    fn the_unrolled_view_lists_every_bar_played() {
+        let project = looped_project();
+        let view = UnrolledView::of(&project.tracks[0]).expect("has repeats");
+        assert_eq!(view.track.bar_count, 6);
+        assert!(view.track.bar_marks.is_empty());
+        let frets: Vec<u8> = view.track.notes.iter().map(|note| note.fret).collect();
+        assert_eq!(frets, [10, 11, 12, 11, 12, 13]);
+        let starts: Vec<Tick> = view.track.notes.iter().map(|note| note.abs_tick).collect();
+        assert_eq!(starts, [0, BAR, BAR * 2, BAR * 3, BAR * 4, BAR * 5]);
+    }
+
+    #[test]
+    fn only_later_passes_count_as_repeated() {
+        let project = looped_project();
+        let view = UnrolledView::of(&project.tracks[0]).unwrap();
+        let flags: Vec<bool> = (0..6).map(|bar| view.is_repeated_at(bar * BAR + 1)).collect();
+        assert_eq!(flags, [false, false, false, true, true, false]);
+    }
+
+    #[test]
+    fn a_track_without_repeats_has_no_unrolled_view() {
+        assert!(UnrolledView::of(&project_with_bars(3).tracks[0]).is_none());
+    }
+
+    #[test]
+    fn every_copy_of_a_note_names_the_written_note() {
+        let project = looped_project();
+        let written = &project.tracks[0];
+        let view = UnrolledView::of(written).unwrap();
+        for copy in &view.track.notes {
+            let origin = written
+                .notes
+                .iter()
+                .find(|note| note.id == view.origin(copy.id))
+                .expect("origin is a written note");
+            assert_eq!(origin.fret, copy.fret);
+        }
+        let copies = view
+            .track
+            .notes
+            .iter()
+            .filter(|note| note.fret == 11)
+            .map(|note| view.origin(note.id))
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0], copies[1]);
+    }
+
+    #[test]
+    fn view_ticks_map_back_to_written_ticks_on_every_pass() {
+        let project = looped_project();
+        let view = UnrolledView::of(&project.tracks[0]).unwrap();
+        let tick = BAR + TICKS_PER_QUARTER;
+        assert_eq!(
+            view.view_ticks(tick),
+            [BAR + TICKS_PER_QUARTER, BAR * 3 + TICKS_PER_QUARTER]
+        );
+        for shown in view.view_ticks(tick) {
+            assert_eq!(view.written_tick(shown), tick);
+        }
+        assert_eq!(view.view_ticks(0), [0]);
+        assert_eq!(view.written_tick(BAR * 5 + 7), BAR * 3 + 7);
+        // The end of the last written bar is the end of the last pass.
+        assert_eq!(view.view_ticks(BAR * 4), [BAR * 6]);
+    }
+
+    #[test]
+    fn the_unrolled_view_follows_the_signature_of_each_bar_played() {
+        let mut project = looped_project();
+        let track = &mut project.tracks[0];
+        // Bars 1 and 2 are 3/4; the rest stay 4/4. Notes sit at the new grid.
+        track.notes.clear();
+        track.time_signature_changes = vec![
+            TimeSignatureChange { at_tick: 0, signature: TimeSignature::new(4, 4) },
+            TimeSignatureChange { at_tick: BAR, signature: TimeSignature::new(3, 4) },
+            TimeSignatureChange {
+                at_tick: BAR + TICKS_PER_QUARTER * 6,
+                signature: TimeSignature::new(4, 4),
+            },
+        ];
+        track.set_repeat_open(BAR, true);
+        track.set_repeat_close(BAR + TICKS_PER_QUARTER * 3, 1);
+        let spans: Vec<TimeSignature> = track.bar_spans().iter().map(|span| span.signature).collect();
+        let view = UnrolledView::of(track).unwrap();
+        let shown: Vec<TimeSignature> = view.track.bar_spans().iter().map(|span| span.signature).collect();
+        let order: Vec<usize> = track.played_bars().iter().map(|played| played.bar).collect();
+        let expected: Vec<TimeSignature> = order.iter().map(|&bar| spans[bar]).collect();
+        assert_eq!(shown, expected);
+    }
+
+    #[test]
+    fn editing_the_written_note_changes_every_copy() {
+        let mut project = looped_project();
+        let written_id = {
+            let view = UnrolledView::of(&project.tracks[0]).unwrap();
+            let copy = view.track.notes.iter().find(|note| note.fret == 11).unwrap();
+            view.origin(copy.id)
+        };
+        project.tracks[0]
+            .notes
+            .iter_mut()
+            .find(|note| note.id == written_id)
+            .unwrap()
+            .fret = 20;
+        let view = UnrolledView::of(&project.tracks[0]).unwrap();
+        assert_eq!(view.track.notes.iter().filter(|note| note.fret == 20).count(), 2);
     }
 
     #[test]
