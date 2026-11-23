@@ -97,6 +97,11 @@ fn mscx(song: &ExportSong) -> String {
     ] {
         xml.text_with("metaTag", &[("name", name.to_owned())], value);
     }
+    // MuseScore keeps properties it does not know, so BetterWriter's own
+    // settings (the automatic sound, plug-ins) survive a round trip.
+    if let Ok(settings) = super::extras::encode(song.project) {
+        xml.text_with("metaTag", &[("name", super::extras::PROPERTY.to_owned())], &settings);
+    }
 
     for (index, exported) in song.tracks.iter().enumerate() {
         write_part(&mut xml, index, exported.track);
@@ -197,6 +202,61 @@ struct Placed<'a> {
     beat: &'a ExportBeat,
 }
 
+/// The lines MuseScore draws over a run of notes: a technique held for as
+/// long as the notes that carry it follow each other.
+const LINES: [(&str, &str, fn(&ExportNote) -> bool); 3] = [
+    ("PalmMute", "palmMute", |note| note.effects.palm_mute),
+    ("LetRing", "letRing", |note| note.effects.let_ring),
+    ("Vibrato", "guitarVibrato", |note| note.effects.vibrato),
+];
+
+/// Where a line is: the bar it is in and the ticks into it.
+#[derive(Clone, Copy)]
+struct Spot {
+    bar: usize,
+    offset: Tick,
+}
+
+fn write_line_start(xml: &mut Xml, name: &str, subtype: &str, from: Spot, to: Spot) {
+    xml.open_with("Spanner", &[("type", name.to_owned())]);
+    xml.open(name);
+    xml.text("subtype", subtype);
+    xml.close(name);
+    write_location(xml, "next", to.bar as i64 - from.bar as i64, to.offset - from.offset);
+    xml.close("Spanner");
+}
+
+fn write_line_end(xml: &mut Xml, name: &str, from: Spot, to: Spot) {
+    xml.open_with("Spanner", &[("type", name.to_owned())]);
+    write_location(xml, "prev", from.bar as i64 - to.bar as i64, from.offset - to.offset);
+    xml.close("Spanner");
+}
+
+/// For each line kind and each beat, whether the beat is the last of a run
+/// the line covers, and where the run ends: at the next beat when it is in
+/// the same bar, else at the end of the bar.
+fn line_ends(song: &ExportSong, flat: &[Placed], on: fn(&ExportNote) -> bool) -> Vec<Option<Spot>> {
+    let carries = |placed: &Placed| placed.beat.notes.iter().any(on);
+    (0..flat.len())
+        .map(|at| {
+            if !carries(&flat[at]) || flat.get(at + 1).is_some_and(carries) {
+                return None;
+            }
+            let here = &flat[at];
+            Some(match flat.get(at + 1).filter(|next| next.bar == here.bar) {
+                Some(next) => Spot {
+                    bar: next.bar,
+                    offset: offset_in_bar(&song.grid[next.bar], next.beat.start),
+                },
+                None => Spot {
+                    bar: here.bar,
+                    offset: song.grid[here.bar].end - song.grid[here.bar].start,
+                },
+            })
+        })
+        .collect()
+}
+
 fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score::ExportTrack) {
     let strings = exported.track.tuning.len().max(1);
     let flat: Vec<Placed> = exported
@@ -206,6 +266,9 @@ fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score:
         .flat_map(|(bar, content)| content.beats.iter().map(move |beat| Placed { bar, beat }))
         .collect();
     let mut cursor = 0;
+    // A line starts at the first beat of its run and ends where the run does.
+    let ends: Vec<Vec<Option<Spot>>> = LINES.iter().map(|(_, _, on)| line_ends(song, &flat, *on)).collect();
+    let mut open_from: Vec<Option<Spot>> = vec![None; LINES.len()];
 
     xml.open_with("Staff", &[("id", (index + 1).to_string())]);
     if index == 0 {
@@ -256,6 +319,26 @@ fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score:
                 xml.close("Tempo");
             }
             let (value, dots) = score::value_and_dots(beat.duration);
+            let here = Spot {
+                bar: bar_index,
+                offset: offset_in_bar(grid, beat.start),
+            };
+            for (kind, (name, subtype, on)) in LINES.iter().enumerate() {
+                let carries = beat.notes.iter().any(on);
+                if carries && open_from[kind].is_none() {
+                    // The run's end is the first later beat that ends one.
+                    let end = (cursor..flat.len()).find_map(|at| ends[kind][at]);
+                    if let Some(end) = end {
+                        write_line_start(xml, name, subtype, here, end);
+                        open_from[kind] = Some(here);
+                    }
+                }
+            }
+            for text in exported.texts_in(beat) {
+                xml.open("StaffText");
+                xml.text("text", text);
+                xml.close("StaffText");
+            }
             if beat.notes.is_empty() {
                 xml.open("Rest");
                 if whole_bar_rest {
@@ -306,6 +389,13 @@ fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score:
                     );
                 }
                 xml.close("Chord");
+            }
+            // A line whose run ends with this beat closes right after it.
+            for (kind, (name, _, _)) in LINES.iter().enumerate() {
+                if let (Some(end), Some(from)) = (ends[kind][cursor], open_from[kind]) {
+                    write_line_end(xml, name, from, end);
+                    open_from[kind] = None;
+                }
             }
             cursor += 1;
         }

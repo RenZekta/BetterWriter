@@ -1285,10 +1285,6 @@ right-click submenus and the move / stretch drag previews.
       macOS loading; plug-in latency compensation, tempo/transport info for
       plug-ins, MIDI controllers other than notes, multi-output instruments,
       instruments in the global chain.
-- [ ] **Not tested here**: any real-world plug-in (only the `vst3` crate's
-      gain example and a small instrument built from it), the Windows editor
-      window and the Windows loader (no Windows here; the Windows-only code
-      is type-checked, not run), audio on a device.
 - [x] Tests: `cargo test` 229 passed with the two test plug-ins built from the
       vst3 crate (`BW_TEST_GAIN_VST3`, `BW_TEST_SYNTH_VST3`, `BW_TEST_VST3`
       name the bundles; without them those tests pass quietly), 2 ignored (the
@@ -1426,9 +1422,6 @@ right-click submenus and the move / stretch drag previews.
       18.11.2026 (and its tests) is removed. Delete, Backspace and Ctrl+A in
       the FX Chain list and Delete in the Automation Editor are read from the
       window that has the keyboard.
-- [ ] **Not tested here (Windows only)**: finding the window by title,
-      the owner relation, and plug-in editors as children of the FX Chain's
-      own window instead of the program's.
 
 ### 3. Plug-in editors freezing during playback
 - [x] Probable cause: playback asked for a repaint after every frame, so the
@@ -1733,7 +1726,6 @@ right-click submenus and the move / stretch drag previews.
       logic tests of `UnrolledView` and `unrolled_view` only.
       Repeat signs are not drawn on the unrolled track. Bars are not
       numbered by pass.
-- [ ] Notes' lengths are not drawn, only onsets.
 
 ### 8. Multi-track view and track order
 - [x] Ctrl+click on a track's number or name in the track table picks it
@@ -1776,6 +1768,387 @@ right-click submenus and the move / stretch drag previews.
       (MIDI input) changed `Cargo.lock`. Nothing in this pass was tried in a
       running app: the effect buttons, Ctrl+click, the ghost track, the Sound menu during
       playback and the MIDI keyboard are covered by the logic tests only.
+
+---
+
+## 21.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Tracks: delete, add, numbering, order
+- [x] Right-click on a track's number or name in the table offers "Delete
+      track" (`BwxProject::remove_track`; the last track cannot be deleted);
+      right-click on the empty area under the tracks offers "Add track".
+- [x] The number shown for a track is its place in the table, so it follows
+      a drag reorder (it is the position + 1, not a stored number).
+
+### 2. Writing a note plays it
+- [x] A note written at the cursor with the fret keys or Enter sounds at
+      once through the track's own sound (`audition_written_note`), for as
+      long as the note lasts: at least 0.15 s and at most 2 s, then it is
+      released. A muted track stays silent. A fretboard click writes through
+      the same path (`click_fretboard` -> `write_fret_at_cursor`), so it
+      sounds too; a click on a note already there deletes it and is silent.
+      Notes drawn with the mouse in brick view and pasted notes do not
+      sound yet. Not listened to in a running app.
+
+### 3. New Project uses the advanced instrument list
+- [x] The New Project window embeds the same instrument list as the
+      Instrument picker (`sound_picker::instrument_list`: search, genre,
+      family) and the track is created with the instrument picked.
+
+### 4. TuxGuitar rejected the generated .tg
+- [x] TuxGuitar decides the format by comparing the header text exactly,
+      and it expects "TuxGuitar File Format - 1.5", not "1.5.0". The writer
+      now writes that text (`TG_VERSION`). The expected text was read from
+      the bytecode of the TuxGuitar 1.6.6 jar; the file was not opened in
+      TuxGuitar itself.
+- [ ] Open the exported files in TuxGuitar, Guitar Pro and MuseScore and
+      fix what they reject (still open, see File formats below).
+
+### 5. Ghost track: see-through notes
+- [x] Ghost tracks now show their notes faintly, see section 7 of the
+      20.11.2026 pass above (`core::ghost::ghost_layers`).
+
+### 6. Import: .tg, .gp, .mscz / .mscx, .mid
+- [x] File > Open takes `.bwx`, `.tg`, `.gp`, `.mscz`, `.mscx`, `.mid` and
+      `.midi` (`format::open_project`, picked by extension). Only `.bwx` and
+      `.tg` are saved back in place; any other import is saved as a new
+      project.
+- [x] Every reader fills one neutral song (`format::import`: shared bar
+      grid, tempo curve, tracks with notes) that becomes the project, and a
+      report of what the file held that the project has no place for yet.
+      The report opens in an "Import notes" window after the file opens, one
+      line per kind with a count (bends, harmonics, chord diagrams,
+      lyrics, text, dynamics, grace notes, trills, strums, alternate
+      endings, section markers, key signatures, triplet feel, pedal and
+      other MIDI controllers ...). The notes themselves are kept, plain.
+- [x] Placeholders: percussion tracks (drum kits, MIDI channel 10, MuseScore
+      percussion staves) are kept as empty tracks named "... (percussion,
+      not imported)" in their place, with bank 128; extra staves of a Guitar
+      Pro track are counted in the report; a second voice is merged onto the
+      first voice's staff, and a note that sits on a first-voice note is
+      dropped.
+- [x] `.tg` (`tuxguitar::import_tg`): as before plus tuplet lengths
+      (`enters` notes in the time of `times`; the flag was read correctly,
+      the lengths were not scaled), the capo (frets count from it), percussion
+      channels (bank 128) and the report.
+- [x] `.gp` (`import_gp`, Guitar Pro 7/8 GPIF in the zip): title, tempo
+      automation (with the beat unit and glide), bars with time signature and
+      repeat signs, tracks with tuning, capo, fret count, program and bank,
+      volume and pan, solo and mute, notes with string, fret, dynamics as
+      velocity, ties, tuplets and the effects the project has (dead, palm
+      mute, let ring, vibrato, slide, hammer-on, ghost, accents, staccato,
+      tapping, slap, pop, fade in).
+- [x] `.mscz` / `.mscx` (`import_musescore`): one track per staff; tempo,
+      time signatures (a bar of another length than the signature, such as a
+      pickup, becomes a bar of its own length), repeats, tuplets, ties,
+      staccato and accents, dead notes, palm mute, let ring and vibrato
+      lines, slides. A note with a string and fret that agree with its pitch
+      keeps them (counted from the lowest string or from the highest); any
+      other is placed from its pitch.
+- [x] `.mid` (`import_midi`): format 0 and 1, running status; one track per
+      channel of each MIDI track (named from the track name); tempo and
+      time signature events make the bar grid; volume, pan, bank and
+      program. A MIDI file has no strings, so pitches are placed on a guitar
+      (a bass for programs 32 to 39) at the lowest fret on a free string;
+      pitches outside the strings move by octaves, and that is reported.
+      Times are rounded to the nearest 192nd of a whole note (reported).
+- [x] A small XML reader of our own (`format::xml::parse`) instead of a new
+      dependency, so `Cargo.toml` did not change for this.
+- [ ] Not tried with files written by Guitar Pro, MuseScore or TuxGuitar
+      themselves: the readers are tested on the files our exporters write
+      and on small hand-written ones that follow the format as the
+      exporters and TuxGuitar's bytecode show it. Real files will use
+      elements and orderings not covered. In particular: the beat unit of
+      a Guitar Pro tempo, the order of the channel-strip parameters (volume
+      and pan), and which end MuseScore counts its tab strings from are
+      taken from the exporters.
+- [ ] Old Guitar Pro files (`.gp3` to `.gp5`) and `.gpx` are not read.
+- [ ] Notes sounding on one string at once (two voices) are not kept
+      apart; there is one voice per track.
+
+### 7. Tuplets (designed; the core is built, see 22.11.2026)
+- [ ] Agreed design: the tuplet button in brick view opens a window to split
+      the cursor or the selected notes into N equal parts. The span is
+      stored on the track (`{start, length, parts}`, like `bar_marks`),
+      with its own sub-grid inside the bar grid and a cursor that steps by
+      one part; with no notes under it, the split is only in the editor and
+      is dropped when the cursor moves away unwritten, and a note written
+      fills every part. Each selected note gets its own span. A span is
+      removed when a note that is not a tuplet note lands on it (moved onto
+      it, stretched across a part boundary or past its end, or as long as
+      the whole span), and when no tuplet note is left in it; empty parts
+      stay as rests. Importers and exporters will read and write the spans.
+
+### 8. Fixes after trying the importers and plug-in parameters
+- [x] A change of sound (instrument, picked sound, "Choose automatically")
+      now reaches the playback events at once (`apply_mix_event` rebuilds the
+      track's events). Before, the automatic palm-mute sound showed in the
+      menu but was heard only after something else (switching tab / brick
+      view) rebuilt them.
+- [x] `.tg` pitch: the byte after the tuning is the track's offset plus 24
+      (checked in TuxGuitar's `TGSongReaderImpl.readTrack`: `readByte() -
+      24`); the reader took it as a capo of 24 semitones and played two
+      octaves up. It now subtracts 24. Test: `the_tuning_comes_back_as_written_with_no_offset`.
+- [x] `.mscz` / `.mscx` export writes palm mute, let ring and vibrato as
+      MuseScore line spanners over each run of notes that carry them (they
+      were dropped); the importer reads them back.
+- [x] `.mscz` / `.mscx` keep BetterWriter's own settings (instrument, the
+      automatic sound, plug-in chains with their saved settings, master chain)
+      in a score property named "BetterWriter" (`format::extras`, MessagePack
+      as base64): a MuseScore score keeps properties it does not know, so
+      reopening restores the automatic sound. Not tried in MuseScore itself
+      (whether it keeps the property when it saves the score again is
+      assumed). `.gp` and `.tg` have no place for them; saving to those says
+      so in the status line.
+- [x] Save As offers `.bwx`, `.tg`, `.gp` and `.mscz`; File > Save then
+      writes to the same file (a `.mscz` / `.mscx` opened is saved back in
+      place; a `.gp` opened is saved as a new project, since it would lose
+      the automatic sound).
+- [x] Double-clicking a plug-in parameter's slider resets it to the plug-in's
+      default, as double-clicking its name does (egui's slider senses drags
+      only, so `double_clicked` never fired; the double click is read from
+      the pointer).
+- [x] Plug-in parameter changes are undo steps: the settings of the running
+      plug-ins are written into the project when a drag starts and ends
+      (`begin_param_edit` / `end_param_edit`), and undo and redo load them
+      back into the plug-ins (`PluginHost::restore_states`). A change made in
+      the plug-in's own window is not an undo step (changed on 22.11.2026,
+      see below).
+      Not tried with a real plug-in; the logic is not covered by a test.
+
+### 9. Bends and tremolo bar (designed, not built)
+- [ ] One shared pitch envelope: points `{time, semitones in quarter-tone
+      steps, curve -1..1 for the segment leading into the point}`, snapped
+      to the grid, edited in brick view (double-click adds a point, scroll
+      over a point changes its curve, drag moves it) and in a detail window
+      opened by right-click on the modifier (draggable points, numeric
+      fields, curvature per segment, presets: bend, bend-release,
+      pre-bend, pre-bend-release).
+- [ ] Bend modifier: the envelope belongs to a note and runs along its tied
+      chain, times relative to the note's start. Left-click applies a default
+      full bend to the selection. Drawn in a thin pitch strip above the
+      bricks for bent notes only. A MIDI pitch bend moves the whole channel,
+      so playback gives a bending note its own spare channel (sound, volume
+      and pan copied) while it sounds; this is an audio engine change.
+- [ ] Tremolo bar: not a continuous lane like tempo, volume and pan. Each
+      dive is its own envelope on the track with a start and an end in
+      time, not tied to a note, and between envelopes the bar rests at 0.
+      Envelopes may not overlap and end by returning to 0 (a release is
+      drawn inside). Created by dragging a range on its own row in brick
+      view; edited like a bend. It moves the whole channel, so it needs no
+      spare channel.
+- [ ] Formats: Guitar Pro and TuxGuitar store bends as linear points on a
+      coarse grid per note and the tremolo bar as points per beat, so
+      smooth curves are flattened and a tremolo envelope longer than a beat
+      is split at the beats (reported). MIDI export uses pitch-bend events.
+      The importers read bends and tremolo-bar points into envelopes
+      instead of counting them as skipped.
+
+### 10. Build and tests
+- [x] `cargo test`: 416 passed, 3 ignored. `cargo check --all-targets`: only
+      the 3 warnings that were already there. `Cargo.toml` and `Cargo.lock`
+      did not change in this pass. Nothing in this pass was tried in a
+      running app: the track context menus, the note audition, the New
+      Project list and the import window are covered by compile and logic
+      tests only.
+
+---
+
+## 22.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Fixes
+- [x] The bar timeline under the track table was gone: the spacer added under
+      the track rows was as wide as all the free space, so the rows' scroll
+      area took the whole width and left the timeline none. It is now as
+      wide as the table. Seen and checked in a running app (virtual display).
+- [x] Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) and Space now work in the FX Chain
+      window and the other floating windows: each of those is its own
+      window with its own keyboard input, which the main window never saw.
+      They queue the key (`floating::queue_window_shortcuts`) and the main
+      window carries it out. A window whose text field has focus keeps the
+      keys. Not tried with a real second window on screen (the virtual
+      display has no window manager to give another window the keyboard).
+- [x] One drag of a plug-in parameter slider is one undo step: the end of
+      the drag was looked for on the main window's pointer, which does not
+      see a drag in the FX Chain window, so every frame closed the step and
+      opened a new one. The window that began the drag now decides.
+- [x] Undoing the removal of a plug-in: the causes found by reading, not
+      reproduced (plug-in editors only open on Windows, so this could not
+      be tried here):
+      the editor of a plug-in that an undo or redo took out of the chain was
+      kept and later outlived its plug-in; a removed plug-in was dropped
+      three seconds after removal, so undo made a second instance beside the
+      dying one. Now an editor goes when its slot leaves the chain
+      (`forget_vanished_slots`), an editor keeps its plug-in alive until it
+      is itself gone, and a plug-in that an undo or redo step still names is
+      kept running idle (`collect_garbage` with the history's slot ids), so
+      undoing a removal brings back the same instance with its settings.
+      If the black window still shows up, it is not one of these.
+
+### 2. Features
+- [x] A change made in a plug-in's own window is an undo step too. The host
+      now sees the plug-in's begin / perform / end edit calls
+      (`vst3::Gestures`): the first touch opens a step starting from the
+      settings last written down (`known_states`), and it closes when the
+      plug-in lets go and has been quiet for 300 ms; one knob drag is one step.
+      Plug-ins that never call beginEdit are caught by their performEdit.
+      Not tried with a real plug-in.
+- [x] Save As / Export start with the name of the file the project came from
+      without its format (Night Souls.gp offers Night Souls.bwx; Export offers
+      Night Souls and the chosen format adds its ending). A project that
+      was never saved still goes by its title.
+- [x] Text above the score (`core::annotations`: `TextAnnotation{tick, text}`
+      per track): the Text button of the palette (and "Text..." in the
+      context menu) opens a small window for the cursor or the selected
+      note's position; empty text or Remove deletes it. Drawn above the staff
+      in tab, notation and brick views; follows bar insert / delete / move;
+      undoable. Written and read by `.tg` (beat text), `.gp` (FreeText) and
+      `.mscz` / `.mscx` (StaffText, SystemText on the first staff), and no
+      longer reported as skipped. One text per tick; a text that falls
+      inside a longer beat is exported at that beat's start. Test:
+      `texts_above_the_score_survive_the_notation_formats`. Texts of an
+      unrolled (repeat-expanded) view are not shown.
+- [x] Tuplets in the editor and the core (`core::tuplets`: `TupletSpan{start,
+      length, parts}` on the track; part boundaries, the "normal notes" count,
+      `prune_tuplets` after every note edit, `split_notes_into_tuplets`,
+      `write_tuplet`, spans follow bar insert / delete / move; tests):
+      - the Tuplet palette button opens a window with 3, 5, 6, 7, 9 ... 15
+        parts; with notes selected each note is cut into that many equal
+        parts (its own span each), with none selected the cursor is split
+        (`CursorTuplet`, editor state only: it is dropped when the cursor
+        moves) and the next fret typed fills every part;
+      - typing inside a span writes one part and steps to the next part;
+      - a bracket with the part count is drawn above each span (tab,
+        notation and brick rows), the split cursor shows its cuts in brick
+        view, and a click in brick view snaps to the part boundaries;
+      - notation, rests, ties, stretching and move snapping know the spans.
+      Checked in a running app (virtual display): cursor split into 3, typed
+      a fret, three notes and a "3" bracket appeared, notation shows
+      triplet eighths. Not done: the file formats do not write or read
+      tuplets yet (exporters still snap every note to a 64th, so a triplet
+      comes out slightly off the beat), and there is no "remove tuplet"
+      command beyond overwriting its notes with ordinary ones.
+- [ ] Bends and tremolo bar: not started (see 21.11.2026 section 9).
+
+### 2b. Later the same day
+- [x] The fretboard follows the loops: while playing it showed the notes
+      under the playing position on the unrolled timeline, so after a repeat
+      it looked at the wrong place of the written track. It now uses the
+      written position (`playback_score_tick`).
+- [x] Ghost mode: a ghost note that ends exactly where a repeat pass of the
+      shown track begins was cut to nothing (its end was looked up at the
+      start of the loop). The end is now looked up just inside the note
+      (`ghost_layers`); test
+      `a_ghost_note_ending_where_a_pass_of_the_shown_loop_begins_keeps_its_length`
+      fails without the change (length 1 tick) and passes with it.
+- [x] The tuplet window takes any number of parts (2 to 64) in a number box:
+      type it, drag it or scroll the wheel over it, then Cut (or Enter).
+      Whether the parts fit is checked when it is applied. The wheel works on
+      a number box through `wheel_step`.
+- [x] Alt + wheel over the score changes the note length one value per notch
+      (wheel up longer, down shorter): the entry length, and the selected
+      note(s) take it too.
+- [x] Slow with a plug-in open (second pass; the first guess, turning the
+      refresh wait off, did not help and was undone: frames wait for the
+      display's refresh again, with adaptive sync following it). Found by
+      reading the code, not measured (plug-in editors only open on Windows):
+      every FX Chain window, every frame,
+      - copied the whole chain including each plug-in's saved settings,
+        which can be megabytes (`SoundChainSlot::without_state`);
+      - asked the plug-in for every one of its parameters, one call each
+        (`handle.parameters()`), for the Parameters view; the list is now
+        kept for 2 s per plug-in (`FxChainState::parameters`).
+      Playback no longer caps frames at 60 a second: it asks for the next
+      frame 1 ms after the last, so the display's refresh sets the rate (the
+      millisecond keeps the window's message queue empty between frames for
+      the plug-in editors' timers). `vsync: true` in `NativeOptions` does
+      nothing with the wgpu renderer; the present mode is set in
+      `WgpuConfiguration` in `main.rs`.
+- [x] Alt + wheel (and the wheel over a number box) counts notches from the
+      raw wheel events (`wheel_notches`) instead of the smoothed scroll,
+      which spread a notch over frames so some notches counted twice and
+      others needed a second. In a running app on the virtual display each
+      wheel click arrived as two wheel events and made two steps, so the
+      one-notch-one-step behaviour could not be seen end to end there; the
+      counting is per wheel event (a notch is one line).
+
+### 3. Speed on long scores
+- [x] Looked at with the real song and a synthetic score
+      of 6 tracks x 6400 notes x 300 bars (run on a virtual display with
+      software drawing, so frame times are only comparable with each other).
+      Found and fixed:
+      - the bar timeline under the track table painted every bar of every
+        track, in view or not: it now paints only the blocks in view. Shapes
+        drawn per frame: 3001 -> 1689 on the song, 6936 -> 2486 on the large
+        score;
+      - the timeline asked of every bar whether any note touches it, by
+        scanning all notes (bars x notes per frame); it is now one pass
+        over the notes (`occupied_bars`, tested against the old definition);
+      - the status bar copied the whole compiled MIDI event list every frame
+        just to count it (`ShadowTimeline::len`).
+      Time spent in the interface code per frame on the large score: about
+      4.8 ms after the last two items, 3.5 ms after the culling (the first
+      item was not timed alone, an earlier 10 ms reading was taken while a
+      second copy of the program was running, so it is not used). The score
+      rows were already skipped when off screen.
+      On the song itself it was about 2 ms before and after, so a drop seen
+      there is not explained by these; the drawing itself (GPU) was not
+      measurable on this machine.
+
+### 4. Every floating window draws itself (deferred viewports)
+- [x] Frames dropped with every window open, and more with each one. Cause,
+      from eframe 0.34.2 (`render_immediate_viewport`): a window made with
+      `show_viewport_immediate` runs inside the main window's frame, then is
+      painted and presented there, waiting for the display, before the main
+      window can finish. N windows meant N+1 waits per main frame, and each
+      window's interface was rebuilt every main frame. This replaces the
+      immediate viewports of 19.11.2026, item 2.
+- [x] All floating windows (FX Chain, Add FX, Theme, Automation Editor,
+      Instrument picker, Tuplet, Text, Import notes) are now deferred
+      viewports (`floating::BetterWriterApp::floating_window`). Each is drawn
+      and presented from its own redraw, never inside the main frame, and
+      repaints only for its own input, a 1 s timer, or a wake-up.
+      - The app now lives behind `Shell` (`Rc<RefCell<..>>`), so a window
+        draws from the live app state with the same `&mut self` code as
+        before; nothing is copied or queued. Windows are never drawn while
+        the main frame holds the borrow. egui asks deferred callbacks for
+        `Send + Sync`, so they are wrapped in `MainThread`, which asserts on
+        every use that it runs on the thread that made it (eframe runs all
+        viewports on the event-loop thread). Where the platform has no real
+        windows, egui's embedded window is used as before.
+      - A window with input (click, key, wheel, drag) wakes the main window
+        and the other windows; the pointer merely moving does not, so
+        windows cannot pull each other back to the main window's frame rate.
+        The main window wakes the open windows on the same kinds of input.
+        Playback and MIDI-keyboard changes reach a window within its 1 s
+        refresh.
+      - Undo, redo and Space now run directly from any window (the queue of
+        22.11.2026, item 1, is gone).
+      - The window is found and owned by the program's window by its handle,
+        checked with `IsWindow` each frame. Before, the owner was set once
+        and a window reopened later was never owned again.
+      - Editors in the background (`preload_fx_editors`) and the scan counter
+        in Add FX ask for their own repaints; the immediate windows used to
+        drive them by repainting every frame.
+- [x] Run on a virtual display with software drawing: the FX Chain window
+      opens as a window of its own, Add FX opens from inside it, Cancel
+      closes it and it opens again, and Bright in the Theme window re-themes
+      the main window and the Theme window at once. No panics. This showed
+      that the first version of the helper had dropped the panel every
+      window's contents sit in (the Add FX window came out black); restored.
+- [ ] Frame times and the effect of a real plug-in were not measured: that
+      machine had no GPU and no Windows. Check on Windows with a plug-in
+      open and 2-3 windows.
+- [ ] The windows are still drawn one after another on the main thread
+      (winit allows one event loop per process), and a plug-in's editor is a
+      native window on that thread too (a VST3 editor must be made on the
+      thread that owns the window), so a plug-in that paints slowly still
+      takes time from the main window. The black flash of the notation seen
+      after the frame-pacing attempts was not found by reading; it may be
+      gone with the windows' nested presents, or not.
+
+### 5. Build and tests
+- [x] `cargo test`: 434 passed, 3 ignored.
 
 ---
 
@@ -1916,46 +2289,41 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Make instruments selectable to display multiple of their tabs/notations at the same time (current time of each instrument's notes is the key for synchronization here)
 
 ### Audio / playback (Phase 3)
-- [ ] **Live playback playhead** rendered on the canvas synced to the audio
-      callback (the engine plays, but there is no moving cursor yet).
+- [x] **Live playback playhead** rendered on the canvas synced to the audio
+      callback
 - [ ] Transport scrubbing: rewind / fast-forward / jump-to-start actually move
       the playhead (buttons exist but are no-ops).
-- [ ] Loop regions, metronome, count-in.
-- [ ] Verify audible output on a real device: a headless test renders
+- [x] Loop regions, 
+- [ ] Metronome, count-in.
+- [x] Verify audible output on a real device: a headless test renders
       `MS Basic.sf3` to a non-silent buffer (12.11.2026), but the `cpal`
       stream has never been heard in this sandbox (no sound card).
-- [ ] Playing from the middle does not sound notes already held at the start
-      tick (a tied continuation chosen as the start point stays silent until
-      its next attack).
-- [ ] Fretboard clicks don't audition the note.
+- [x] Fretboard clicks audition the note: they write through the same path as
+      the keys (21.11.2026 item 2).
 - [ ] Changing a track's sound, volume or pan does not audition: the new setup
-      is heard the next time notes play (live while playing, immediately).
+      is heard the next time notes play (live while playing, immediately) (??? Dev: I don't get it, is this an issue or what???).
 - [ ] Sounds other than the 128 General MIDI ones in bank 0 (the soundfont's
       variation banks and the 37 drum kits in bank 128) are not selectable,
       and there is no drum track type yet.
-- [ ] Track table: instrument type (which sound list a track gets) can't be
-      changed after creation, and channel assignment is not editable.
 - [x] Real **VST3 hosting**: done in 17.11.2026 item 17 (the stub is gone).
 - [ ] Hosting for VST2, CLAP, LV2 and AU, and VST3 loading on macOS.
 
 ### File formats (Phase 4)
 - [ ] Open the exported `.tg`, `.gp`, `.mid` and `.mscz` files in TuxGuitar,
       Guitar Pro and MuseScore and fix what they reject.
-- [ ] **Import** of `.gp`, `.mid` and `.mscz`; the `.tg` reader covers a
-      TuxGuitar subset.
+- [x] **Import** of `.tg`, `.gp`, `.mid` and `.mscz`: done 21.11.2026 item 6.
+      Real files from the other programs are still to be tried.
 - [ ] Export of a chosen set of tracks (the dialog exports all of them).
 
 ### UI / UX
-- [ ] **Custom theme palette editor** (`EditorTheme` exists but is not
-      user-editable at runtime).
-- [ ] Score scrollbar widget (`Shift`+wheel is the only way to scroll) and a
-      paged layout.
+- [x] **Custom theme palette editor**
+- [x] Score scrollbar widget
 - [ ] Zoom holds only the row under the pointer in place; its horizontal
       position shifts because rows reflow to the page width.
 - [ ] Edition palette commands still drawn disabled: key signature, clef,
-      triplet feel, repeats, tuplet, fermata,
+      triplet feel, repeats, tuplet (done), fermata,
       crescendo / decrescendo, bend, harmonic, trill, grace note, tremolo
-      bar, text, chord diagram. No voice 1/2 or select/draw modes.
+      bar, text (done), chord diagram. No voice 1/2 or select/draw modes.
 - [ ] Note effect glyphs rendered on the staff (palm-mute text exists; others
       are modeled but not drawn).
 - [ ] Drag-to-move notes; drag-select range.
@@ -1970,7 +2338,7 @@ right-click submenus and the move / stretch drag previews.
       selection changes (e.g. three quarter rests become six eighth rests),
       unlike TuxGuitar where each rest beat keeps its own length.
 - [ ] Tab view has no overlapping notes (a second voice): a note is always
-      cut at the next beat that has notes.
+      cut at the next beat that has notes (intentional, for that multi-track exists).
 - [ ] A single bar wider than the page isn't scrolled or clipped in tab view.
 - [ ] Moving and stretching notes in tab view (disabled for now, see
       10.11.2026).

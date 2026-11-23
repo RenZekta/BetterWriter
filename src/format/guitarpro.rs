@@ -470,6 +470,10 @@ impl Ids {
                         }
                         beats.close("Properties");
                     }
+                    let texts = exported.texts_in(beat);
+                    if !texts.is_empty() {
+                        beats.text("FreeText", texts.join(" "));
+                    }
                     beats.close("Beat");
                 }
 

@@ -325,8 +325,30 @@ impl IHostApplicationTrait for HostContext {
 /// audio processor.
 type EditQueue = Arc<Mutex<Vec<(u32, f64)>>>;
 
+/// What the plug-in's own window has done to its parameters, for the host's
+/// edit history to read from the UI thread.
+#[derive(Default)]
+pub struct Gestures {
+    /// Gestures begun and not yet ended (a knob held down).
+    open: std::sync::atomic::AtomicI32,
+    /// The plug-in changed a parameter since the last `take_touched`.
+    touched: std::sync::atomic::AtomicBool,
+}
+
+impl Gestures {
+    pub fn is_open(&self) -> bool {
+        self.open.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Whether the plug-in changed anything since the last call.
+    pub fn take_touched(&self) -> bool {
+        self.touched.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 struct ComponentHandler {
     edits: EditQueue,
+    gestures: Arc<Gestures>,
 }
 
 impl Class for ComponentHandler {
@@ -335,10 +357,14 @@ impl Class for ComponentHandler {
 
 impl IComponentHandlerTrait for ComponentHandler {
     unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.gestures.open.fetch_add(1, Relaxed);
+        self.gestures.touched.store(true, Relaxed);
         kResultOk
     }
 
     unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
+        self.gestures.touched.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut edits) = self.edits.lock() {
             edits.push((id, value_normalized));
         }
@@ -346,6 +372,8 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 
     unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self.gestures.open.fetch_update(Relaxed, Relaxed, |open| Some((open - 1).max(0)));
         kResultOk
     }
 
@@ -631,6 +659,7 @@ pub struct Instance {
     _host: ComWrapper<HostContext>,
     _handler: ComWrapper<ComponentHandler>,
     edits: EditQueue,
+    gestures: Arc<Gestures>,
     /// Channels of the main audio input; 0 for an instrument.
     pub inputs: usize,
     pub outputs: usize,
@@ -719,7 +748,8 @@ impl Instance {
                 }
             }
             let edits: EditQueue = Arc::new(Mutex::new(Vec::new()));
-            let handler = ComWrapper::new(ComponentHandler { edits: edits.clone() });
+            let gestures = Arc::new(Gestures::default());
+            let handler = ComWrapper::new(ComponentHandler { edits: edits.clone(), gestures: gestures.clone() });
             if let Some(controller) = &controller {
                 if let Some(handler_ref) = handler.as_com_ref::<IComponentHandler>() {
                     controller.setComponentHandler(handler_ref.as_ptr());
@@ -798,6 +828,7 @@ impl Instance {
                 _host: host,
                 _handler: handler,
                 edits,
+                gestures,
                 inputs,
                 outputs,
                 scratch_in: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
@@ -965,6 +996,11 @@ impl Instance {
                 controller.setComponentState(stream_ref.as_ptr());
             }
         }
+    }
+
+    /// What the plug-in's own window has done to its parameters.
+    pub fn gestures(&self) -> Arc<Gestures> {
+        self.gestures.clone()
     }
 
     /// What the UI thread needs to show and change the plug-in's parameters,

@@ -11,8 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::native_window::NativeWindow;
-use super::vst3::{ControllerHandle, Editor, Instance, Module};
+use super::vst3::{ControllerHandle, Editor, Gestures, Instance, Module};
 use crate::core::{BwxProject, PluginFormat, SoundChainSlot};
+
+/// What the plug-ins' own windows did since the last look.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowEdits {
+    pub touched: bool,
+    pub held: bool,
+}
 
 /// A plug-in the audio thread may run. The audio thread only ever
 /// `try_lock`s, so the UI thread can read or change settings without
@@ -25,6 +32,8 @@ pub struct LivePlugin {
     /// the audio thread runs the plug-in under. Every frame the UI held that
     /// lock was a block the audio thread had to skip, which is a click.
     controller: UiHandle,
+    /// What the plug-in's own window has done to its parameters.
+    pub gestures: Arc<Gestures>,
 }
 
 /// The controller half of a plug-in, which only the UI thread touches; the
@@ -66,6 +75,19 @@ pub struct PluginHost {
     /// Removed plug-ins wait here a moment so the audio thread has dropped
     /// its copy first and shutdown code never runs on it.
     retired: Vec<(Instant, Arc<LivePlugin>)>,
+    /// Each running plug-in's settings as last written into a slot or read
+    /// back: what a change made in the plug-in's own window started from.
+    known_states: Mutex<HashMap<u64, Vec<u8>>>,
+}
+
+/// The ids of every slot of every chain of `project`.
+pub fn slot_ids(project: &BwxProject) -> impl Iterator<Item = u64> + '_ {
+    project
+        .tracks
+        .iter()
+        .flat_map(|track| track.sound_chain.iter())
+        .chain(project.master_chain.iter())
+        .map(|slot| slot.id)
 }
 
 impl Default for PluginHost {
@@ -82,6 +104,7 @@ impl PluginHost {
             live: HashMap::new(),
             failed: HashMap::new(),
             retired: Vec::new(),
+            known_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,11 +131,20 @@ impl PluginHost {
         if let Some(live) = self.live.get(&slot.id) {
             return Some(live.clone());
         }
+        // A slot brought back (undo) finds its plug-in still waiting.
+        if let Some(at) = self.retired.iter().position(|(_, live)| live.id == slot.id) {
+            let (_, live) = self.retired.remove(at);
+            self.live.insert(slot.id, live.clone());
+            return Some(live);
+        }
         if self.failed.contains_key(&slot.id) {
             return None;
         }
         match self.start(slot) {
             Ok(live) => {
+                if let Ok(instance) = live.instance.lock() {
+                    self.remember_state(slot.id, instance.save_state());
+                }
                 self.live.insert(slot.id, live.clone());
                 Some(live)
             }
@@ -148,17 +180,19 @@ impl PluginHost {
         Ok(Arc::new(LivePlugin::new(slot.id, slot.is_instrument, instance)))
     }
 
-    /// Drops every plug-in no slot of `project` names any more, and ones
-    /// retired long enough ago.
-    pub fn collect_garbage(&mut self, project: &BwxProject) {
-        let wanted: HashSet<u64> = project
-            .tracks
-            .iter()
-            .flat_map(|track| track.sound_chain.iter())
-            .chain(project.master_chain.iter())
-            .map(|slot| slot.id)
+    /// Drops every plug-in no slot of `project` names any more and that
+    /// `history` (the slots the undo and redo steps name) does not keep, and
+    /// ones retired long enough ago. A plug-in only waiting for an undo keeps
+    /// running idle, so undoing its removal brings back the very instance,
+    /// settings and all, rather than a new one.
+    pub fn collect_garbage(&mut self, project: &BwxProject, history: &HashSet<u64>) {
+        let wanted: HashSet<u64> = slot_ids(project).collect();
+        let gone: Vec<u64> = self
+            .live
+            .keys()
+            .filter(|id| !wanted.contains(id) && !history.contains(id))
+            .copied()
             .collect();
-        let gone: Vec<u64> = self.live.keys().filter(|id| !wanted.contains(id)).copied().collect();
         for id in gone {
             if let Some(live) = self.live.remove(&id) {
                 self.retired.push((Instant::now(), live));
@@ -183,10 +217,78 @@ impl PluginHost {
                 {
                     let state = instance.save_state();
                     if !state.is_empty() {
+                        self.remember_state(slot.id, state.clone());
                         slot.state = state;
                     }
                 }
             }
+        }
+    }
+
+    fn remember_state(&self, id: u64, state: Vec<u8>) {
+        if let Ok(mut known) = self.known_states.lock() {
+            known.insert(id, state);
+        }
+    }
+
+    /// Whether a plug-in's own window changed something since the last call,
+    /// and whether one of them is being held (a knob down) right now.
+    pub fn poll_window_edits(&self) -> WindowEdits {
+        let mut edits = WindowEdits::default();
+        for live in self.live.values() {
+            edits.touched |= live.gestures.take_touched();
+            edits.held |= live.gestures.is_open();
+        }
+        edits
+    }
+
+    /// `project` with each plug-in's settings as they were before the
+    /// changes made in its own window since they were last written down.
+    pub fn with_known_states(&self, project: &BwxProject) -> BwxProject {
+        let mut project = project.clone();
+        let Ok(known) = self.known_states.lock() else {
+            return project;
+        };
+        let chains = project
+            .tracks
+            .iter_mut()
+            .map(|track| &mut track.sound_chain)
+            .chain(std::iter::once(&mut project.master_chain));
+        for chain in chains {
+            for slot in chain.iter_mut() {
+                if let Some(state) = known.get(&slot.id) {
+                    slot.state = state.clone();
+                }
+            }
+        }
+        project
+    }
+
+    /// Puts each running plug-in's settings back to the ones its slot holds,
+    /// for undo and redo. A plug-in that already has them is left alone.
+    pub fn restore_states(&self, project: &BwxProject) {
+        let chains = project
+            .tracks
+            .iter()
+            .map(|track| track.sound_chain.as_slice())
+            .chain(std::iter::once(project.master_chain.as_slice()));
+        for chain in chains {
+            for slot in chain {
+                if slot.state.is_empty() {
+                    continue;
+                }
+                if let Some(live) = self.live.get(&slot.id)
+                    && let Ok(instance) = live.instance.lock()
+                    && instance.save_state() != slot.state
+                {
+                    instance.load_state(&slot.state);
+                }
+                self.remember_state(slot.id, slot.state.clone());
+            }
+        }
+        // Settings loaded from here are not the user's changes.
+        for live in self.live.values() {
+            live.gestures.take_touched();
         }
     }
 
@@ -221,8 +323,10 @@ impl PluginHost {
 impl LivePlugin {
     pub fn new(id: u64, is_instrument: bool, instance: Instance) -> Self {
         let controller = UiHandle(instance.controller_handle());
+        let gestures = instance.gestures();
         Self {
             id,
+            gestures,
             is_instrument,
             instance: Mutex::new(instance),
             controller,
@@ -249,6 +353,9 @@ pub struct EditorWindow {
     // The view comes off before its window goes.
     editor: Editor,
     window: NativeWindow,
+    /// Keeps the plug-in running for as long as its view exists, so the
+    /// view never outlives the instance it belongs to. Last, so it goes last.
+    _plugin: Arc<LivePlugin>,
     mode: EditorMode,
     /// The size the plug-in wants, in pixels.
     size: (i32, i32),
@@ -271,7 +378,7 @@ fn editors_need_windows() -> Result<(), String> {
 impl EditorWindow {
     /// Opens the editor in a window of its own, owned by `owner` (the
     /// program's window, which it then stays above; null for none).
-    pub fn open(title: &str, plugin: &LivePlugin, owner: *mut std::ffi::c_void) -> Result<EditorWindow, String> {
+    pub fn open(title: &str, plugin: &Arc<LivePlugin>, owner: *mut std::ffi::c_void) -> Result<EditorWindow, String> {
         editors_need_windows()?;
         let handle = plugin.controller_handle().ok_or("the plug-in has no controller")?;
         let mut editor = Editor::new(handle.controller())?;
@@ -284,6 +391,7 @@ impl EditorWindow {
         Ok(EditorWindow {
             editor,
             window,
+            _plugin: plugin.clone(),
             mode: EditorMode::Floating,
             size: (width, height),
             can_resize,
@@ -293,7 +401,7 @@ impl EditorWindow {
 
     /// Opens the editor as a child of the program's main window `parent`. It
     /// stays hidden until `place` puts it somewhere.
-    pub fn open_embedded(parent: *mut std::ffi::c_void, plugin: &LivePlugin) -> Result<EditorWindow, String> {
+    pub fn open_embedded(parent: *mut std::ffi::c_void, plugin: &Arc<LivePlugin>) -> Result<EditorWindow, String> {
         editors_need_windows()?;
         let handle = plugin.controller_handle().ok_or("the plug-in has no controller")?;
         let mut editor = Editor::new(handle.controller())?;
@@ -304,6 +412,7 @@ impl EditorWindow {
         Ok(EditorWindow {
             editor,
             window,
+            _plugin: plugin.clone(),
             mode: EditorMode::Embedded,
             size: (width, height),
             can_resize,

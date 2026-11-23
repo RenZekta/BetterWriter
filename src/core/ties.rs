@@ -229,6 +229,25 @@ fn tie_chain_ids(track: &InstrumentTrack, note_id: u64) -> Vec<u64> {
 pub fn note_slices(track: &InstrumentTrack, start: Tick, end: Tick) -> Vec<(Tick, Tick)> {
     let mut slices = Vec::new();
     for (slice_start, slice_end) in bar_slices(track, start, end) {
+        // Inside a tuplet the pieces are the plain values the parts stand
+        // for, mapped back to real ticks.
+        if let Some(span) = track
+            .tuplet_at(slice_start)
+            .filter(|span| span.is_tuplet() && slice_end <= span.end())
+        {
+            let mut written: Tick = 0;
+            let mut cursor = slice_start;
+            for length in standard_pieces_in(span.written_ticks(slice_end - slice_start), LengthScale::PLAIN) {
+                written += length;
+                let next = (slice_start + span.real_ticks(written)).min(slice_end);
+                slices.push((cursor, next));
+                cursor = next;
+            }
+            if let Some(last) = slices.last_mut() {
+                last.1 = slice_end;
+            }
+            continue;
+        }
         let mut cursor = slice_start;
         let scale = LengthScale::of(track.signature_at(slice_start));
         for length in standard_pieces_in(slice_end - slice_start, scale) {

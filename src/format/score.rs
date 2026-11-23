@@ -75,6 +75,19 @@ pub struct ExportTrack<'a> {
     pub bars: Vec<ExportBar>,
 }
 
+impl<'a> ExportTrack<'a> {
+    /// The texts written over `beat`, that is, anywhere from its start up to
+    /// where the next beat begins.
+    pub fn texts_in(&self, beat: &ExportBeat) -> Vec<&'a str> {
+        self.track
+            .annotations
+            .iter()
+            .filter(|note| note.tick >= beat.start && note.tick < beat.start + beat.duration)
+            .map(|note| note.text.as_str())
+            .collect()
+    }
+}
+
 pub struct ExportSong<'a> {
     pub project: &'a BwxProject,
     pub grid: Vec<GridBar>,

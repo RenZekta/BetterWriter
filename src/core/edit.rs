@@ -70,6 +70,7 @@ impl BwxProject {
             tied_from_previous: None,
         });
         track.sort_notes();
+        track.prune_tuplets();
         Some(id)
     }
 
@@ -79,6 +80,7 @@ impl BwxProject {
         };
         let before = track.notes.len();
         track.notes.retain(|note| note.id != note_id);
+        track.prune_tuplets();
         before != track.notes.len()
     }
 
@@ -154,6 +156,7 @@ impl BwxProject {
         }
 
         track.sort_notes();
+        track.prune_tuplets();
         true
     }
 
@@ -176,6 +179,9 @@ impl BwxProject {
         step_ticks: Tick,
     ) -> bool {
         let step_ticks = step_ticks.max(1);
+        if self.stretch_tuplet_note(track_id, note_id, edge, delta_ticks) {
+            return true;
+        }
         // Round toward zero to the nearest whole step, so a drag that
         // hasn't crossed a full step yet does nothing rather than jittering.
         let delta_ticks = (delta_ticks / step_ticks) * step_ticks;
@@ -241,6 +247,69 @@ impl BwxProject {
         }
 
         track.sort_notes();
+        track.prune_tuplets();
+        true
+    }
+
+    /// Stretches a note of a tuplet span by whole parts: the dragged edge
+    /// snaps to the part boundary nearest the drag, inside the span. A note
+    /// that is not in a span is left to the plain stretch.
+    fn stretch_tuplet_note(&mut self, track_id: u64, note_id: u64, edge: StretchEdge, delta_ticks: Tick) -> bool {
+        let Some(track) = self.track_mut(track_id) else {
+            return false;
+        };
+        let Some(index) = track.notes.iter().position(|note| note.id == note_id) else {
+            return false;
+        };
+        let original = track.notes[index].clone();
+        let Some(span) = track.tuplet_of(&original).copied().filter(|span| span.is_tuplet()) else {
+            return false;
+        };
+        let end = original.end_tick();
+        let (mut start, mut new_end) = (original.abs_tick, end);
+        match edge {
+            StretchEdge::Right => {
+                new_end = span.snap(end + delta_ticks);
+                if let Some(first_part_after) = span.boundary_index(original.abs_tick) {
+                    new_end = new_end.max(span.boundary(first_part_after + 1));
+                }
+                if let Some(next_start) = track
+                    .notes
+                    .iter()
+                    .filter(|note| {
+                        note.id != note_id && note.string_index == original.string_index && note.abs_tick > original.abs_tick
+                    })
+                    .map(|note| note.abs_tick)
+                    .min()
+                {
+                    new_end = new_end.min(next_start);
+                }
+            }
+            StretchEdge::Left => {
+                start = span.snap(original.abs_tick + delta_ticks);
+                if let Some(last_part_before) = span.boundary_index(end) {
+                    start = start.min(span.boundary(last_part_before.saturating_sub(1)));
+                }
+                if let Some(previous_end) = track
+                    .notes
+                    .iter()
+                    .filter(|note| {
+                        note.id != note_id && note.string_index == original.string_index && note.abs_tick < original.abs_tick
+                    })
+                    .map(|note| note.end_tick())
+                    .max()
+                {
+                    start = start.max(previous_end);
+                }
+            }
+        }
+        if (start, new_end) == (original.abs_tick, end) || new_end <= start {
+            return false;
+        }
+        track.notes[index].abs_tick = start;
+        track.notes[index].duration_ticks = new_end - start;
+        track.sort_notes();
+        track.prune_tuplets();
         true
     }
 
@@ -319,6 +388,7 @@ impl BwxProject {
         track.notes[index].abs_tick = new_abs_tick;
         track.notes[index].string_index = new_string_index;
         track.sort_notes();
+        track.prune_tuplets();
         true
     }
 
@@ -351,6 +421,8 @@ impl BwxProject {
             }
         }
         track.shift_bar_marks(bar_start, width);
+        track.shift_tuplets(bar_start, width);
+        track.shift_annotations(bar_start, width);
         track.bar_count = track.bar_count.saturating_add(1);
         track.sort_notes();
         true
@@ -383,6 +455,8 @@ impl BwxProject {
             }
         }
         track.shift_bar_marks(bar_end, width);
+        track.shift_tuplets(bar_end, width);
+        track.shift_annotations(bar_end, width);
         track.bar_count = track.bar_count.saturating_add(1);
         track.sort_notes();
         true
@@ -426,6 +500,10 @@ impl BwxProject {
             .bar_marks
             .retain(|mark| mark.at_tick < bar_start || mark.at_tick >= bar_end);
         track.shift_bar_marks(bar_end, -width);
+        track.drop_tuplets_in(bar_start, bar_end);
+        track.shift_tuplets(bar_end, -width);
+        track.drop_annotations_in(bar_start, bar_end);
+        track.shift_annotations(bar_end, -width);
         if track
             .time_signature_changes
             .first()
@@ -494,11 +572,42 @@ impl InstrumentTrack {
             }
         }
 
-        let Some(&(_, last_end)) = merged.last() else {
+        if merged.is_empty() {
             return vec![RestNode {
                 abs_tick: measure_start,
                 duration_ticks: measure_end - measure_start,
             }];
+        }
+
+        // A tuplet span rests part by part; its stretch then counts as
+        // sounding so the plain gap rests leave it alone.
+        let mut tuplet_rests = Vec::new();
+        if matches!(fill, RestFill::AllGaps { .. }) {
+            for span in track
+                .tuplets
+                .iter()
+                .filter(|span| span.start >= measure_start && span.end() <= measure_end)
+            {
+                for part in 0..u32::from(span.parts) {
+                    let (from, to) = (span.boundary(part), span.boundary(part + 1));
+                    if !merged.iter().any(|&(start, end)| start < to && end > from) {
+                        tuplet_rests.push(RestNode { abs_tick: from, duration_ticks: to - from });
+                    }
+                }
+                merged.push((span.start, span.end()));
+            }
+            merged.sort_unstable();
+            let mut joined: Vec<(Tick, Tick)> = Vec::new();
+            for (start, end) in merged {
+                match joined.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => joined.push((start, end)),
+                }
+            }
+            merged = joined;
+        }
+        let Some(&(_, last_end)) = merged.last() else {
+            return tuplet_rests;
         };
 
         let preferred = match fill {
@@ -527,6 +636,8 @@ impl InstrumentTrack {
             preferred,
             scale,
         ));
+        rests.extend(tuplet_rests);
+        rests.sort_by_key(|rest| rest.abs_tick);
         rests
     }
 }

@@ -113,6 +113,11 @@ impl ShadowTimeline {
         }
     }
 
+    /// How many events are compiled, without copying them.
+    pub fn len(&self) -> usize {
+        self.events.read().map_or(0, |events| events.len())
+    }
+
     pub fn snapshot(&self) -> Vec<MidiPlaybackEvent> {
         self.events
             .read()

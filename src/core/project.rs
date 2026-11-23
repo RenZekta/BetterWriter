@@ -189,13 +189,6 @@ pub enum InstrumentFamily {
 }
 
 impl InstrumentFamily {
-    pub const ALL: [InstrumentFamily; 4] = [
-        InstrumentFamily::Stringed,
-        InstrumentFamily::Orchestra,
-        InstrumentFamily::Drums,
-        InstrumentFamily::Midi,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             InstrumentFamily::Stringed => "Stringed",
@@ -203,12 +196,6 @@ impl InstrumentFamily {
             InstrumentFamily::Drums => "Drums",
             InstrumentFamily::Midi => "MIDI",
         }
-    }
-
-    /// Whether this family has its own editor and playback path. The others
-    /// stay selectable in the picker and build a Stringed track underneath.
-    pub fn is_implemented(self) -> bool {
-        matches!(self, InstrumentFamily::Stringed)
     }
 }
 
@@ -223,13 +210,6 @@ pub enum StringedVariant {
 }
 
 impl StringedVariant {
-    pub const ALL: [StringedVariant; 4] = [
-        StringedVariant::AcousticGuitar,
-        StringedVariant::ElectricGuitar,
-        StringedVariant::Bass,
-        StringedVariant::Other,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             StringedVariant::AcousticGuitar => "Acoustic Guitar",
@@ -373,6 +353,25 @@ pub struct SoundChainSlot {
     pub state: Vec<u8>,
 }
 
+impl SoundChainSlot {
+    /// A copy without the plug-in's saved settings, which can be megabytes
+    /// and are not what a window listing the chain needs.
+    pub fn without_state(&self) -> Self {
+        Self {
+            state: Vec::new(),
+            id: self.id,
+            name: self.name.clone(),
+            path: self.path.clone(),
+            is_instrument: self.is_instrument,
+            bypassed: self.bypassed,
+            format: self.format,
+            vendor: self.vendor.clone(),
+            class_id: self.class_id.clone(),
+            label: self.label.clone(),
+        }
+    }
+}
+
 /// A number no other slot has: the clock in nanoseconds, kept increasing
 /// within a run so two slots made in the same instant still differ.
 pub fn fresh_slot_id() -> u64 {
@@ -460,6 +459,12 @@ pub struct InstrumentTrack {
     pub volume_points: Vec<AutomationPoint>,
     #[serde(default)]
     pub pan_points: Vec<AutomationPoint>,
+    /// Stretches cut into equal parts of their own; see `core::tuplets`.
+    #[serde(default)]
+    pub tuplets: Vec<super::tuplets::TupletSpan>,
+    /// Text written above the score; see `core::annotations`.
+    #[serde(default)]
+    pub annotations: Vec<super::annotations::TextAnnotation>,
 }
 
 impl InstrumentTrack {
@@ -568,6 +573,8 @@ impl InstrumentTrack {
             tempo_points: Vec::new(),
             volume_points: Vec::new(),
             pan_points: Vec::new(),
+            tuplets: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
@@ -610,6 +617,8 @@ impl InstrumentTrack {
             tempo_points: Vec::new(),
             volume_points: Vec::new(),
             pan_points: Vec::new(),
+            tuplets: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
@@ -1006,6 +1015,17 @@ impl BwxProject {
         self.tracks.iter_mut().find(|track| track.id == id)
     }
 
+    /// Removes a track with its notes. The last track cannot be removed: a
+    /// project always has one. Returns whether the track was removed.
+    pub fn remove_track(&mut self, track_id: u64) -> bool {
+        if self.tracks.len() < 2 {
+            return false;
+        }
+        let before = self.tracks.len();
+        self.tracks.retain(|track| track.id != track_id);
+        self.tracks.len() != before
+    }
+
     /// Moves a track to place `to` (0-based, counted after the move) in the
     /// track order. The track keeps its id, channel and everything else, so
     /// only its row in the table, its timeline row and its place in exports
@@ -1325,6 +1345,22 @@ mod move_track_tests {
         assert_eq!(order(&project), ids);
         assert!(project.move_track(ids[0], 99));
         assert_eq!(*order(&project).last().unwrap(), ids[0]);
+    }
+
+    #[test]
+    fn a_track_can_be_removed_but_never_the_last_one() {
+        let mut project = BwxProject::demo();
+        let ids: Vec<u64> = project.tracks.iter().map(|track| track.id).collect();
+        assert!(project.remove_track(ids[0]));
+        assert!(project.track(ids[0]).is_none());
+        assert_eq!(project.tracks.len(), ids.len() - 1);
+        assert!(!project.remove_track(u64::MAX));
+        for &id in &ids[1..] {
+            project.remove_track(id);
+        }
+        assert_eq!(project.tracks.len(), 1);
+        let last = project.tracks[0].id;
+        assert!(!project.remove_track(last));
     }
 
     #[test]

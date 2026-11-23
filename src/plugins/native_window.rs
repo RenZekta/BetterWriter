@@ -480,9 +480,21 @@ pub fn set_owner(window: usize, owner: usize) {
     }
 }
 
+/// True while `window` is a live window.
+#[cfg(any(windows, bw_check))]
+pub fn window_exists(window: usize) -> bool {
+    // SAFETY: `IsWindow` accepts any handle value.
+    window != 0 && unsafe { imp::IsWindow(window as *mut c_void) != 0 }
+}
+
 #[cfg(not(any(windows, bw_check)))]
 pub fn find_window(_title: &str) -> usize {
     0
+}
+
+#[cfg(not(any(windows, bw_check)))]
+pub fn window_exists(_window: usize) -> bool {
+    false
 }
 
 #[cfg(not(any(windows, bw_check)))]

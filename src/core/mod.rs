@@ -1,3 +1,4 @@
+pub mod annotations;
 pub mod automation;
 pub mod bars;
 pub mod clipboard;
@@ -12,6 +13,7 @@ pub mod smf;
 pub mod sounds;
 pub mod tempo;
 pub mod ties;
+pub mod tuplets;
 pub mod validation;
 
 pub use automation::{AutomationLane, AutomationPoint, Scope};

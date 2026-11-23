@@ -46,9 +46,30 @@ pub(super) struct TimelineRow {
     pub bars: Vec<TimelineBar>,
 }
 
+/// Which bars hold part of a note, found in one pass over the notes: a
+/// per-bar scan of every note is quadratic on a long score.
+fn occupied_bars(track: &InstrumentTrack, spans: &[crate::core::bars::BarSpan]) -> Vec<bool> {
+    let mut occupied = vec![false; spans.len()];
+    for note in &track.notes {
+        let end = note.end_tick();
+        // Spans are consecutive, so the first one ending after the note's
+        // start is where it begins.
+        let mut index = spans.partition_point(|span| span.end <= note.abs_tick);
+        while let Some(span) = spans.get(index) {
+            if span.start >= end {
+                break;
+            }
+            occupied[index] = true;
+            index += 1;
+        }
+    }
+    occupied
+}
+
 impl TimelineRow {
     pub fn new(track: &InstrumentTrack, tempo: &TempoMap) -> Self {
         let spans = track.bar_spans();
+        let occupied = occupied_bars(track, &spans);
         let mut exact_from = Some((0, 1));
         let bars = track
             .played_bars()
@@ -68,10 +89,7 @@ impl TimelineRow {
                     exact_from: block_from,
                     exact_length,
                     signature: span.signature,
-                    has_notes: track
-                        .notes
-                        .iter()
-                        .any(|note| note.abs_tick < span.end && note.end_tick() > span.start),
+                    has_notes: occupied[played.bar],
                     bar: played.bar,
                     score_start: span.start,
                     repeated: played.repeated,
@@ -561,7 +579,16 @@ impl BetterWriterApp {
                         Sense::click_and_drag(),
                     );
                     let row_selected = row.track_id == self.selected_track_id;
-                    for block in &row.bars {
+                    // Blocks outside the visible part are neither laid out nor
+                    // tessellated; only the ones in view (plus a block of slack
+                    // for outlines) are painted.
+                    let visible = ui.clip_rect().expand(TIMELINE_MIN_BLOCK);
+                    let drawn = rect.intersects(visible);
+                    for block in row.bars.iter().filter(|block| {
+                        drawn
+                            && rect.left() + block.to as f32 * scale >= visible.left()
+                            && rect.left() + block.from as f32 * scale <= visible.right()
+                    }) {
                         let bar = BarRef {
                             track_id: row.track_id,
                             bar: block.bar,
@@ -1209,5 +1236,34 @@ mod tests {
         let picked = selection(&[(1, 0), (2, 1)]);
         let list = compare_to(&rows, &picked, BarRef { track_id: 1, bar: 0 });
         assert!(list[0].describe("B").contains("never back in step"));
+    }
+
+    #[test]
+    fn occupied_bars_match_a_scan_of_every_note_per_bar() {
+        let mut project = crate::core::BwxProject::demo();
+        let id = project.tracks[0].id;
+        let track = project.track_mut(id).unwrap();
+        track.notes.clear();
+        track.grow_bars_to_cover(64 * TICKS_PER_QUARTER * 4);
+        let bar = TICKS_PER_QUARTER * 4;
+        let mut notes = Vec::new();
+        // Inside a bar, across a barline, exactly on one, and a long hold.
+        for (tick, length) in [(10, 50), (bar * 3 - 20, 40), (bar * 5, bar), (bar * 8 + 7, bar * 4)] {
+            notes.extend(project.insert_note(id, tick, length, 0, 3));
+        }
+        assert_eq!(notes.len(), 4);
+        let track = project.track(id).unwrap();
+        let spans = track.bar_spans();
+        let expected: Vec<bool> = spans
+            .iter()
+            .map(|span| {
+                track
+                    .notes
+                    .iter()
+                    .any(|note| note.abs_tick < span.end && note.end_tick() > span.start)
+            })
+            .collect();
+        assert_eq!(occupied_bars(track, &spans), expected);
+        assert!(expected.iter().filter(|held| **held).count() >= 7);
     }
 }

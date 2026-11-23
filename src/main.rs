@@ -10,7 +10,7 @@ mod plugins;
 mod symbols;
 mod theme;
 
-use app::BetterWriterApp;
+use app::{BetterWriterApp, Shell};
 
 fn main() -> eframe::Result<()> {
     // `--probe-vst3 <bundle>`: the plug-in scanner's child process. It loads
@@ -25,8 +25,13 @@ fn main() -> eframe::Result<()> {
     }
 
     let options = eframe::NativeOptions {
-        // Present at the display's own refresh rate; nothing in the app caps it.
-        vsync: true,
+        // Frames wait for the display's refresh (adaptive sync follows the
+        // display's own rate). This is the wgpu present mode; the `vsync`
+        // option of `NativeOptions` only applies to the glow renderer.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: eframe::egui_wgpu::wgpu::PresentMode::AutoVsync,
+            ..Default::default()
+        },
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1420.0, 880.0])
             .with_min_inner_size([980.0, 620.0]),
@@ -36,6 +41,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "BetterWriter",
         options,
-        Box::new(|cc| Ok(Box::new(BetterWriterApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(Shell::new(BetterWriterApp::new(cc))))),
     )
 }

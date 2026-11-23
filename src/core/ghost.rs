@@ -165,14 +165,19 @@ pub fn ghost_layers(
             let source_map = project.tempo_map_for(source);
             let unrolled = from.unrolled_for_playback();
             let played = unrolled.as_ref().unwrap_or(from);
-            let place = |tick: Tick| -> Tick {
-                let playing = target_map.tick_at(source_map.seconds_at(tick as f64));
+            let place_at = |tick: Tick, back: f64| -> Tick {
+                let playing = target_map.tick_at(source_map.seconds_at(tick as f64)) - back;
                 let shown_at = match view {
                     Some(view) => view.shown_tick_at_playback(playing),
                     None => onto.score_tick_at_playback(playing),
                 };
-                shown_at.round() as Tick
+                (shown_at + back).round() as Tick
             };
+            let place = |tick: Tick| place_at(tick, 0.0);
+            // A note's end is looked up just inside the note: an end that is
+            // exactly where a repeat pass of the shown track begins would
+            // otherwise land on the first bar of the loop.
+            let place_end = |tick: Tick| place_at(tick, 1.0);
             // A source string sits `shift` rows lower than its own number.
             let shift = strings as i64 - from.tuning.len() as i64;
             let row = |string: usize| (string as i64 + shift).clamp(0, strings as i64 - 1) as usize;
@@ -193,7 +198,7 @@ pub fn ghost_layers(
                 .iter()
                 .filter_map(|note| {
                     let start = place(note.abs_tick);
-                    let end = place(note.end_tick());
+                    let end = place_end(note.end_tick());
                     let string_index = row(note.string_index);
                     seen.insert((start, string_index, note.fret)).then(|| {
                         let mut ghost = note.clone();
@@ -377,6 +382,24 @@ mod tests {
         let track = project.track_mut(id).unwrap();
         track.bar_count = 2;
         track.bar_marks = vec![BarMark { at_tick: 0, repeat_open: true, repeat_close: plays - 1 }];
+    }
+
+    #[test]
+    fn a_ghost_note_ending_where_a_pass_of_the_shown_loop_begins_keeps_its_length() {
+        let (mut project, a, b) = two_tracks();
+        // The shown track plays its first bar twice; the ghost track has a
+        // note filling that bar and then one filling the next.
+        bar_zero_played(&mut project, b, 2);
+        project.track_mut(a).unwrap().bar_count = 3;
+        project.insert_note(a, 0, Q * 4, 0, 3).unwrap();
+        project.insert_note(a, Q * 4, Q * 4, 0, 5).unwrap();
+        let shown = project.track(b).unwrap().clone();
+        let layers = ghost_layers(&project, &[a], &shown, None);
+        let notes = &layers[0].notes;
+        assert_eq!(notes.len(), 2);
+        // The first note ends where the loop's second pass starts, which is
+        // the end of the written bar, not its beginning.
+        assert_eq!((notes[0].abs_tick, notes[0].duration_ticks), (0, Q * 4));
     }
 
     #[test]

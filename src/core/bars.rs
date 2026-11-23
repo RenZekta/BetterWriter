@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::annotations::TextAnnotation;
+use super::tuplets::TupletSpan;
 use super::project::{
     BarMark, BwxProject, InstrumentTrack, TabNote, TimeSignature, TimeSignatureChange, Tick,
 };
@@ -455,6 +457,9 @@ struct BarContent {
     signature: TimeSignature,
     length: Tick,
     notes: Vec<TabNote>,
+    /// Tuplet spans and texts of the bar, relative to its start.
+    tuplets: Vec<TupletSpan>,
+    texts: Vec<TextAnnotation>,
     mark: BarMark,
     origin: BarRef,
     old_previous: Option<BarRef>,
@@ -490,6 +495,18 @@ fn lift_bars(track: &InstrumentTrack) -> Vec<BarContent> {
             signature: span.signature,
             length: span.end - span.start,
             notes: Vec::new(),
+            tuplets: track
+                .tuplets
+                .iter()
+                .filter(|tuplet| tuplet.start >= span.start && tuplet.start < span.end)
+                .map(|tuplet| TupletSpan { start: tuplet.start - span.start, ..*tuplet })
+                .collect(),
+            texts: track
+                .annotations
+                .iter()
+                .filter(|text| text.tick >= span.start && text.tick < span.end)
+                .map(|text| TextAnnotation { tick: text.tick - span.start, ..text.clone() })
+                .collect(),
             mark: track.bar_mark_at(span.start),
             origin: BarRef {
                 track_id: track.id,
@@ -521,6 +538,8 @@ fn lift_bars(track: &InstrumentTrack) -> Vec<BarContent> {
 fn rebuild_track(track: &mut InstrumentTrack, bars: Vec<BarContent>) {
     let mut start = 0;
     let mut notes = Vec::new();
+    let mut tuplets = Vec::new();
+    let mut texts = Vec::new();
     let mut changes: Vec<TimeSignatureChange> = Vec::new();
     let mut marks = Vec::new();
     let mut previous: Option<(TimeSignature, bool)> = None;
@@ -541,6 +560,8 @@ fn rebuild_track(track: &mut InstrumentTrack, bars: Vec<BarContent>) {
             placed.abs_tick += start;
             notes.push(placed);
         }
+        tuplets.extend(bar.tuplets.iter().map(|tuplet| TupletSpan { start: tuplet.start + start, ..*tuplet }));
+        texts.extend(bar.texts.iter().map(|text| TextAnnotation { tick: text.tick + start, ..text.clone() }));
         if !bar.mark.is_empty() {
             marks.push(BarMark {
                 at_tick: start,
@@ -553,6 +574,8 @@ fn rebuild_track(track: &mut InstrumentTrack, bars: Vec<BarContent>) {
     track.time_signature_changes = changes;
     track.notes = notes;
     track.bar_marks = marks;
+    track.tuplets = tuplets;
+    track.annotations = texts;
     track.sort_notes();
 }
 
@@ -635,6 +658,8 @@ impl BwxProject {
                     signature,
                     length: signature.measure_ticks(),
                     notes: Vec::new(),
+                    tuplets: Vec::new(),
+                    texts: Vec::new(),
                     mark: BarMark::default(),
                     origin: BarRef { track_id, bar: usize::MAX },
                     old_previous: None,
@@ -962,6 +987,29 @@ mod tests {
         assert_eq!(bar_of_fret(track, 3), 1);
         assert_eq!(bar_of_fret(track, 1), 2);
         assert_eq!(track.bar_count, 3);
+    }
+
+    #[test]
+    fn a_moved_bar_takes_its_texts_and_tuplet_spans_along() {
+        let mut project = project_with_bars(3);
+        let q = crate::core::project::TICKS_PER_QUARTER;
+        let bar = project.tracks[0].bar_spans()[0].end - project.tracks[0].bar_spans()[0].start;
+        let id = project.insert_note(1, 0, q, 0, 3).unwrap();
+        project.split_notes_into_tuplets(1, &[id], 3);
+        project.tracks[0].set_annotation(10, "first");
+        project.tracks[0].set_annotation(bar + 10, "second");
+        project
+            .move_bars(&[BarMove {
+                from: BarRef { track_id: 1, bar: 0 },
+                to_track: 1,
+                insert_before: 2,
+            }])
+            .unwrap();
+        let track = &project.tracks[0];
+        let texts: Vec<_> = track.annotations.iter().map(|note| (note.tick, note.text.as_str())).collect();
+        assert_eq!(texts, [(10, "second"), (bar * 2 + 10, "first")]);
+        assert_eq!(track.tuplets.len(), 1);
+        assert_eq!(track.tuplets[0].start, bar * 2);
     }
 
     #[test]

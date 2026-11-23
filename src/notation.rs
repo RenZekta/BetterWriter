@@ -213,6 +213,16 @@ pub struct BarScore {
     pub beams: Vec<BeamGroup>,
 }
 
+/// How a note or rest of `ticks` starting at `start` is written: inside a
+/// tuplet span as the plain value its parts stand for, elsewhere by the
+/// bar's `scale`.
+fn written_value(track: &InstrumentTrack, start: Tick, ticks: Tick, scale: LengthScale) -> NoteValue {
+    match track.tuplet_at(start).filter(|span| span.is_tuplet()) {
+        Some(span) => note_value_in(span.written_ticks(ticks), LengthScale::PLAIN),
+        None => note_value_in(ticks, scale),
+    }
+}
+
 /// One written piece of a note that starts inside the bar being built.
 struct Onset<'a> {
     note: &'a TabNote,
@@ -282,12 +292,13 @@ pub fn score_bar(
             group.push(&onsets[index]);
             index += 1;
         }
-        let shortest = group
+        // The look comes from the shortest note, as it is written: a note of
+        // a tuplet is written as the plain value its parts stand for.
+        let value = group
             .iter()
-            .map(|onset| onset.length)
-            .min()
-            .unwrap_or(TICKS_PER_QUARTER);
-        let value = note_value_in(shortest, scale);
+            .map(|onset| written_value(track, onset.note.abs_tick, onset.length, scale))
+            .max_by_key(|value| (value.value, value.dots))
+            .unwrap_or(NoteValue { value: 4, dots: 0 });
 
         let heads: Vec<Head> = group
             .iter()
@@ -326,7 +337,7 @@ pub fn score_bar(
     for rest in rests {
         items.push(ScoreItem::Rest {
             tick: rest.abs_tick,
-            value: note_value_in(rest.duration_ticks, scale),
+            value: written_value(track, rest.abs_tick, rest.duration_ticks, scale),
         });
     }
     items.sort_by_key(ScoreItem::tick);

@@ -9,10 +9,12 @@ use crate::core::{
 
 use super::{
     FormatError,
+    import::{Import, Report, scaled},
     score::{self, ExportBar},
 };
 
-const TG_VERSION: &str = "TuxGuitar File Format - 1.5.0";
+/// TuxGuitar compares this header text exactly; its own is "1.5", not "1.5.0".
+const TG_VERSION: &str = "TuxGuitar File Format - 1.5";
 const TG_START_OFFSET: Tick = TICKS_PER_QUARTER;
 
 const TRACK_SOLO: u8 = 0x01;
@@ -115,7 +117,13 @@ struct MeasureHeader {
     repeat_close: u16,
 }
 
+#[cfg(test)]
 pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
+    import_tg(bytes).map(|import| import.project)
+}
+
+/// Reads a TuxGuitar file, with what it held that the project cannot keep.
+pub fn import_tg(bytes: &[u8]) -> Result<Import, FormatError> {
     let mut reader = TgReader::new(bytes);
     let version = reader.read_ubyte_string()?;
     if !version.starts_with("TuxGuitar File Format") {
@@ -136,11 +144,12 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
 
     let channel_count = reader.read_u8()? as usize;
     let mut channel_programs = Vec::with_capacity(channel_count);
+    let mut channel_banks = Vec::with_capacity(channel_count);
     let mut channel_mixes = Vec::with_capacity(channel_count);
     let mut channel_names = Vec::with_capacity(channel_count);
     for _ in 0..channel_count {
         let _channel_id = reader.read_i16()? as u16;
-        let _bank = reader.read_u8()?;
+        let bank = reader.read_u8()?;
         let program = reader.read_u8()?;
         let volume = reader.read_u8()?;
         let balance = reader.read_u8()?;
@@ -155,6 +164,7 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             let _value = reader.read_i32_string()?;
         }
         channel_programs.push(program);
+        channel_banks.push(bank);
         channel_mixes.push((volume.min(127), pan_from_midi(balance)));
         channel_names.push(name);
     }
@@ -179,12 +189,15 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
         }
         if flags & MEASURE_HEADER_REPEAT_ALTERNATIVE != 0 {
             let _ = reader.read_u8()?;
+            reader.report.skip("alternate endings");
         }
         if flags & MEASURE_HEADER_MARKER != 0 {
             reader.read_marker()?;
+            reader.report.skip("section markers");
         }
         if flags & MEASURE_HEADER_TRIPLET_FEEL != 0 {
             let _ = reader.read_u8()?;
+            reader.report.skip("triplet feel marks");
         }
         let length = last_signature.measure_ticks();
         headers.push(MeasureHeader {
@@ -205,6 +218,7 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
         let track_flags = reader.read_u8()?;
         let name = reader.read_ubyte_string()?;
         let channel_id = reader.read_i16()?.max(1) as usize;
+        let percussion = channel_banks.get(channel_id.saturating_sub(1)) == Some(&128);
         let program = channel_programs
             .get(channel_id.saturating_sub(1))
             .copied()
@@ -214,9 +228,10 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             .copied()
             .unwrap_or((100, 0));
         let mut notes = Vec::new();
+        let mut texts = Vec::new();
 
         for header in &headers {
-            reader.read_measure(header, &mut notes, &mut next_note_id)?;
+            reader.read_measure(header, &mut notes, &mut texts, &mut next_note_id)?;
         }
 
         let string_count = reader.read_u8()? as usize;
@@ -224,28 +239,46 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
         for _ in 0..string_count {
             tuning.push(reader.read_u8()?);
         }
-        let _offset = reader.read_u8()?;
+        // The file keeps the track's offset (capo or transposition, in
+        // semitones) plus 24, so 24 means none.
+        let offset = i16::from(reader.read_u8()?) - 24;
         let _r = reader.read_u8()?;
         let _g = reader.read_u8()?;
         let _b = reader.read_u8()?;
         if track_flags & TRACK_LYRICS != 0 {
             let _from = reader.read_i16()?;
             let _lyrics = reader.read_i32_string()?;
+            reader.report.skip("lyrics");
         }
 
+        // Frets are counted from the capo.
+        for pitch in &mut tuning {
+            *pitch = (i16::from(*pitch) + offset).clamp(0, 127) as u8;
+        }
+        if percussion {
+            notes.clear();
+            reader.report.skip("percussion tracks (kept as empty tracks)");
+        }
         tracks.push(InstrumentTrack {
             id: (track_index + 1) as u64,
-            name: if name.is_empty() {
-                channel_names
-                    .get(track_index)
-                    .cloned()
-                    .unwrap_or_else(|| format!("Track {}", track_index + 1))
-            } else {
-                name
+            name: {
+                let base = if name.is_empty() {
+                    channel_names
+                        .get(track_index)
+                        .cloned()
+                        .unwrap_or_else(|| format!("Track {}", track_index + 1))
+                } else {
+                    name
+                };
+                if percussion {
+                    format!("{base} (percussion, not imported)")
+                } else {
+                    base
+                }
             },
             channel: melodic_channel(track_index),
             program,
-            bank: 0,
+            bank: if percussion { 128 } else { 0 },
             sound_auto: false,
             instrument_id: String::new(),
             solo: track_flags & TRACK_SOLO != 0,
@@ -269,8 +302,13 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
             tempo_points: Vec::new(),
             volume_points: Vec::new(),
             pan_points: Vec::new(),
+            tuplets: Vec::new(),
+            annotations: Vec::new(),
         });
         if let Some(track) = tracks.last_mut() {
+            for (tick, text) in &texts {
+                track.set_annotation(*tick, text);
+            }
             for header in &headers {
                 let at = header.start - TG_START_OFFSET;
                 if header.repeat_open {
@@ -303,7 +341,10 @@ pub fn read_tg(bytes: &[u8]) -> Result<BwxProject, FormatError> {
     // should already cover every note; this is just a safety net against a
     // malformed import leaving notes past the last declared bar.
     project.normalize_bar_counts();
-    Ok(project)
+    Ok(Import {
+        project,
+        report: reader.report.lines(),
+    })
 }
 
 pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
@@ -378,7 +419,7 @@ pub fn write_tg(project: &BwxProject) -> Result<Vec<u8>, FormatError> {
         writer.write_ubyte_string(&track.name)?;
         writer.write_i16((track_index + 1).min(i16::MAX as usize) as i16);
         for (measure_index, bar) in exported.bars.iter().enumerate() {
-            writer.write_measure(bar, song.grid[measure_index].start, measure_index == 0);
+            writer.write_measure(exported, bar, song.grid[measure_index].start, measure_index == 0);
         }
         writer.write_u8(track.tuning.len().min(255) as u8);
         for string in &track.tuning {
@@ -437,12 +478,14 @@ fn tempo_points(headers: &[MeasureHeader]) -> Vec<crate::core::TempoPoint> {
 
 struct TgReader<'a> {
     cursor: Cursor<&'a [u8]>,
+    report: Report,
 }
 
 impl<'a> TgReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: Cursor::new(bytes),
+            report: Report::default(),
         }
     }
 
@@ -450,6 +493,7 @@ impl<'a> TgReader<'a> {
         &mut self,
         header: &MeasureHeader,
         notes: &mut Vec<TabNote>,
+        texts: &mut Vec<(Tick, String)>,
         next_note_id: &mut u64,
     ) -> Result<(), FormatError> {
         let flags = self.read_u8()?;
@@ -506,8 +550,10 @@ impl<'a> TgReader<'a> {
             if beat_header & BEAT_HAS_STROKE != 0 {
                 let _direction = self.read_u8()?;
                 let _value = self.read_u8()?;
+                self.report.skip("strums");
             }
             if beat_header & BEAT_HAS_CHORD != 0 {
+                self.report.skip("chord diagrams");
                 let strings = self.read_u8()? as usize;
                 let _name = self.read_ubyte_string()?;
                 let _first_fret = self.read_u8()?;
@@ -516,7 +562,8 @@ impl<'a> TgReader<'a> {
                 }
             }
             if beat_header & BEAT_HAS_TEXT != 0 {
-                let _ = self.read_ubyte_string()?;
+                let text = self.read_ubyte_string()?;
+                texts.push(((beat_start - TG_START_OFFSET).max(0), text));
             }
         }
         if flags & MEASURE_CLEF != 0 {
@@ -532,17 +579,21 @@ impl<'a> TgReader<'a> {
         let raw = self.read_header24()?;
         if raw & EFFECT_BEND != 0 {
             self.skip_points(false)?;
+            self.report.skip("bends");
         }
         if raw & EFFECT_TREMOLO_BAR != 0 {
             self.skip_points(false)?;
+            self.report.skip("tremolo bar dives");
         }
         if raw & EFFECT_HARMONIC != 0 {
+            self.report.skip("harmonics");
             let harmonic_type = self.read_u8()?;
             if harmonic_type != 1 {
                 let _ = self.read_u8()?;
             }
         }
         if raw & EFFECT_GRACE != 0 {
+            self.report.skip("grace notes (played as ordinary notes)");
             let _flags = self.read_u8()?;
             let _fret = self.read_u8()?;
             let _duration = self.read_u8()?;
@@ -550,10 +601,12 @@ impl<'a> TgReader<'a> {
             let _transition = self.read_u8()?;
         }
         if raw & EFFECT_TRILL != 0 {
+            self.report.skip("trills");
             let _fret = self.read_u8()?;
             let _duration = self.read_u8()?;
         }
         if raw & EFFECT_TREMOLO_PICKING != 0 {
+            self.report.skip("tremolo picking");
             let _duration = self.read_u8()?;
         }
         Ok(NoteEffects {
@@ -604,10 +657,13 @@ impl<'a> TgReader<'a> {
     fn read_duration(&mut self) -> Result<TgDuration, FormatError> {
         let flags = self.read_u8()?;
         let value = self.read_u8()?.max(1);
-        if flags & DURATION_NO_TUPLET != 0 {
-            let _enters = self.read_u8()?;
-            let _times = self.read_u8()?;
-        }
+        // The flag is set when the duration is divided in an unusual way:
+        // `enters` notes in the time of `times`.
+        let (enters, times) = if flags & DURATION_NO_TUPLET != 0 {
+            (self.read_u8()?.max(1), self.read_u8()?.max(1))
+        } else {
+            (1, 1)
+        };
         let dots = if flags & DURATION_DOUBLE_DOTTED != 0 {
             2
         } else {
@@ -615,7 +671,10 @@ impl<'a> TgReader<'a> {
         };
         let ticks = dotted_ticks(value as u32, dots)
             .unwrap_or_else(|| TICKS_PER_QUARTER * 4 / value as Tick);
-        Ok(TgDuration { value, ticks })
+        Ok(TgDuration {
+            value,
+            ticks: scaled(ticks, Tick::from(times), Tick::from(enters)),
+        })
     }
 
     fn read_u8(&mut self) -> Result<u8, FormatError> {
@@ -678,7 +737,7 @@ impl TgWriter {
         self.bytes
     }
 
-    fn write_measure(&mut self, bar: &ExportBar, bar_start: Tick, first: bool) {
+    fn write_measure(&mut self, exported: &score::ExportTrack, bar: &ExportBar, bar_start: Tick, first: bool) {
         let mut measure_flags = 0;
         if first {
             measure_flags |= MEASURE_CLEF | MEASURE_KEYSIGNATURE;
@@ -693,6 +752,10 @@ impl TgWriter {
                 0
             };
             beat_flags |= BEAT_HAS_VOICE | BEAT_HAS_VOICE_CHANGES;
+            let texts = exported.texts_in(beat);
+            if !texts.is_empty() {
+                beat_flags |= BEAT_HAS_TEXT;
+            }
             let mut voice_flags = if beat.notes.is_empty() {
                 0
             } else {
@@ -725,6 +788,9 @@ impl TgWriter {
                 if note_flags & NOTE_EFFECT != 0 {
                     self.write_note_effects(&note.effects);
                 }
+            }
+            if !texts.is_empty() {
+                let _ = self.write_ubyte_string(&texts.join(" "));
             }
             voice.start += beat.duration;
         }
@@ -888,6 +954,21 @@ mod tests {
     use crate::core::StringedVariant;
 
     #[test]
+    fn the_header_is_the_text_tuxguitar_detects_the_format_by() {
+        // TuxGuitar 1.6.6 reads a length byte and then UTF-16 chars and
+        // compares them with "TuxGuitar File Format - 1.5" exactly; any
+        // other text and it moves on to its other readers, ending in a zip
+        // error.
+        let bytes = write_tg(&score::aligned_demo()).unwrap();
+        let length = bytes[0] as usize;
+        let units: Vec<u16> = bytes[1..1 + length * 2]
+            .chunks(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), "TuxGuitar File Format - 1.5");
+    }
+
+    #[test]
     fn tg_subset_round_trips_betterwriter_project() {
         let project = score::aligned_demo();
         let bytes = write_tg(&project).unwrap();
@@ -966,6 +1047,31 @@ mod tests {
             .map(|note| note.duration_ticks)
             .collect();
         assert_eq!(read, lengths);
+    }
+
+    #[test]
+    fn a_tuplet_duration_is_scaled_to_the_time_it_takes() {
+        // An eighth of a triplet: 3 in the time of 2.
+        let bytes = [DURATION_NO_TUPLET, 8, 3, 2];
+        let duration = TgReader::new(&bytes).read_duration().unwrap();
+        assert_eq!(duration.ticks, 320);
+        let plain = TgReader::new(&[0, 8]).read_duration().unwrap();
+        assert_eq!(plain.ticks, 480);
+    }
+
+    #[test]
+    fn the_tuning_comes_back_as_written_with_no_offset() {
+        let project = score::aligned_demo();
+        let back = read_tg(&write_tg(&project).unwrap()).unwrap();
+        for (a, b) in project.tracks.iter().zip(&back.tracks) {
+            assert_eq!(a.tuning, b.tuning);
+        }
+    }
+
+    #[test]
+    fn our_own_files_import_with_nothing_reported() {
+        let import = import_tg(&write_tg(&score::aligned_demo()).unwrap()).unwrap();
+        assert!(import.report.is_empty());
     }
 
     #[test]

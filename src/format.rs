@@ -4,7 +4,12 @@ use thiserror::Error;
 
 use crate::core::BwxProject;
 
+mod extras;
 pub mod guitarpro;
+pub mod import;
+mod import_gp;
+mod import_midi;
+mod import_musescore;
 pub mod midi;
 pub mod musescore;
 pub mod score;
@@ -43,17 +48,24 @@ pub fn save_bwx(path: impl AsRef<Path>, project: &BwxProject) -> Result<(), Form
     Ok(())
 }
 
-pub fn load_project(path: impl AsRef<Path>) -> Result<BwxProject, FormatError> {
+/// Opens a project of any format the program reads, with the list of what
+/// the file held that the project has no place for yet.
+pub fn open_project(path: impl AsRef<Path>) -> Result<import::Import, FormatError> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
+    let own = |project| import::Import {
+        project,
+        report: Vec::new(),
+    };
     match extension(path).as_deref() {
-        Some("bwx") => decode_bwx(&bytes),
-        // `.tg` normalizes its own `bar_count` internally (see
-        // `tuxguitar::read_tg`) since it's deriving project state from a
-        // foreign format, not round-tripping our own.
-        Some("tg") => tuxguitar::read_tg(&bytes),
+        Some("bwx") => decode_bwx(&bytes).map(own),
+        Some("tg") => tuxguitar::import_tg(&bytes),
+        Some("gp") => import_gp::import_gp(&bytes),
+        Some("mid" | "midi") => import_midi::import_midi(&bytes),
+        Some("mscz") => import_musescore::import_mscz(&bytes),
+        Some("mscx") => import_musescore::import_mscx(&bytes),
         Some(other) => Err(FormatError::UnsupportedFormat(format!(
-            ".{other} loading is not implemented yet"
+            ".{other} loading is not implemented"
         ))),
         None => Err(FormatError::UnsupportedFormat(
             "file has no extension".to_owned(),
@@ -65,7 +77,7 @@ pub fn save_project(path: impl AsRef<Path>, project: &BwxProject) -> Result<(), 
     let path = path.as_ref();
     match extension(path).as_deref() {
         Some("bwx") => save_bwx(path, project),
-        Some("tg") => export_project(path, project),
+        Some("tg" | "gp" | "mscz" | "mscx") => export_project(path, project),
         Some(other) => Err(FormatError::UnsupportedFormat(format!(
             ".{other} saving is not implemented yet"
         ))),
@@ -107,6 +119,46 @@ fn extension(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_exported_format_opens_again_by_its_extension() {
+        let dir = std::env::temp_dir().join(format!("bw_import_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = score::aligned_demo();
+        for name in ["a.tg", "a.gp", "a.mid", "a.mscz", "a.mscx"] {
+            let path = dir.join(name);
+            export_project(&path, &project).unwrap();
+            let import = open_project(&path).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(import.project.tracks.len(), project.tracks.len(), "{name}");
+            assert!(import.project.tracks[0].notes.len() > 1, "{name}");
+        }
+        std::fs::write(dir.join("a.xyz"), b"x").unwrap();
+        assert!(open_project(dir.join("a.xyz")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn texts_above_the_score_survive_the_notation_formats() {
+        let dir = std::env::temp_dir().join(format!("bw_texts_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = score::aligned_demo();
+        let starts: Vec<_> = project.tracks[0].notes.iter().map(|note| note.abs_tick).collect();
+        project.tracks[0].set_annotation(starts[0], "Intro & <riff>");
+        project.tracks[0].set_annotation(starts[2], "let ring");
+        let expected: Vec<_> = project.tracks[0].annotations.clone();
+        for name in ["t.tg", "t.gp", "t.mscz", "t.mscx"] {
+            let path = dir.join(name);
+            export_project(&path, &project).unwrap();
+            let import = open_project(&path).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(import.project.tracks[0].annotations, expected, "{name}");
+            assert!(
+                !import.report.iter().any(|line| line.contains("text")),
+                "{name}: {:?}",
+                import.report
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn export_picks_the_format_from_the_extension() {

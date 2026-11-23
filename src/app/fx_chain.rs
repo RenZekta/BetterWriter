@@ -16,7 +16,7 @@
 //! editor, laid over the window as a native child window, or as a generic
 //! list of parameters; a plug-in can also open in a window of its own.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::*;
@@ -126,6 +126,9 @@ pub(super) struct FxChainState {
     /// one used longest ago.
     embed_use: HashMap<(FxTarget, u64), u64>,
     use_clock: u64,
+    /// Each plug-in's parameter list and when it was read: asking the
+    /// plug-in for all of them (hundreds, one call each) every frame is slow.
+    parameters: HashMap<u64, (std::time::Instant, Arc<Vec<crate::plugins::vst3::ParameterDesc>>)>,
 }
 
 /// What the chain list asked for during a frame.
@@ -327,6 +330,39 @@ impl BetterWriterApp {
         });
     }
 
+    /// Closes the editors of plug-ins no chain holds any more (an undo or a
+    /// redo took them out) and forgets what was kept for them, so a slot
+    /// that comes back starts from scratch.
+    fn forget_vanished_slots(&mut self) {
+        let present: HashSet<(FxTarget, u64)> = self
+            .fx
+            .editors
+            .keys()
+            .chain(self.fx.fitted.keys())
+            .chain(self.fx.embed_use.keys())
+            .copied()
+            .filter(|(target, id)| {
+                self.fx_chain(*target).is_some_and(|chain| chain.iter().any(|slot| slot.id == *id))
+            })
+            .collect();
+        self.fx.editors.retain(|key, _| present.contains(key));
+        self.fx.fitted.retain(|key, _| present.contains(key));
+        self.fx.embed_use.retain(|key, _| present.contains(key));
+        let wanted: HashSet<u64> = self.fx.windows.iter().filter_map(|window| window.selected).collect();
+        self.fx.parameters.retain(|id, _| wanted.contains(id));
+        let ids: HashSet<u64> = present.iter().map(|(_, id)| *id).collect();
+        let chains: Vec<Vec<u64>> = self
+            .fx
+            .windows
+            .iter()
+            .filter_map(|window| self.fx_chain(window.target))
+            .map(|chain| chain.iter().map(|slot| slot.id).collect())
+            .collect();
+        self.fx
+            .editor_notes
+            .retain(|id, _| ids.contains(id) || chains.iter().any(|chain| chain.contains(id)));
+    }
+
     fn close_fx_window(&mut self, target: FxTarget) {
         self.fx.windows.retain(|window| window.target != target);
         self.fx.editors.retain(|(shown, _), _| *shown != target);
@@ -462,7 +498,7 @@ impl BetterWriterApp {
     /// finished editor instead of a blank area. A VST3 editor can only be
     /// made on the thread that owns the window, so this is spread over
     /// frames instead of moved to another thread.
-    fn preload_fx_editors(&mut self) {
+    fn preload_fx_editors(&mut self, ctx: &egui::Context) {
         if self.playback_tick.is_some() {
             return;
         }
@@ -491,6 +527,7 @@ impl BetterWriterApp {
             });
             if let Some(id) = next {
                 self.create_fx_embedded(target, id);
+                ctx.request_repaint();
                 return;
             }
         }
@@ -713,6 +750,7 @@ impl BetterWriterApp {
         for target in gone {
             self.close_fx_window(target);
         }
+        self.forget_vanished_slots();
         for editor in self.fx.editors.values_mut() {
             editor.update();
         }
@@ -721,7 +759,7 @@ impl BetterWriterApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        self.preload_fx_editors();
+        self.preload_fx_editors(ctx);
         let targets: Vec<FxTarget> = self.fx.windows.iter().map(|window| window.target).collect();
         for target in targets {
             self.show_fx_window(ctx, target);
@@ -818,11 +856,30 @@ impl BetterWriterApp {
         }
     }
 
-    /// Draws a chain's window: a window of the operating system, which can
+    /// Declares a chain's window: a window of the operating system, which can
     /// go anywhere on the desktop (over the program's window, and past it),
-    /// or, where the platform has no such windows, an egui window.
+    /// or, where the platform has no such windows, an egui window. It draws
+    /// itself, see `fx_window_ui`.
     fn show_fx_window(&mut self, ctx: &egui::Context, target: FxTarget) {
-        let Some(chain) = self.fx_chain(target).cloned() else {
+        if self.fx_chain(target).is_none() || !self.fx.windows.iter().any(|window| window.target == target) {
+            return;
+        }
+        let title = self.fx_window_title(target);
+        self.floating_window(
+            ctx,
+            super::floating::WindowSpec::new(("fx_chain_viewport", target), &title, FX_DEFAULT_SIZE, FX_MIN_SIZE),
+            move |app, ui| app.fx_window_ui(ui, target),
+            move |app, _| app.close_fx_window(target),
+        );
+    }
+
+    /// Draws a chain's window in its own frame. Owned by the program's
+    /// window, it stays above it, like a plug-in window in a DAW.
+    fn fx_window_ui(&mut self, ui: &mut egui::Ui, target: FxTarget) {
+        let Some(chain) = self
+            .fx_chain(target)
+            .map(|chain| chain.iter().map(SoundChainSlot::without_state).collect::<Vec<_>>())
+        else {
             return;
         };
         let Some(index) = self.fx.windows.iter().position(|window| window.target == target) else {
@@ -851,61 +908,30 @@ impl BetterWriterApp {
             muted: self.theme.muted_foreground,
             accent: self.theme.accent,
         };
-        let title = self.fx_window_title(target);
-        let viewport_id = egui::ViewportId::from_hash_of(("fx_chain_viewport", target));
-        let builder = egui::ViewportBuilder::default()
-            .with_title(title.clone())
-            .with_inner_size(FX_DEFAULT_SIZE)
-            .with_min_inner_size(FX_MIN_SIZE);
+        let native = !ui.ctx().embed_viewports();
+        let hwnd = self.native_windows.get(&ui.ctx().viewport_id()).copied().unwrap_or(0);
         let mut out = FxBodyOut::default();
-        let mut close = false;
-        let mut native = false;
-        let mut hwnd = self.fx.windows[index].hwnd;
         self.fx.embeds.remove(&target);
 
-        ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
-            native = class != egui::ViewportClass::EmbeddedWindow;
-            if native {
-                if hwnd == 0 {
-                    hwnd = native_window::find_window(&title);
-                    if hwnd != 0 {
-                        // Owned by the program's window, the chain's window
-                        // stays above it, like a plug-in window in a DAW.
-                        native_window::set_owner(hwnd, self.main_window);
-                    }
-                }
-                if ui.input(|state| state.viewport().close_requested()) {
-                    close = true;
-                }
-            } else if ui.input(|state| state.viewport().close_requested()) {
-                close = true;
-            }
-            egui::CentralPanel::default().show_inside(ui, |ui| {
-                self.show_fx_body(ui, target, &input, &mut out);
+        self.show_fx_body(ui, target, &input, &mut out);
+        // Delete and Backspace remove the picked plug-ins, Ctrl+A picks them
+        // all, while this window has the keyboard.
+        if !ui.ctx().text_edit_focused() && self.fx.renaming.is_none() {
+            let (remove, all) = ui.input_mut(|state| {
+                let delete = state.consume_key(egui::Modifiers::NONE, egui::Key::Delete);
+                let backspace = state.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
+                let all = state.consume_key(egui::Modifiers::COMMAND, egui::Key::A);
+                (delete || backspace, all)
             });
-            // Delete and Backspace remove the picked plug-ins, Ctrl+A picks
-            // them all, while this window has the keyboard.
-            if !ui.ctx().text_edit_focused() && self.fx.renaming.is_none() {
-                let (remove, all) = ui.input_mut(|state| {
-                    let delete = state.consume_key(egui::Modifiers::NONE, egui::Key::Delete);
-                    let backspace = state.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
-                    let all = state.consume_key(egui::Modifiers::COMMAND, egui::Key::A);
-                    (delete || backspace, all)
-                });
-                if remove && !selected_ids.is_empty() {
-                    out.action = Some(ChainAction::Remove(selected_ids.to_vec()));
-                } else if all {
-                    out.action = Some(ChainAction::SelectAll);
-                }
+            if remove && !selected_ids.is_empty() {
+                out.action = Some(ChainAction::Remove(selected_ids.to_vec()));
+            } else if all {
+                out.action = Some(ChainAction::SelectAll);
             }
-            let parent = if native { hwnd } else { self.main_window };
-            self.place_embedded_editors(ui.ctx(), target, parent, native);
-        });
-
-        if close {
-            self.close_fx_window(target);
-            return;
         }
+        let parent = if native { hwnd } else { self.main_window };
+        self.place_embedded_editors(ui.ctx(), target, parent, native);
+
         if let Some(window) = self.fx.windows.iter_mut().find(|window| window.target == target) {
             window.native = Some(native);
             window.hwnd = hwnd;
@@ -1400,11 +1426,22 @@ impl BetterWriterApp {
             ui.weak("This plug-in has no parameters to show.");
             return;
         };
-        let params = handle.parameters();
+        const KEEP: std::time::Duration = std::time::Duration::from_secs(2);
+        let params = match self.fx.parameters.get(&slot_id) {
+            Some((read, list)) if read.elapsed() < KEEP => list.clone(),
+            _ => {
+                let list = Arc::new(handle.parameters());
+                self.fx.parameters.insert(slot_id, (std::time::Instant::now(), list.clone()));
+                list
+            }
+        };
         if params.is_empty() {
             ui.weak("This plug-in has no parameters to show.");
             return;
         }
+        // (parameter, value, a reset): applied after the list is drawn, so
+        // the undo step can open before the first change.
+        let mut changes: Vec<(u32, f64, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt(("fx_params", slot_id))
             .auto_shrink([false, false])
@@ -1422,17 +1459,49 @@ impl BetterWriterApp {
                             .custom_formatter(|_, _| String::new());
                         let response = ui.add_enabled(!param.read_only, slider);
                         ui.label(format!("{text} {}", param.units));
-                        if !param.read_only && (response.double_clicked() || name.double_clicked()) {
-                            handle.set(param.id, param.default);
+                        // A slider only senses drags, so its double click is
+                        // read from the pointer.
+                        let double_on_slider = response.contains_pointer()
+                            && ui.input(|input| input.pointer.button_double_clicked(egui::PointerButton::Primary));
+                        if !param.read_only && (double_on_slider || name.double_clicked()) {
+                            changes.push((param.id, param.default, true));
                         } else if response.changed() {
-                            handle.set(param.id, value as f64);
+                            changes.push((param.id, f64::from(value), false));
                         }
                     });
                 }
             });
+        for (id, value, reset) in changes {
+            self.begin_param_edit(ui.ctx().viewport_id());
+            handle.set(id, value);
+            // A reset is a click, not a drag: it ends its own step.
+            if reset {
+                self.end_param_edit();
+            }
+        }
+        self.finish_param_edit_when_released(ui.ctx());
     }
 
+    /// Declares the Add FX browser.
     fn show_fx_browser(&mut self, ctx: &egui::Context) {
+        let Some(browser) = &self.fx.browser else {
+            return;
+        };
+        let name = self.fx_target_name(browser.target);
+        let title = if browser.replace.is_some() {
+            format!("Replace FX - {name}")
+        } else {
+            format!("Add FX to {name}")
+        };
+        self.floating_window(
+            ctx,
+            super::floating::WindowSpec::new("fx_browser_window", &title, Vec2::new(460.0, 480.0), Vec2::new(320.0, 240.0)),
+            |app, ui| app.fx_browser_ui(ui),
+            |app, _| app.fx.browser = None,
+        );
+    }
+
+    fn fx_browser_ui(&mut self, ui: &mut egui::Ui) {
         let Some(browser) = &self.fx.browser else {
             return;
         };
@@ -1440,109 +1509,95 @@ impl BetterWriterApp {
         let replace = browser.replace;
         let mut filter = browser.filter.clone();
         let mut picked = browser.picked.clone();
-        let mut open = true;
         let mut commit: Option<ScannedPlugin> = None;
         let mut cancel = false;
         let mut rescan = false;
         let allow_instruments = target != FxTarget::Master;
-        let name = self.fx_target_name(target);
         let accent = self.theme.accent;
 
-        let title = if replace.is_some() {
-            format!("Replace FX - {name}")
-        } else {
-            format!("Add FX to {name}")
-        };
-        super::floating::floating_window(
-            ctx,
-            "fx_browser_window",
-            &title,
-            Vec2::new(460.0, 480.0),
-            Vec2::new(320.0, 240.0),
-            self.main_window,
-            &mut open,
-            |ui| {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut filter)
-                        .hint_text("Search plug-ins or developers")
-                        .desired_width(240.0),
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut filter)
+                    .hint_text("Search plug-ins or developers")
+                    .desired_width(240.0),
+            );
+            let scanning = self.plugin_scanner.is_scanning();
+            if scanning {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            if ui
+                .add_enabled(!scanning, egui::Button::new("Rescan"))
+                .on_hover_text("Look for installed plug-ins again")
+                .clicked()
+            {
+                rescan = true;
+            }
+            ui.weak(if scanning {
+                format!("Scanning... {} found", self.plugin_scanner.plugins().len())
+            } else {
+                format!("{} found", self.plugin_scanner.plugins().len())
+            });
+        });
+        ui.separator();
+        let footer = ui.spacing().interact_size.y + 12.0;
+        let list_height = (ui.available_height() - footer).max(60.0);
+        egui::ScrollArea::vertical()
+            .max_height(list_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let folders = group_by_developer(
+                    self.plugin_scanner.plugins().iter(),
+                    &filter,
+                    allow_instruments,
                 );
-                let scanning = self.plugin_scanner.is_scanning();
-                if ui
-                    .add_enabled(!scanning, egui::Button::new("Rescan"))
-                    .on_hover_text("Look for installed plug-ins again")
-                    .clicked()
-                {
-                    rescan = true;
+                if folders.is_empty() {
+                    ui.weak(if self.plugin_scanner.is_scanning() {
+                        "Scanning..."
+                    } else {
+                        "No plug-ins match."
+                    });
                 }
-                ui.weak(if scanning {
-                    format!("Scanning... {} found", self.plugin_scanner.plugins().len())
-                } else {
-                    format!("{} found", self.plugin_scanner.plugins().len())
-                });
-            });
-            ui.separator();
-            let footer = ui.spacing().interact_size.y + 12.0;
-            let list_height = (ui.available_height() - footer).max(60.0);
-            egui::ScrollArea::vertical()
-                .max_height(list_height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let folders = group_by_developer(
-                        self.plugin_scanner.plugins().iter(),
-                        &filter,
-                        allow_instruments,
-                    );
-                    if folders.is_empty() {
-                        ui.weak(if self.plugin_scanner.is_scanning() {
-                            "Scanning..."
-                        } else {
-                            "No plug-ins match."
-                        });
-                    }
-                    let searching = !filter.trim().is_empty();
-                    for (developer, plugins) in &folders {
-                        egui::CollapsingHeader::new(format!("{developer}  ({})", plugins.len()))
-                            .id_salt(("fx_folder", developer))
-                            .open(searching.then_some(true))
-                            .show(ui, |ui| {
-                                for plugin in plugins {
-                                    let key = (plugin.path.display().to_string(), plugin.class_id.clone());
-                                    let is_picked = picked.as_ref() == Some(&key);
-                                    let response = ui
-                                        .selectable_label(is_picked, plugin.list_label())
-                                        .on_hover_text(plugin.path.display().to_string());
-                                    if response.clicked() {
-                                        picked = Some(key);
-                                    }
-                                    if response.double_clicked() {
-                                        commit = Some((*plugin).clone());
-                                    }
+                let searching = !filter.trim().is_empty();
+                for (developer, plugins) in &folders {
+                    egui::CollapsingHeader::new(format!("{developer}  ({})", plugins.len()))
+                        .id_salt(("fx_folder", developer))
+                        .open(searching.then_some(true))
+                        .show(ui, |ui| {
+                            for plugin in plugins {
+                                let key = (plugin.path.display().to_string(), plugin.class_id.clone());
+                                let is_picked = picked.as_ref() == Some(&key);
+                                let response = ui
+                                    .selectable_label(is_picked, plugin.list_label())
+                                    .on_hover_text(plugin.path.display().to_string());
+                                if response.clicked() {
+                                    picked = Some(key);
                                 }
-                            });
-                    }
-                });
-            ui.separator();
-            ui.horizontal(|ui| {
-                let chosen = picked.as_ref().and_then(|(path, class)| {
-                    self.plugin_scanner
-                        .plugins()
-                        .iter()
-                        .find(|plugin| plugin.path.display().to_string() == *path && plugin.class_id == *class)
-                });
-                let label = if replace.is_some() { "Replace" } else { "Add" };
-                let button = egui::Button::new(
-                    egui::RichText::new(label).color(crate::theme::contrast_text(accent)),
-                )
-                .fill(accent);
-                if ui.add_enabled(chosen.is_some(), button).clicked() {
-                    commit = chosen.cloned();
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
+                                if response.double_clicked() {
+                                    commit = Some((*plugin).clone());
+                                }
+                            }
+                        });
                 }
             });
+        ui.separator();
+        ui.horizontal(|ui| {
+            let chosen = picked.as_ref().and_then(|(path, class)| {
+                self.plugin_scanner
+                    .plugins()
+                    .iter()
+                    .find(|plugin| plugin.path.display().to_string() == *path && plugin.class_id == *class)
+            });
+            let label = if replace.is_some() { "Replace" } else { "Add" };
+            let button = egui::Button::new(
+                egui::RichText::new(label).color(crate::theme::contrast_text(accent)),
+            )
+            .fill(accent);
+            if ui.add_enabled(chosen.is_some(), button).clicked() {
+                commit = chosen.cloned();
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
         });
 
         if rescan {
@@ -1551,7 +1606,7 @@ impl BetterWriterApp {
         if let Some(plugin) = commit {
             self.fx.browser = None;
             self.add_fx(target, &plugin, replace);
-        } else if cancel || !open {
+        } else if cancel {
             self.fx.browser = None;
         } else if let Some(browser) = &mut self.fx.browser {
             browser.filter = filter;
