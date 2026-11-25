@@ -1285,6 +1285,10 @@ right-click submenus and the move / stretch drag previews.
       macOS loading; plug-in latency compensation, tempo/transport info for
       plug-ins, MIDI controllers other than notes, multi-output instruments,
       instruments in the global chain.
+- [ ] **Not tested here**: any real-world plug-in (only the `vst3` crate's
+      gain example and a small instrument built from it), the Windows editor
+      window and the Windows loader (no Windows here; the Windows-only code
+      is type-checked, not run), audio on a device.
 - [x] Tests: `cargo test` 229 passed with the two test plug-ins built from the
       vst3 crate (`BW_TEST_GAIN_VST3`, `BW_TEST_SYNTH_VST3`, `BW_TEST_VST3`
       name the bundles; without them those tests pass quietly), 2 ignored (the
@@ -1422,6 +1426,9 @@ right-click submenus and the move / stretch drag previews.
       18.11.2026 (and its tests) is removed. Delete, Backspace and Ctrl+A in
       the FX Chain list and Delete in the Automation Editor are read from the
       window that has the keyboard.
+- [ ] **Not tested here (Windows only)**: finding the window by title,
+      the owner relation, and plug-in editors as children of the FX Chain's
+      own window instead of the program's.
 
 ### 3. Plug-in editors freezing during playback
 - [x] Probable cause: playback asked for a repaint after every frame, so the
@@ -1802,7 +1809,8 @@ right-click submenus and the move / stretch drag previews.
       the bytecode of the TuxGuitar 1.6.6 jar; the file was not opened in
       TuxGuitar itself.
 - [ ] Open the exported files in TuxGuitar, Guitar Pro and MuseScore and
-      fix what they reject (still open, see File formats below).
+      fix what they reject (still open, see File formats below; TuxGuitar was
+      done on 23.11.2026, item 1).
 
 ### 5. Ghost track: see-through notes
 - [x] Ghost tracks now show their notes faintly, see section 7 of the
@@ -1878,6 +1886,9 @@ right-click submenus and the move / stretch drag previews.
       it, stretched across a part boundary or past its end, or as long as
       the whole span), and when no tuplet note is left in it; empty parts
       stay as rests. Importers and exporters will read and write the spans.
+      Changed 23.11.2026 (item 3): a note that runs into the span from
+      outside and ends on a part boundary no longer removes it; formats are
+      done (item 2).
 
 ### 8. Fixes after trying the importers and plug-in parameters
 - [x] A change of sound (instrument, picked sound, "Choose automatically")
@@ -2024,9 +2035,8 @@ right-click submenus and the move / stretch drag previews.
       - notation, rests, ties, stretching and move snapping know the spans.
       Checked in a running app (virtual display): cursor split into 3, typed
       a fret, three notes and a "3" bracket appeared, notation shows
-      triplet eighths. Not done: the file formats do not write or read
-      tuplets yet (exporters still snap every note to a 64th, so a triplet
-      comes out slightly off the beat), and there is no "remove tuplet"
+      triplet eighths. Not done: the file formats did not write or read
+      tuplets yet (done 23.11.2026, item 2), and there is no "remove tuplet"
       command beyond overwriting its notes with ordinary ones.
 - [ ] Bends and tremolo bar: not started (see 21.11.2026 section 9).
 
@@ -2073,7 +2083,7 @@ right-click submenus and the move / stretch drag previews.
       counting is per wheel event (a notch is one line).
 
 ### 3. Speed on long scores
-- [x] Looked at with the real song and a synthetic score
+- [x] Looked at with the real song "Roaming Sand Dunes" and a synthetic score
       of 6 tracks x 6400 notes x 300 bars (run on a virtual display with
       software drawing, so frame times are only comparable with each other).
       Found and fixed:
@@ -2149,6 +2159,113 @@ right-click submenus and the move / stretch drag previews.
 
 ### 5. Build and tests
 - [x] `cargo test`: 434 passed, 3 ignored.
+
+## 23.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. TuxGuitar failed on the exported .tg ("Index -1 out of bounds for length 4")
+- [x] Reproduced with the real TuxGuitar 1.6.6 (Linux build, run on a virtual
+      display) opening the `.tg` written from the reporter's project. The
+      stack trace ended in `TGNotation.computePosition`, which indexes a table
+      of four clefs with `clef - 1`. TuxGuitar numbers its clefs 1 (treble)
+      to 4 (alto), and the writer stored the clef of the first measure as 0.
+      TuxGuitar's reader accepts the 0 and only fails when it draws the first
+      measure, so loading seemed to work and then the dialog came up.
+- [x] The writer now writes clef 1 (treble) and key signature 0 (C major)
+      (`CLEF_TREBLE`, `KEY_C_MAJOR`). The reader refuses a clef outside 1 to
+      4, as TuxGuitar could not draw such a file either; five of the existing
+      `.tg` tests fail with the old value. The exported file now opens in
+      TuxGuitar 1.6.6 without a message, with both tracks, the notes, and the
+      repeat signs; read back with TuxGuitar's own reader, every measure has
+      a valid clef. This is the first time an export was opened in TuxGuitar
+      (21.11.2026, item 4, only checked the header text).
+- [x] Guitar Pro and MuseScore open the exports without complaint
+      (checked by the reporter).
+
+### 2. Tuplets in the file formats
+- [x] Every writer (`.tg`, `.gp`, `.mscz`/`.mscx`) now writes tuplets, and
+      every reader (`.tg`, `.gp`, `.mscz`/`.mscx`) makes the spans again.
+      Before, notes were snapped to the 64th grid, so a triplet came out a
+      little early or late (22.11.2026, item 2).
+      - `score.rs`: a beat inside a tuplet keeps its exact place (`start`,
+        `duration`) and also has `written` (the note value, what its length
+        would be outside the tuplet) and `tuplet` (`enters`, `times`, the
+        part's note value, and whether it opens or closes the group). Parts
+        that hold no note are rests written in the tuplet's values; a stretch
+        that is no note value (five parts of six) is cut into tied pieces.
+        Tuplets whose parts are dotted are left as plain notes: formats
+        count a tuplet in plain values.
+      - `.tg`: the duration carries the tuplet (the file's "not divided the
+        usual way" flag, then enters and times). `.gp`: a `PrimaryTuplet`
+        in the rhythm, shared like any rhythm. MuseScore: a `Tuplet` element
+        before the first chord and `endTuplet` after the last, with
+        `baseNote`.
+      - Readers: `core::tuplets::spans_from_beats` makes spans from the
+        tuplet beats of a file (a group closes when its written lengths add
+        up to `enters` parts of the largest value that divides them, so six
+        equal beats of a sextuplet are one group, a quarter and an eighth of
+        a triplet are three parts) and `InstrumentTrack::adopt_tuplets` puts
+        the notes onto the part boundaries, since a file rounds them. A
+        tuplet the project cannot hold (5 in the time of 6) is left as plain
+        notes with their real lengths.
+- [x] Notes without a span that only make sense as a tuplet are found when
+      exporting (`InstrumentTrack::loose_tuplets`): notes and rests that
+      tile 3, 5, 6, 7, ... equal parts of a note value, off the 64th grid,
+      in the smallest window and with the fewest parts that hold them. The
+      reporter's file had several (a span is dropped by an edit, see item
+      3), which used to come out snapped; they now come out as the tuplet
+      they are. The project itself is not changed by this.
+- [x] Checked with the real TuxGuitar 1.6.6: all 65 notes of the reporter's
+      project come back at their exact tick and length, with the brackets
+      3, 6, 3, 5, 3, 3 drawn. `.gp` and MuseScore: round-trip tests only (no
+      Guitar Pro or MuseScore here); check a tuplet score by eye.
+
+### 3. A note stretched into a tuplet no longer destroys it
+- [x] The span used to go as soon as any note touching it did not fit, even
+      if tuplet notes were left: stretching the note before a triplet into
+      the triplet's emptied first part dropped the whole triplet. Now a note
+      that runs into the span from outside (or out of it) and ends on a part
+      boundary leaves it (`TupletSpan::continues`): the stretch inside is a
+      tied continuation of that note, and parts with no note are rests. The
+      span still goes when no note of it is left, or when a note inside it is
+      off the parts (moved onto it, ending mid-part, as long as the span).
+- [x] The writers write such a note as two tied pieces: the plain note up to
+      the tuplet and a tied tuplet beat for the part it covers (read back
+      from the three formats in tests, and by TuxGuitar 1.6.6).
+- [ ] The editor does not show the tied part inside the tuplet as a note of
+      its own (the long note is one brick; the tie arc and the bracket are
+      drawn). Not done: a remove-tuplet command, and finding loose tuplets
+      when a project is opened (so the editor shows their brackets).
+
+## 25.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. A note stretched into a tuplet was written as the wrong sum
+- [x] The tied part of such a note inside the triplet was written as a
+      dotted value plus a short one (a 16th and a 64th, tied, in a test of
+      the old code): 320 ticks, one eighth of a triplet, is no plain length.
+      Two causes in the notation model. `note_slices` (`core/ties.rs`) cut a
+      note only at barlines, so the stretch inside the tuplet was cut as a
+      plain note; it now also cuts where a tuplet starts or ends inside the
+      note, and the part inside is written in the tuplet's values like any
+      note of it. `written_value` (`notation.rs`) asked whether a piece lies
+      in a tuplet from where its note starts instead of where the piece
+      starts. The part is now one eighth with a tie from the quarter before
+      it. The tab view takes its pieces from the same function.
+
+### 2. Two playback lines after pausing and playing from elsewhere
+- [x] `AudioRuntime::send_play` raised the playing flag at once, but the
+      song position kept the value of the last playback until the audio
+      thread took the command a few milliseconds later; the playback line
+      showed at the old place for those frames, next to the new one. The
+      position is now set to the start of the new playback first.
+
+### 3. Reported on Windows after the window changes (22.11.2026, item 4)
+- [x] Usable with four plug-in windows open, the playback line stays smooth,
+      and the black flash of the notation is gone (it was a drawing-timing
+      problem). Notation scrolling and moving a window still lower the frame
+      rate.
+- [ ] To explore later: plug-in editors on a thread of their own, which
+      means the plug-in itself lives there (see 22.11.2026, item 4). It does
+      not mean a copy of the soundfont per track.
 
 ---
 
@@ -2289,22 +2406,26 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Make instruments selectable to display multiple of their tabs/notations at the same time (current time of each instrument's notes is the key for synchronization here)
 
 ### Audio / playback (Phase 3)
-- [x] **Live playback playhead** rendered on the canvas synced to the audio
-      callback
+- [ ] **Live playback playhead** rendered on the canvas synced to the audio
+      callback (the engine plays, but there is no moving cursor yet).
 - [ ] Transport scrubbing: rewind / fast-forward / jump-to-start actually move
       the playhead (buttons exist but are no-ops).
-- [x] Loop regions, 
-- [ ] Metronome, count-in.
-- [x] Verify audible output on a real device: a headless test renders
+- [ ] Loop regions, metronome, count-in.
+- [ ] Verify audible output on a real device: a headless test renders
       `MS Basic.sf3` to a non-silent buffer (12.11.2026), but the `cpal`
       stream has never been heard in this sandbox (no sound card).
+- [ ] Playing from the middle does not sound notes already held at the start
+      tick (a tied continuation chosen as the start point stays silent until
+      its next attack).
 - [x] Fretboard clicks audition the note: they write through the same path as
-      the keys (21.11.2026 item 2).
+      the keys (21.11.2026 item 2). Not listened to in a running app.
 - [ ] Changing a track's sound, volume or pan does not audition: the new setup
-      is heard the next time notes play (live while playing, immediately) (??? Dev: I don't get it, is this an issue or what???).
+      is heard the next time notes play (live while playing, immediately).
 - [ ] Sounds other than the 128 General MIDI ones in bank 0 (the soundfont's
       variation banks and the 37 drum kits in bank 128) are not selectable,
       and there is no drum track type yet.
+- [ ] Track table: instrument type (which sound list a track gets) can't be
+      changed after creation, and channel assignment is not editable.
 - [x] Real **VST3 hosting**: done in 17.11.2026 item 17 (the stub is gone).
 - [ ] Hosting for VST2, CLAP, LV2 and AU, and VST3 loading on macOS.
 
@@ -2316,14 +2437,16 @@ right-click submenus and the move / stretch drag previews.
 - [ ] Export of a chosen set of tracks (the dialog exports all of them).
 
 ### UI / UX
-- [x] **Custom theme palette editor**
-- [x] Score scrollbar widget
+- [ ] **Custom theme palette editor** (`EditorTheme` exists but is not
+      user-editable at runtime).
+- [ ] Score scrollbar widget (`Shift`+wheel is the only way to scroll) and a
+      paged layout.
 - [ ] Zoom holds only the row under the pointer in place; its horizontal
       position shifts because rows reflow to the page width.
 - [ ] Edition palette commands still drawn disabled: key signature, clef,
-      triplet feel, repeats, tuplet (done), fermata,
+      triplet feel, repeats, tuplet, fermata,
       crescendo / decrescendo, bend, harmonic, trill, grace note, tremolo
-      bar, text (done), chord diagram. No voice 1/2 or select/draw modes.
+      bar, text, chord diagram. No voice 1/2 or select/draw modes.
 - [ ] Note effect glyphs rendered on the staff (palm-mute text exists; others
       are modeled but not drawn).
 - [ ] Drag-to-move notes; drag-select range.
@@ -2338,7 +2461,7 @@ right-click submenus and the move / stretch drag previews.
       selection changes (e.g. three quarter rests become six eighth rests),
       unlike TuxGuitar where each rest beat keeps its own length.
 - [ ] Tab view has no overlapping notes (a second voice): a note is always
-      cut at the next beat that has notes (intentional, for that multi-track exists).
+      cut at the next beat that has notes.
 - [ ] A single bar wider than the page isn't scrolled or clipped in tab view.
 - [ ] Moving and stretching notes in tab view (disabled for now, see
       10.11.2026).

@@ -296,7 +296,7 @@ pub fn score_bar(
         // a tuplet is written as the plain value its parts stand for.
         let value = group
             .iter()
-            .map(|onset| written_value(track, onset.note.abs_tick, onset.length, scale))
+            .map(|onset| written_value(track, onset.start, onset.length, scale))
             .max_by_key(|value| (value.value, value.dots))
             .unwrap_or(NoteValue { value: 4, dots: 0 });
 
@@ -705,6 +705,31 @@ mod tests {
             .find(|chord| chord.heads[0].note_id == 2)
             .unwrap();
         assert_eq!(tied.heads[0].tie_from, Some((1, q)));
+    }
+
+    #[test]
+    fn a_note_running_into_a_tuplet_is_one_tied_value_of_the_tuplet() {
+        // The note before a triplet stretched over the triplet's first part:
+        // a quarter, then one eighth of the triplet, not a dotted value and a
+        // short one that add up to a different length.
+        let q = TICKS_PER_QUARTER;
+        let mut track = guitar();
+        track.notes = vec![note(1, 5760, 1280, 5, 3), note(2, 7040, 320, 4, 4), note(3, 7360, 320, 3, 5)];
+        assert!(track.add_tuplet(crate::core::tuplets::TupletSpan { start: 6720, length: 960, parts: 3 }));
+        let score = score_bar(&track, Clef::Treble, 3840, 7680, &[], q);
+        let seen: Vec<_> = chords(&score)
+            .into_iter()
+            .map(|chord| (chord.tick, chord.value.value, chord.value.dots, chord.heads[0].tie_from))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (5760, 4, 0, None),
+                (6720, 8, 0, Some((1, 5760))),
+                (7040, 8, 0, None),
+                (7360, 8, 0, None),
+            ]
+        );
     }
 
     #[test]

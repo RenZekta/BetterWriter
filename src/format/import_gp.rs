@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
-use crate::core::{NoteEffects, TICKS_PER_QUARTER, Tick, project::TimeSignature};
+use crate::core::{NoteEffects, TICKS_PER_QUARTER, Tick, project::TimeSignature, tuplets::TupletBeat};
 
 use super::{
     FormatError,
@@ -248,11 +248,21 @@ fn import_gpif(text: &str) -> Result<Import, FormatError> {
                     let mut cursor = starts[bar_index];
                     for beat_id in ids(voice.text_of("Beats")) {
                         let Some(beat) = beat_nodes.get(beat_id) else { continue };
-                        let length = beat
+                        let rhythm = beat
                             .child("Rhythm")
                             .and_then(|rhythm| rhythm.attribute("ref"))
                             .and_then(|reference| rhythm_nodes.get(reference))
-                            .map_or(TICKS_PER_QUARTER, |rhythm| rhythm_ticks(rhythm));
+                            .map_or_else(Rhythm::quarter, |rhythm| rhythm_of(rhythm));
+                        let length = rhythm.ticks;
+                        if voice_index == 0 && rhythm.enters != rhythm.times {
+                            track.tuplet_beats.push(TupletBeat {
+                                start: cursor,
+                                ticks: length,
+                                written: rhythm.written,
+                                enters: rhythm.enters,
+                                times: rhythm.times,
+                            });
+                        }
                         if let Some(dynamic) = beat.text_of("Dynamic")
                             && let Some(&(_, value)) = DYNAMICS.iter().find(|(name, _)| *name == dynamic)
                         {
@@ -302,21 +312,40 @@ fn import_gpif(text: &str) -> Result<Import, FormatError> {
     Ok(song.into_import())
 }
 
-fn rhythm_ticks(rhythm: &Node) -> Tick {
+/// A beat's length: what it lasts, what its value and dots make without the
+/// tuplet, and the tuplet (`enters` notes in the time of `times`).
+struct Rhythm {
+    ticks: Tick,
+    written: Tick,
+    enters: u8,
+    times: u8,
+}
+
+impl Rhythm {
+    fn quarter() -> Self {
+        Self { ticks: TICKS_PER_QUARTER, written: TICKS_PER_QUARTER, enters: 1, times: 1 }
+    }
+}
+
+fn rhythm_of(rhythm: &Node) -> Rhythm {
     let dots: u8 = rhythm
         .child("AugmentationDot")
         .and_then(|dot| dot.attribute("count"))
         .and_then(|count| count.parse().ok())
         .unwrap_or(0);
-    let base = value_ticks(note_value(rhythm.text_of("NoteValue").unwrap_or("Quarter")), dots);
-    match rhythm.child("PrimaryTuplet") {
-        Some(tuplet) => {
-            let number = |name: &str| -> Tick {
-                tuplet.attribute(name).and_then(|n| n.parse().ok()).unwrap_or(1).max(1)
-            };
-            scaled(base, number("den"), number("num"))
-        }
-        None => base,
+    let written = value_ticks(note_value(rhythm.text_of("NoteValue").unwrap_or("Quarter")), dots);
+    let Some(tuplet) = rhythm.child("PrimaryTuplet") else {
+        return Rhythm { ticks: written, written, enters: 1, times: 1 };
+    };
+    let number = |name: &str| -> u8 {
+        tuplet.attribute(name).and_then(|n| n.parse().ok()).unwrap_or(1).max(1)
+    };
+    let (enters, times) = (number("num"), number("den"));
+    Rhythm {
+        ticks: scaled(written, Tick::from(times), Tick::from(enters)),
+        written,
+        enters,
+        times,
     }
 }
 
@@ -507,6 +536,25 @@ mod tests {
         assert_eq!(track.bar_mark_at(second).repeat_close, 3);
         assert!(track.solo);
         assert_eq!((track.volume, track.pan), (80, -20));
+    }
+
+    #[test]
+    fn tuplets_come_back_as_spans_with_their_exact_parts() {
+        let project = score::tuplet_demo();
+        let back = round_trip(&project);
+        assert_eq!(back.tracks[0].tuplets, project.tracks[0].tuplets);
+        assert_eq!(score::note_places(&back.tracks[0]), score::note_places(&project.tracks[0]));
+    }
+
+    #[test]
+    fn a_tuplet_a_note_was_stretched_into_comes_back_with_its_tied_part() {
+        let (project, span) = score::stretched_tuplet_demo();
+        let back = round_trip(&project);
+        assert_eq!(back.tracks[0].tuplets, [span]);
+        assert_eq!(
+            score::note_places(&back.tracks[0]),
+            [(5760, 960), (6720, 320), (7040, 320), (7360, 320)]
+        );
     }
 
     #[test]

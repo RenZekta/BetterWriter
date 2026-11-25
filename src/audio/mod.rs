@@ -716,6 +716,13 @@ impl AudioRuntime {
     }
 
     fn send_play(&mut self, pending: PendingPlay) -> Result<(), AudioError> {
+        // The position still holds where the last playback stopped until the
+        // audio thread takes the command, a few milliseconds from now: the
+        // playback line would show there for those frames, next to the new
+        // one. It starts where the song is about to.
+        self.flags
+            .position
+            .store(pending.schedule.start_seconds.to_bits(), Ordering::Relaxed);
         self.flags.playing.store(true, Ordering::Relaxed);
         self.producer
             .try_push(AudioCommand::Play {
@@ -1313,6 +1320,17 @@ mod tests {
         let _ = producer.try_push(play_command(one_note(0.0, 0.01), 0.0, 1.0, no_channels()));
         state.next_frame();
         assert!(flags.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn playback_that_starts_elsewhere_does_not_show_where_it_stopped() {
+        let mut audio = AudioRuntime::new("none.sf2");
+        // Stopped at 7 s earlier.
+        audio.flags.position.store(7.0_f64.to_bits(), Ordering::Relaxed);
+        let schedule = Schedule { events: Vec::new(), start_seconds: 2.0, end_seconds: 9.0 };
+        let _ = audio.send_play(PendingPlay { schedule });
+        // Before the audio thread has taken the command.
+        assert_eq!(audio.playback_seconds(), Some(2.0));
     }
 
     #[test]

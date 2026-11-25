@@ -318,7 +318,7 @@ fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score:
                 xml.text("tempo", format!("{:.5}", bpm / 60.0));
                 xml.close("Tempo");
             }
-            let (value, dots) = score::value_and_dots(beat.duration);
+            let (value, dots) = score::value_and_dots(beat.written);
             let here = Spot {
                 bar: bar_index,
                 offset: offset_in_bar(grid, beat.start),
@@ -338,6 +338,14 @@ fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score:
                 xml.open("StaffText");
                 xml.text("text", text);
                 xml.close("StaffText");
+            }
+            if let Some(tuplet) = beat.tuplet.filter(|tuplet| tuplet.starts) {
+                let (unit, _) = score::value_and_dots(tuplet.unit);
+                xml.open("Tuplet");
+                xml.text("normalNotes", tuplet.times);
+                xml.text("actualNotes", tuplet.enters);
+                xml.text("baseNote", duration_type(unit));
+                xml.close("Tuplet");
             }
             if beat.notes.is_empty() {
                 xml.open("Rest");
@@ -389,6 +397,9 @@ fn write_staff(xml: &mut Xml, song: &ExportSong, index: usize, exported: &score:
                     );
                 }
                 xml.close("Chord");
+            }
+            if beat.tuplet.is_some_and(|tuplet| tuplet.ends) {
+                xml.empty("endTuplet");
             }
             // A line whose run ends with this beat closes right after it.
             for (kind, (name, _, _)) in LINES.iter().enumerate() {
@@ -576,6 +587,21 @@ mod tests {
         assert!(xml.contains("<dots>1</dots>"));
         assert!(xml.contains("<durationType>quarter</durationType>"));
         assert!(xml.contains("<durationType>eighth</durationType>"));
+    }
+
+    #[test]
+    fn a_tuplet_is_wrapped_in_a_tuplet_element_with_plain_note_values() {
+        let xml = score_of(&score::tuplet_demo());
+        assert_well_formed(&xml);
+        assert_eq!(xml.matches("<Tuplet>").count(), 3);
+        assert_eq!(xml.matches("<endTuplet/>").count(), 3);
+        for (normal, actual, base) in [(2, 3, "eighth"), (4, 5, "eighth"), (4, 6, "eighth")] {
+            let tag = format!(
+                "<normalNotes>{normal}</normalNotes><actualNotes>{actual}</actualNotes><baseNote>{base}</baseNote>"
+            );
+            let flat: String = xml.split_whitespace().collect::<Vec<_>>().join("");
+            assert!(flat.contains(&tag), "{tag}");
+        }
     }
 
     #[test]

@@ -4,13 +4,14 @@ use crate::core::{
     BwxProject, NoteEffects, TICKS_PER_QUARTER, Tick,
     project::{InstrumentTrack, TabNote, TieOrigin, TimeSignature, TimeSignatureChange},
     length::{detect_length, dotted_ticks},
+    tuplets::{TupletBeat, spans_from_beats},
     sounds::{melodic_channel, midi_pan, pan_from_midi, variant_for_program},
 };
 
 use super::{
     FormatError,
     import::{Import, Report, scaled},
-    score::{self, ExportBar},
+    score::{self, ExportBar, Tuplet},
 };
 
 /// TuxGuitar compares this header text exactly; its own is "1.5", not "1.5.0".
@@ -31,6 +32,13 @@ const MEASURE_HEADER_TRIPLET_FEEL: u8 = 0x40;
 
 const MEASURE_CLEF: u8 = 0x01;
 const MEASURE_KEYSIGNATURE: u8 = 0x02;
+
+/// TuxGuitar numbers its clefs from 1 (treble) to 4 (alto) and indexes a
+/// table of four with `clef - 1`: a clef of 0 makes it fail drawing the score.
+const CLEF_TREBLE: u8 = 1;
+const CLEF_ALTO: u8 = 4;
+/// Key signature 0 is C major.
+const KEY_C_MAJOR: u8 = 0;
 
 const BEAT_HAS_NEXT: u8 = 0x01;
 const BEAT_HAS_STROKE: u8 = 0x02;
@@ -77,7 +85,13 @@ const EFFECT_LET_RING: u32 = 0x080000;
 #[derive(Clone, Copy)]
 struct TgDuration {
     value: u8,
+    /// How long it lasts, tuplet included.
     ticks: Tick,
+    /// What its value and dots make without the tuplet.
+    written: Tick,
+    /// `enters` notes in the time of `times`; 1 and 1 outside a tuplet.
+    enters: u8,
+    times: u8,
 }
 
 impl TgDuration {
@@ -85,7 +99,14 @@ impl TgDuration {
         Self {
             value: 4,
             ticks: TICKS_PER_QUARTER,
+            written: TICKS_PER_QUARTER,
+            enters: 1,
+            times: 1,
         }
+    }
+
+    fn is_tuplet(&self) -> bool {
+        self.enters != self.times
     }
 }
 
@@ -229,9 +250,10 @@ pub fn import_tg(bytes: &[u8]) -> Result<Import, FormatError> {
             .unwrap_or((100, 0));
         let mut notes = Vec::new();
         let mut texts = Vec::new();
+        let mut tuplet_beats = Vec::new();
 
         for header in &headers {
-            reader.read_measure(header, &mut notes, &mut texts, &mut next_note_id)?;
+            reader.read_measure(header, &mut notes, &mut texts, &mut tuplet_beats, &mut next_note_id)?;
         }
 
         let string_count = reader.read_u8()? as usize;
@@ -306,6 +328,7 @@ pub fn import_tg(bytes: &[u8]) -> Result<Import, FormatError> {
             annotations: Vec::new(),
         });
         if let Some(track) = tracks.last_mut() {
+            track.adopt_tuplets(&spans_from_beats(&tuplet_beats));
             for (tick, text) in &texts {
                 track.set_annotation(*tick, text);
             }
@@ -494,6 +517,7 @@ impl<'a> TgReader<'a> {
         header: &MeasureHeader,
         notes: &mut Vec<TabNote>,
         texts: &mut Vec<(Tick, String)>,
+        tuplet_beats: &mut Vec<TupletBeat>,
         next_note_id: &mut u64,
     ) -> Result<(), FormatError> {
         let flags = self.read_u8()?;
@@ -513,6 +537,15 @@ impl<'a> TgReader<'a> {
                 }
                 if voice.flags & VOICE_NEXT_DURATION != 0 {
                     voice.duration = self.read_duration()?;
+                }
+                if voice_index == 0 && voice.duration.is_tuplet() {
+                    tuplet_beats.push(TupletBeat {
+                        start: (beat_start - TG_START_OFFSET).max(0),
+                        ticks: voice.duration.ticks,
+                        written: voice.duration.written,
+                        enters: voice.duration.enters,
+                        times: voice.duration.times,
+                    });
                 }
                 if voice.flags & VOICE_HAS_NOTES != 0 {
                     let mut note_header = NOTE_HAS_NEXT;
@@ -567,7 +600,12 @@ impl<'a> TgReader<'a> {
             }
         }
         if flags & MEASURE_CLEF != 0 {
-            let _ = self.read_u8()?;
+            let clef = self.read_u8()?;
+            if !(CLEF_TREBLE..=CLEF_ALTO).contains(&clef) {
+                return Err(FormatError::UnsupportedFormat(format!(
+                    "a measure has clef {clef}; TuxGuitar knows 1 to 4"
+                )));
+            }
         }
         if flags & MEASURE_KEYSIGNATURE != 0 {
             let _ = self.read_u8()?;
@@ -674,6 +712,9 @@ impl<'a> TgReader<'a> {
         Ok(TgDuration {
             value,
             ticks: scaled(ticks, Tick::from(times), Tick::from(enters)),
+            written: ticks,
+            enters,
+            times,
         })
     }
 
@@ -761,14 +802,20 @@ impl TgWriter {
             } else {
                 VOICE_HAS_NOTES
             };
-            if beat.duration != voice.duration.ticks {
+            let (enters, times) = beat.tuplet.map_or((1, 1), |tuplet| (tuplet.enters, tuplet.times));
+            if (beat.written, enters, times) != (voice.duration.written, voice.duration.enters, voice.duration.times) {
                 voice_flags |= VOICE_NEXT_DURATION;
             }
             self.write_u8(beat_flags);
             self.write_u8(voice_flags);
             if voice_flags & VOICE_NEXT_DURATION != 0 {
-                self.write_duration(beat.duration);
-                voice.duration = duration_from_ticks(beat.duration);
+                self.write_duration(beat.written, beat.tuplet);
+                voice.duration = TgDuration {
+                    ticks: beat.duration,
+                    enters,
+                    times,
+                    ..duration_from_ticks(beat.written)
+                };
             }
             for (note_index, note) in beat.notes.iter().enumerate() {
                 let mut note_flags = NOTE_VELOCITY;
@@ -796,29 +843,40 @@ impl TgWriter {
         }
 
         if first {
-            self.write_u8(0);
-            self.write_u8(0);
+            self.write_u8(CLEF_TREBLE);
+            self.write_u8(KEY_C_MAJOR);
         }
     }
 
     fn write_time_signature(&mut self, signature: TimeSignature) {
         self.write_u8(signature.numerator);
-        self.write_duration(TICKS_PER_QUARTER * 4 / signature.denominator.max(1) as Tick);
+        self.write_duration(TICKS_PER_QUARTER * 4 / signature.denominator.max(1) as Tick, None);
     }
 
-    fn write_duration(&mut self, ticks: Tick) {
+    /// Writes a length as its note value and dots, followed by the tuplet it
+    /// is in, if any. The file counts a duration with a tuplet as one that is
+    /// not divided the usual way.
+    fn write_duration(&mut self, ticks: Tick, tuplet: Option<Tuplet>) {
         // A length that is exactly a (dotted) note value is written as that
         // value plus its dot flag; any other length as the value it reaches.
         let (value, dots) = match detect_length(ticks) {
             Some((value, dots)) if value <= 64 => (value as u8, dots),
             _ => (duration_from_ticks(ticks).value, 0),
         };
-        self.write_u8(match dots {
+        let mut flags = match dots {
             1 => DURATION_DOTTED,
             2 => DURATION_DOUBLE_DOTTED,
             _ => 0,
-        });
+        };
+        if tuplet.is_some() {
+            flags |= DURATION_NO_TUPLET;
+        }
+        self.write_u8(flags);
         self.write_u8(value);
+        if let Some(tuplet) = tuplet {
+            self.write_u8(tuplet.enters);
+            self.write_u8(tuplet.times);
+        }
     }
 
     fn write_note_effects(&mut self, effects: &NoteEffects) {
@@ -928,7 +986,13 @@ fn duration_from_ticks(ticks: Tick) -> TgDuration {
         t if t >= TICKS_PER_QUARTER / 8 => 32,
         _ => 64,
     };
-    TgDuration { value, ticks }
+    TgDuration {
+        value,
+        ticks,
+        written: ticks,
+        enters: 1,
+        times: 1,
+    }
 }
 
 fn has_effects(effects: &NoteEffects) -> bool {
@@ -1086,5 +1150,35 @@ mod tests {
         let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
         assert_eq!(decoded.tracks.len(), 11);
         assert!(decoded.tracks.iter().all(|track| track.channel != 9));
+    }
+
+    #[test]
+    fn tg_round_trip_keeps_tuplets_with_their_exact_parts() {
+        let project = score::tuplet_demo();
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        let (before, after) = (&project.tracks[0], &decoded.tracks[0]);
+        assert_eq!(before.tuplets.len(), 3);
+        assert_eq!(after.tuplets, before.tuplets);
+        assert_eq!(score::note_places(after), score::note_places(before));
+    }
+
+    #[test]
+    fn tg_writes_notes_a_dropped_span_left_as_the_tuplet_they_form() {
+        let mut project = score::tuplet_demo();
+        project.tracks[0].tuplets.clear();
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        assert_eq!(decoded.tracks[0].tuplets.len(), 3);
+        assert_eq!(score::note_places(&decoded.tracks[0]), score::note_places(&project.tracks[0]));
+    }
+
+    #[test]
+    fn tg_keeps_the_tuplet_a_note_was_stretched_into() {
+        let (project, span) = score::stretched_tuplet_demo();
+        let decoded = read_tg(&write_tg(&project).unwrap()).unwrap();
+        assert_eq!(decoded.tracks[0].tuplets, [span]);
+        assert_eq!(
+            score::note_places(&decoded.tracks[0]),
+            [(5760, 960), (6720, 320), (7040, 320), (7360, 320)]
+        );
     }
 }

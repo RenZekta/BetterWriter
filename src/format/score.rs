@@ -6,6 +6,7 @@
 use crate::core::{
     BwxProject, CompatibilityReport, NoteEffects, TICKS_PER_QUARTER, Tick,
     project::{InstrumentTrack, TempoTransition, TimeSignature},
+    tuplets::TupletSpan,
 };
 
 use super::FormatError;
@@ -55,11 +56,32 @@ pub struct ExportNote {
     pub tied: bool,
 }
 
+/// `enters` notes in the time of `times` notes of the same value: three in
+/// the time of two is a triplet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuplet {
+    pub enters: u8,
+    pub times: u8,
+    /// What one part of the tuplet is written as, the note value its
+    /// brackets count in (an eighth for eighth triplets).
+    pub unit: Tick,
+    /// Whether the beat opens the tuplet, or closes it. The notes between
+    /// them, the rests too, belong to it.
+    pub starts: bool,
+    pub ends: bool,
+}
+
 /// One beat of a track; no notes makes it a rest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportBeat {
     pub start: Tick,
+    /// How long the beat really lasts.
     pub duration: Tick,
+    /// The note value it is written as: the same as `duration` unless the
+    /// beat is part of a tuplet, where it is what the value would last
+    /// outside it (an eighth of a triplet lasts a third of a quarter).
+    pub written: Tick,
+    pub tuplet: Option<Tuplet>,
     pub notes: Vec<ExportNote>,
 }
 
@@ -222,25 +244,135 @@ fn track_bars(track: &InstrumentTrack, grid: &[GridBar]) -> Vec<ExportBar> {
     grid.iter().map(|bar| bar_beats(track, bar)).collect()
 }
 
+/// A tuplet of the track inside one bar, as a format writes it: its parts
+/// keep their exact places instead of snapping to the 64th grid.
+struct Group {
+    span: TupletSpan,
+    /// How far the span's start moved to land on the grid.
+    shift: Tick,
+    start: Tick,
+    end: Tick,
+    /// What one part is written as: the span's length over its normal notes.
+    unit: Tick,
+}
+
+impl Group {
+    fn tuplet(&self, starts: bool, ends: bool) -> Tuplet {
+        Tuplet {
+            enters: self.span.parts,
+            times: self.span.normal_notes(),
+            unit: self.unit,
+            starts,
+            ends,
+        }
+    }
+
+    /// The index of the part boundary nearest `tick`.
+    fn boundary_at(&self, tick: Tick) -> u32 {
+        (0..=u32::from(self.span.parts))
+            .min_by_key(|&index| (self.span.boundary(index) + self.shift - tick).abs())
+            .unwrap_or(0)
+    }
+
+    /// The tick `written` ticks of written value into the group fall on.
+    fn real_at(&self, written: Tick) -> Tick {
+        self.start + self.span.real_ticks(written)
+    }
+}
+
+/// The track's tuplets that fit the bar and that formats can write: every
+/// note touching one is its own, and a part is a note value.
+fn tuplet_groups(track: &InstrumentTrack, bar: &GridBar, snap: impl Fn(Tick) -> Tick) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut spans = track.tuplets.clone();
+    spans.extend(track.loose_tuplets(bar.start, bar.end));
+    spans.sort_by_key(|span| span.start);
+    for span in &spans {
+        if !span.is_tuplet() || span.start < bar.start || span.end() > bar.end {
+            continue;
+        }
+        let normal = Tick::from(span.normal_notes());
+        let unit = span.length / normal;
+        // Formats count a tuplet in a plain note value (no dots).
+        if unit * normal != span.length || !is_note_length(unit) || value_and_dots(unit).1 != 0 {
+            continue;
+        }
+        let own = track
+            .notes
+            .iter()
+            .filter(|note| note.abs_tick < span.end() && note.end_tick() > span.start)
+            .all(|note| span.holds(note) || span.continues(note));
+        let start = snap(span.start);
+        if !own || start < bar.start || start + span.length > bar.end {
+            continue;
+        }
+        if groups.last().is_some_and(|last| start < last.end) {
+            continue;
+        }
+        groups.push(Group {
+            span: *span,
+            shift: start - span.start,
+            start,
+            end: start + span.length,
+            unit,
+        });
+    }
+    groups
+}
+
 fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
     let snap = |tick: Tick| bar.start + (tick - bar.start + QUANTUM / 2).div_euclid(QUANTUM) * QUANTUM;
+    let groups = tuplet_groups(track, bar, snap);
+    // A time that snapped into a tuplet goes to the nearer end of it.
+    let keep_out = |tick: Tick| {
+        groups
+            .iter()
+            .find(|group| group.start < tick && tick < group.end)
+            .map_or(tick, |group| {
+                if tick - group.start < group.end - tick { group.start } else { group.end }
+            })
+    };
 
     let mut segments: Vec<Segment> = Vec::new();
     for note in &track.notes {
         if note.abs_tick >= bar.end || note.end_tick() <= bar.start {
             continue;
         }
-        let start = snap(note.abs_tick.max(bar.start)).min(bar.end - 1);
-        let end = snap(note.end_tick().min(bar.end)).clamp(start + 1, bar.end);
-        segments.push(Segment {
-            string_index: note.string_index,
-            fret: note.fret,
-            velocity: note.velocity,
-            effects: note.effects.clone(),
-            start,
-            end,
-            tied_in: note.abs_tick < bar.start || track.is_tied_continuation(note),
-        });
+        let tied_in = note.abs_tick < bar.start || track.is_tied_continuation(note);
+        let mut push = |start: Tick, end: Tick, tied_in: bool| {
+            if start < end {
+                segments.push(Segment {
+                    string_index: note.string_index,
+                    fret: note.fret,
+                    velocity: note.velocity,
+                    effects: note.effects.clone(),
+                    start,
+                    end,
+                    tied_in,
+                });
+            }
+        };
+        if let Some(group) = groups.iter().find(|group| group.span.holds(note)) {
+            push(note.abs_tick + group.shift, note.end_tick() + group.shift, tied_in);
+        } else if let Some(group) = groups.iter().find(|group| group.span.continues(note)) {
+            // A note running into or out of a tuplet: the stretch outside is
+            // a plain note, the stretch inside a tied one that fills the
+            // parts it covers.
+            let (entering, leaving) = (note.abs_tick < group.span.start, note.end_tick() > group.span.end());
+            if entering {
+                push(snap(note.abs_tick.max(bar.start)).min(bar.end - 1), group.start, tied_in);
+            }
+            let from = if entering { group.start } else { note.abs_tick + group.shift };
+            let to = if leaving { group.end } else { note.end_tick() + group.shift };
+            push(from, to, tied_in || entering);
+            if leaving {
+                push(group.end, snap(note.end_tick().min(bar.end)).max(group.end), true);
+            }
+        } else {
+            let start = keep_out(snap(note.abs_tick.max(bar.start)).min(bar.end - 1));
+            let end = keep_out(snap(note.end_tick().min(bar.end))).clamp(start + 1, bar.end);
+            push(start, end, tied_in);
+        }
     }
 
     // One sounding note per string: a note stops where the next on its
@@ -265,6 +397,10 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
         edges.push(segment.start);
         edges.push(segment.end);
     }
+    for group in &groups {
+        edges.push(group.start);
+        edges.push(group.end);
+    }
     edges.sort_unstable();
     edges.dedup();
 
@@ -275,9 +411,8 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
             .iter()
             .filter(|segment| segment.start <= from && segment.end >= to)
             .collect();
-        let mut at = from;
-        for (index, length) in pieces(from - bar.start, to - from).into_iter().enumerate() {
-            let notes = active
+        let notes_of = |index: usize| -> Vec<ExportNote> {
+            active
                 .iter()
                 .map(|segment| ExportNote {
                     string_index: segment.string_index,
@@ -290,11 +425,41 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
                         true
                     },
                 })
-                .collect();
+                .collect()
+        };
+
+        if let Some(group) = groups.iter().find(|group| group.start <= from && to <= group.end) {
+            let (first, last) = (group.boundary_at(from), group.boundary_at(to));
+            if last > first {
+                // The stretch is whole parts: cut it into the note values
+                // the parts are written in, and lay the pieces out in time.
+                let mut written_at = Tick::from(first) * group.unit;
+                let lengths = pieces(written_at, Tick::from(last - first) * group.unit);
+                let mut at = from;
+                for (index, &length) in lengths.iter().enumerate() {
+                    written_at += length;
+                    let next = if index + 1 == lengths.len() { to } else { group.real_at(written_at) };
+                    beats.push(ExportBeat {
+                        start: at,
+                        duration: (next - at).max(1),
+                        written: length,
+                        tuplet: Some(group.tuplet(index == 0 && from == group.start, index + 1 == lengths.len() && to == group.end)),
+                        notes: notes_of(index),
+                    });
+                    at = next;
+                }
+                continue;
+            }
+        }
+
+        let mut at = from;
+        for (index, length) in pieces(from - bar.start, to - from).into_iter().enumerate() {
             beats.push(ExportBeat {
                 start: at,
                 duration: length,
-                notes,
+                written: length,
+                tuplet: None,
+                notes: notes_of(index),
             });
             at += length;
         }
@@ -365,6 +530,51 @@ pub(crate) fn aligned_demo() -> BwxProject {
     project.tracks[1].time_signature_changes = project.tracks[0].time_signature_changes.clone();
     project.tracks[1].bar_count = project.tracks[0].bar_count;
     project
+}
+
+/// One track with a triplet of eighths, a quintuplet in a half note with a
+/// rest part, and a sextuplet whose first note lasts four parts.
+#[cfg(test)]
+pub(crate) fn tuplet_demo() -> BwxProject {
+    let mut project = aligned_demo();
+    project.tracks.truncate(1);
+    let id = project.tracks[0].id;
+    project.tracks[0].notes.clear();
+    project.tracks[0].tuplets.clear();
+    assert!(!project.write_tuplet(id, 960, 960, 3, 5, 3, 100).is_empty());
+    assert!(!project.write_tuplet(id, 3840, 1920, 5, 4, 2, 100).is_empty());
+    let span = TupletSpan { start: 7680, length: 1920, parts: 6 };
+    assert!(project.tracks[0].add_tuplet(span));
+    for (from, parts) in [(0, 4), (4, 1), (5, 1)] {
+        let (a, b) = (span.boundary(from), span.boundary(from + parts));
+        project.insert_note(id, a, b - a, 3, 5).unwrap();
+    }
+    project
+}
+
+/// A triplet in the last beat of a bar whose first note was emptied, and the
+/// note before it stretched into that part: the span stays, and the note is a
+/// plain one that continues into the triplet as a tied part.
+#[cfg(test)]
+pub(crate) fn stretched_tuplet_demo() -> (BwxProject, TupletSpan) {
+    let mut project = aligned_demo();
+    project.tracks.truncate(1);
+    let id = project.tracks[0].id;
+    project.tracks[0].notes.clear();
+    project.tracks[0].tuplets.clear();
+    let span = TupletSpan { start: 6720, length: 960, parts: 3 };
+    project.insert_note(id, 5760, 1280, 5, 3).unwrap();
+    project.insert_note(id, 7040, 320, 5, 4).unwrap();
+    project.insert_note(id, 7360, 320, 5, 5).unwrap();
+    assert!(project.tracks[0].add_tuplet(span));
+    assert!(!project.tracks[0].prune_tuplets());
+    (project, span)
+}
+
+/// The notes of a track as (start, length) pairs, for comparing round trips.
+#[cfg(test)]
+pub(crate) fn note_places(track: &InstrumentTrack) -> Vec<(Tick, Tick)> {
+    track.notes.iter().map(|note| (note.abs_tick, note.duration_ticks)).collect()
 }
 
 #[cfg(test)]
@@ -498,6 +708,147 @@ mod tests {
             prepare(&project),
             Err(FormatError::Incompatible(_))
         ));
+    }
+
+    fn project_with_tuplet(start: Tick, length: Tick, parts: u8, fill: &[(u32, u32)]) -> BwxProject {
+        // `fill` lists (first part, parts it lasts) of the notes to write.
+        let mut project = project_with(&[]);
+        let id = project.tracks[0].id;
+        let span = TupletSpan { start, length, parts };
+        project.tracks[0].add_tuplet(span);
+        for &(first, count) in fill {
+            let (from, to) = (span.boundary(first), span.boundary(first + count));
+            project.insert_note(id, from, to - from, 5, 0).unwrap();
+        }
+        project
+    }
+
+    #[test]
+    fn a_triplet_keeps_its_parts_and_is_written_as_plain_values() {
+        let project = project_with_tuplet(0, Q, 3, &[(0, 1), (1, 1), (2, 1)]);
+        let bar = bar(&project, 0);
+        let triplet: Vec<_> = bar.beats.iter().filter(|beat| beat.tuplet.is_some()).collect();
+        assert_eq!(triplet.len(), 3);
+        for beat in &triplet {
+            assert_eq!((beat.duration, beat.written), (Q / 3, Q / 2));
+            assert_eq!(beat.tuplet.map(|tuplet| (tuplet.enters, tuplet.times)), Some((3, 2)));
+            assert_eq!(beat.notes.len(), 1);
+        }
+        assert_eq!(triplet.iter().map(|beat| beat.start).collect::<Vec<_>>(), [0, Q / 3, Q * 2 / 3]);
+        assert_eq!(bar.beats.iter().map(|beat| beat.duration).sum::<Tick>(), Q * 4);
+    }
+
+    #[test]
+    fn empty_parts_of_a_tuplet_are_rests_in_its_values() {
+        // One note, then four rest parts of a quintuplet in a half note.
+        let project = project_with_tuplet(0, Q * 2, 5, &[(0, 1)]);
+        let bar = bar(&project, 0);
+        let (note, rest) = (&bar.beats[0], &bar.beats[1]);
+        assert_eq!((note.duration, note.written), (Q * 2 / 5, Q / 2));
+        assert!(rest.notes.is_empty());
+        assert_eq!((rest.duration, rest.written), (Q * 8 / 5, Q * 2));
+        assert_eq!(rest.tuplet.map(|tuplet| (tuplet.enters, tuplet.times)), Some((5, 4)));
+        assert_eq!(note.duration + rest.duration, Q * 2);
+    }
+
+    #[test]
+    fn a_stretch_that_is_no_note_value_is_cut_into_tied_pieces_of_the_tuplet() {
+        // Five of six parts of a sextuplet: a half and an eighth, tied.
+        let project = project_with_tuplet(0, Q * 2, 6, &[(0, 5)]);
+        let bar = bar(&project, 0);
+        let written: Vec<_> = bar.beats.iter().take(2).map(|beat| beat.written).collect();
+        assert_eq!(written, [Q * 2, Q / 2]);
+        assert!(bar.beats[1].notes[0].tied);
+        assert_eq!(bar.beats[0].duration + bar.beats[1].duration, Q * 5 / 3);
+    }
+
+    #[test]
+    fn a_power_of_two_split_is_no_tuplet_and_a_foreign_note_cancels_one() {
+        let project = project_with_tuplet(0, Q, 4, &[(0, 1), (1, 1), (2, 1), (3, 1)]);
+        assert!(bar(&project, 0).beats.iter().all(|beat| beat.tuplet.is_none()));
+        // A note that is no part of the span keeps the notes plain.
+        let mut project = project_with_tuplet(0, Q, 3, &[(0, 1)]);
+        let id = project.tracks[0].id;
+        project.insert_note(id, 40, 100, 4, 0).unwrap();
+        assert!(bar(&project, 0).beats.iter().all(|beat| beat.tuplet.is_none()));
+    }
+
+    #[test]
+    fn notes_left_without_a_span_are_still_written_as_the_tuplet_they_form() {
+        // The end of the second bar after an edit dropped the span: a note of
+        // four parts and two of one part, of a sextuplet in a half note.
+        let project = project_with(&[(5760, 1280, 5, 3), (7040, 320, 5, 3), (7360, 320, 5, 3)]);
+        assert!(project.tracks[0].tuplets.is_empty());
+        let bar = bar(&project, 1);
+        let tuplet: Vec<_> = bar.beats.iter().filter(|beat| beat.tuplet.is_some()).collect();
+        assert_eq!(tuplet.len(), 3);
+        assert!(tuplet.iter().all(|beat| beat.tuplet.map(|tuplet| (tuplet.enters, tuplet.times)) == Some((6, 4))));
+        assert_eq!(tuplet.iter().map(|beat| beat.duration).collect::<Vec<_>>(), [1280, 320, 320]);
+        assert_eq!(tuplet.iter().map(|beat| beat.written).collect::<Vec<_>>(), [Q * 2, Q / 2, Q / 2]);
+        assert_eq!(bar.beats.iter().map(|beat| beat.duration).sum::<Tick>(), Q * 4);
+    }
+
+    #[test]
+    fn a_note_stretched_into_a_tuplet_is_a_tied_note_filling_its_first_part() {
+        // A triplet in the last beat of bar 2 whose first note was replaced
+        // by the note before it, stretched into the part.
+        let mut project = project_with(&[(5760, 960, 5, 3), (7040, 320, 5, 4), (7360, 320, 5, 4)]);
+        let span = TupletSpan { start: 6720, length: 960, parts: 3 };
+        assert!(project.tracks[0].add_tuplet(span));
+        project.tracks[0].notes[0].duration_ticks = 1280;
+        assert!(!project.tracks[0].prune_tuplets());
+        let bar = bar(&project, 1);
+        let beats: Vec<_> = bar.beats.iter().map(|beat| (beat.start, beat.duration, beat.written, beat.tuplet.is_some(), beat.notes.first().map(|note| note.tied))).collect();
+        assert_eq!(
+            beats,
+            [
+                (3840, 1920, 1920, false, None),
+                (5760, 960, 960, false, Some(false)),
+                (6720, 320, 480, true, Some(true)),
+                (7040, 320, 480, true, Some(false)),
+                (7360, 320, 480, true, Some(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_part_of_a_tuplet_a_note_was_stretched_into_stays_a_rest() {
+        let mut project = project_with(&[(5760, 960, 5, 3), (7360, 320, 5, 4)]);
+        let span = TupletSpan { start: 6720, length: 960, parts: 3 };
+        assert!(project.tracks[0].add_tuplet(span));
+        project.tracks[0].notes[0].duration_ticks = 1280;
+        assert!(!project.tracks[0].prune_tuplets());
+        let bar = bar(&project, 1);
+        let last: Vec<_> = bar.beats.iter().skip(3).map(|beat| (beat.start, beat.written, beat.notes.len())).collect();
+        assert_eq!(last, [(7040, 480, 0), (7360, 480, 1)]);
+    }
+
+    #[test]
+    fn the_first_and_last_beat_of_a_tuplet_mark_its_edges() {
+        let project = project_with_tuplet(0, Q, 3, &[(0, 1), (1, 1), (2, 1)]);
+        let edges: Vec<_> = bar(&project, 0)
+            .beats
+            .iter()
+            .filter_map(|beat| beat.tuplet.map(|tuplet| (tuplet.starts, tuplet.ends, tuplet.unit)))
+            .collect();
+        assert_eq!(edges, [(true, false, Q / 2), (false, false, Q / 2), (false, true, Q / 2)]);
+        // Two in a row are two groups, whatever lies between the notes.
+        let mut project = project_with_tuplet(0, Q, 3, &[(0, 1)]);
+        let second = TupletSpan { start: Q, length: Q, parts: 3 };
+        assert!(project.tracks[0].add_tuplet(second));
+        let id = project.tracks[0].id;
+        project.insert_note(id, Q, Q / 3, 5, 0).unwrap();
+        let bar = bar(&project, 0);
+        let starts = bar.beats.iter().filter(|beat| beat.tuplet.is_some_and(|tuplet| tuplet.starts)).count();
+        let ends = bar.beats.iter().filter(|beat| beat.tuplet.is_some_and(|tuplet| tuplet.ends)).count();
+        assert_eq!((starts, ends), (2, 2));
+    }
+
+    #[test]
+    fn plain_off_beat_notes_are_not_mistaken_for_a_tuplet() {
+        // A note that is merely a little late does not fit any tuplet.
+        let project = project_with(&[(0, Q, 5, 0), (Q + 41, Q, 4, 0)]);
+        assert!(bar(&project, 0).beats.iter().all(|beat| beat.tuplet.is_none()));
     }
 
     #[test]

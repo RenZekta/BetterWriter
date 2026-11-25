@@ -388,7 +388,8 @@ impl Ids {
         notes.open("Notes");
         rhythm_xml.open("Rhythms");
 
-        let mut rhythms: Vec<(u32, u8)> = Vec::new();
+        // A rhythm is a note value, its dots and the tuplet it is in.
+        let mut rhythms: Vec<(u32, u8, Option<(u8, u8)>)> = Vec::new();
         let mut bar_ids = Vec::new();
         let (mut next_bar, mut next_voice, mut next_beat, mut next_note) = (0, 0, 0, 0);
 
@@ -418,14 +419,22 @@ impl Ids {
                     next_beat += 1;
                     beat_ids.push(beat_id);
 
-                    let key = score::value_and_dots(beat.duration);
+                    let (value, dots) = score::value_and_dots(beat.written);
+                    let tuplet = beat.tuplet.map(|tuplet| (tuplet.enters, tuplet.times));
+                    let key = (value, dots, tuplet);
                     let rhythm = rhythms.iter().position(|&known| known == key).unwrap_or_else(|| {
                         rhythms.push(key);
                         rhythm_xml.open_with("Rhythm", &[("id", (rhythms.len() - 1).to_string())]);
-                        if key.1 > 0 {
-                            rhythm_xml.empty_with("AugmentationDot", &[("count", key.1.to_string())]);
+                        if dots > 0 {
+                            rhythm_xml.empty_with("AugmentationDot", &[("count", dots.to_string())]);
                         }
-                        rhythm_xml.text("NoteValue", note_value(key.0));
+                        rhythm_xml.text("NoteValue", note_value(value));
+                        if let Some((enters, times)) = tuplet {
+                            rhythm_xml.empty_with(
+                                "PrimaryTuplet",
+                                &[("num", enters.to_string()), ("den", times.to_string())],
+                            );
+                        }
                         rhythm_xml.close("Rhythm");
                         rhythms.len() - 1
                     });
@@ -714,6 +723,21 @@ mod tests {
         assert_eq!(count(&xml, "<NoteValue>Quarter</NoteValue>"), 2);
         assert!(xml.contains("<AugmentationDot count=\"1\"/>"));
         assert!(xml.contains("<NoteValue>Eighth</NoteValue>"));
+    }
+
+    #[test]
+    fn a_tuplet_is_a_rhythm_with_a_primary_tuplet() {
+        let xml = gpif_of(&score::tuplet_demo());
+        assert_well_formed(&xml);
+        // One shared rhythm per note value and tuplet: the sextuplet has a
+        // half note and an eighth, the others only eighths.
+        for (num, den, rhythms) in [(3, 2, 1), (5, 4, 1), (6, 4, 2)] {
+            let tag = format!("<PrimaryTuplet num=\"{num}\" den=\"{den}\"/>");
+            assert_eq!(count(&xml, &tag), rhythms, "{tag}");
+        }
+        // The triplet's notes are eighths, not 64ths snapped to the grid.
+        let flat: String = xml.split_whitespace().collect::<Vec<_>>().join("");
+        assert!(flat.contains("<NoteValue>Eighth</NoteValue><PrimaryTuplet"), "{xml}");
     }
 
     #[test]

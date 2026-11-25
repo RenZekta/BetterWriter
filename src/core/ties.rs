@@ -228,7 +228,7 @@ fn tie_chain_ids(track: &InstrumentTrack, note_id: u64) -> Vec<u64> {
 /// each bar's share cut into standard lengths.
 pub fn note_slices(track: &InstrumentTrack, start: Tick, end: Tick) -> Vec<(Tick, Tick)> {
     let mut slices = Vec::new();
-    for (slice_start, slice_end) in bar_slices(track, start, end) {
+    for (slice_start, slice_end) in bar_slices(track, start, end).into_iter().flat_map(|(from, to)| tuplet_slices(track, from, to)) {
         // Inside a tuplet the pieces are the plain values the parts stand
         // for, mapped back to real ticks.
         if let Some(span) = track
@@ -254,6 +254,28 @@ pub fn note_slices(track: &InstrumentTrack, start: Tick, end: Tick) -> Vec<(Tick
             slices.push((cursor, cursor + length));
             cursor += length;
         }
+    }
+    slices
+}
+
+/// `[start, end)` cut where a tuplet starts or ends inside it: a note that
+/// runs into a tuplet is a plain note up to it and, from there, notes of the
+/// tuplet.
+fn tuplet_slices(track: &InstrumentTrack, start: Tick, end: Tick) -> Vec<(Tick, Tick)> {
+    let mut cuts: Vec<Tick> = track
+        .tuplets
+        .iter()
+        .filter(|span| span.is_tuplet())
+        .flat_map(|span| [span.start, span.end()])
+        .filter(|&cut| start < cut && cut < end)
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut slices = Vec::new();
+    let mut cursor = start;
+    for cut in cuts.into_iter().chain([end]) {
+        slices.push((cursor, cut));
+        cursor = cut;
     }
     slices
 }

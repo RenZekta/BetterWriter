@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 
-use crate::core::{NoteEffects, TICKS_PER_QUARTER, Tick, project::TimeSignature};
+use crate::core::{NoteEffects, TICKS_PER_QUARTER, Tick, project::TimeSignature, tuplets::TupletBeat};
 
 use super::{
     FormatError,
@@ -196,6 +196,7 @@ fn import_score(text: &str) -> Result<Import, FormatError> {
                 tempos: (index == 0).then_some(&mut tempos),
                 active: HashSet::new(),
                 tuplets: Vec::new(),
+                tuplet_beats: &mut track.tuplet_beats,
             };
             for (bar, measure) in content.all("Measure").enumerate() {
                 let (Some(&start), Some(grid)) = (starts.get(bar), song.bars.get(bar)) else {
@@ -298,6 +299,8 @@ struct Walker<'a> {
     active: HashSet<String>,
     /// (normal, actual) of the tuplets open.
     tuplets: Vec<(Tick, Tick)>,
+    /// The beats of the first voice that sit in a tuplet.
+    tuplet_beats: &'a mut Vec<TupletBeat>,
     /// Texts above the staff; text for all staves goes to the first only.
     texts: &'a mut Vec<(Tick, String)>,
 }
@@ -341,9 +344,14 @@ impl Walker<'_> {
                         cursor += shift;
                     }
                 }
-                "Rest" => cursor += self.rest_ticks(element, length),
+                "Rest" => {
+                    let ticks = self.rest_ticks(element, length);
+                    self.note_tuplet_beat(element, cursor, ticks, index);
+                    cursor += ticks;
+                }
                 "Chord" => {
                     let ticks = self.duration(element);
+                    self.note_tuplet_beat(element, cursor, ticks, index);
                     if element.children.iter().any(|child| is_grace(&child.name)) {
                         self.report.skip("grace notes (left out)");
                     } else {
@@ -380,6 +388,29 @@ impl Walker<'_> {
                 }
             }
         }
+    }
+
+    /// Remembers a beat that sits in one tuplet, for the spans of the track.
+    /// Tuplets inside tuplets are not kept as such.
+    fn note_tuplet_beat(&mut self, element: &Node, start: Tick, ticks: Tick, voice: usize) {
+        let [(normal, actual)] = self.tuplets[..] else {
+            return;
+        };
+        let (Ok(times), Ok(enters)) = (u8::try_from(normal), u8::try_from(actual)) else {
+            return;
+        };
+        if voice != 0 || element.text_of("durationType") == Some("measure") {
+            return;
+        }
+        let dots: u8 = element.number_of("dots").unwrap_or(0);
+        let value = element.text_of("durationType").and_then(duration_value).unwrap_or(4);
+        self.tuplet_beats.push(TupletBeat {
+            start,
+            ticks,
+            written: value_ticks(value, dots),
+            enters,
+            times,
+        });
     }
 
     fn duration(&self, element: &Node) -> Tick {
@@ -578,6 +609,26 @@ mod tests {
         assert!(track.is_tied_continuation(&track.notes[1]));
         assert!(track.bar_mark_at(0).repeat_open);
         assert_eq!(track.bar_mark_at(second).repeat_close, 2);
+    }
+
+    #[test]
+    fn tuplets_come_back_as_spans_with_their_exact_parts() {
+        let project = score::tuplet_demo();
+        let back = round_trip(&project);
+        assert_eq!(back.tracks[0].tuplets, project.tracks[0].tuplets);
+        assert_eq!(score::note_places(&back.tracks[0]), score::note_places(&project.tracks[0]));
+    }
+
+    #[test]
+    fn a_tuplet_a_note_was_stretched_into_comes_back_with_its_tied_part() {
+        let (project, span) = score::stretched_tuplet_demo();
+        let back = round_trip(&project);
+        assert_eq!(back.tracks[0].tuplets, [span]);
+        // The long note comes back in two tied pieces: before and in the tuplet.
+        assert_eq!(
+            score::note_places(&back.tracks[0]),
+            [(5760, 960), (6720, 320), (7040, 320), (7360, 320)]
+        );
     }
 
     #[test]

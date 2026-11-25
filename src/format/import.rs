@@ -11,6 +11,7 @@ use crate::core::{
         TieOrigin, TimeSignature, TimeSignatureChange,
     },
     sounds::{melodic_channel, variant_for_program},
+    tuplets::{TupletBeat, spans_from_beats},
 };
 
 /// A loaded project and what did not come across.
@@ -90,6 +91,9 @@ pub struct ImportedTrack {
     pub notes: Vec<ImportedNote>,
     /// Texts written above the score, with the tick they sit at.
     pub texts: Vec<(Tick, String)>,
+    /// The beats of the first voice that sit in a tuplet; the project's
+    /// tuplet spans are made from them.
+    pub tuplet_beats: Vec<TupletBeat>,
 }
 
 impl ImportedTrack {
@@ -108,6 +112,7 @@ impl ImportedTrack {
             percussion: false,
             notes: Vec::new(),
             texts: Vec::new(),
+            tuplet_beats: Vec::new(),
         }
     }
 }
@@ -239,6 +244,7 @@ impl ImportedSong {
                 next_note_id += 1;
             }
             track.sort_notes();
+            track.adopt_tuplets(&spans_from_beats(&imported.tuplet_beats));
             for (tick, text) in &imported.texts {
                 if (0..end).contains(tick) {
                     track.set_annotation(*tick, text);

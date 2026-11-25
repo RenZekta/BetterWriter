@@ -2,22 +2,35 @@
 //! usual grid (three in the time of a quarter, five in a half, ...). The
 //! span is stored on the track and lives only as long as it has notes:
 //! notes of the span sit on its part boundaries and are whole parts long.
-//! A note that does not (one moved onto the span, stretched across a part
-//! boundary or out of the span, or as long as the whole span) overwrites it,
-//! and the span goes. Parts that hold no note are rests.
+//! A note that runs into the span from outside and ends on a part boundary
+//! (a note before it stretched into its first part) leaves the span as it is:
+//! the part it covers is a tied continuation of that note, and parts that
+//! hold no note are rests. A note inside the span that does not sit on the
+//! parts (one moved onto it, stretched across a part boundary, or as long as
+//! the whole span) overwrites it, and the span goes, as it does when no note
+//! of it is left.
 
-// The editor and the file formats do not use most of this yet.
+// Some of it is only used by tests, or by editor commands still to come.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
-use super::project::{BwxProject, InstrumentTrack, TabNote, Tick};
+use super::project::{BwxProject, InstrumentTrack, TICKS_PER_QUARTER, TabNote, Tick};
 
 /// Fewest and most parts a span can be cut into.
 pub const MIN_PARTS: u8 = 2;
 pub const MAX_PARTS: u8 = 64;
 /// Shortest part, the length of the shortest note the editor writes.
 pub const MIN_PART_TICKS: Tick = super::project::TICKS_PER_QUARTER / 32;
+
+/// Whether `ticks` is a whole, dotted or double dotted note value, from a
+/// whole note down to a 64th.
+fn is_note_value(ticks: Tick) -> bool {
+    (0..7).any(|index| {
+        let value = TICKS_PER_QUARTER * 4 >> index;
+        ticks == value || ticks == value * 3 / 2 || ticks == value * 7 / 4
+    })
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TupletSpan {
@@ -98,12 +111,121 @@ impl TupletSpan {
             && self.boundary_index(note.end_tick()).is_some()
     }
 
+    /// Whether `note` runs into the span from outside, or out of it, with its
+    /// end inside the span on a part boundary: the part of it in the span is
+    /// whole parts, so the span can stay under it.
+    pub fn continues(&self, note: &TabNote) -> bool {
+        let (start, end) = (note.abs_tick, note.end_tick());
+        if !self.overlaps(start, end) {
+            return false;
+        }
+        match (start < self.start, end > self.end()) {
+            (true, true) => true,
+            (true, false) => self.boundary_index(end).is_some(),
+            (false, true) => self.boundary_index(start).is_some(),
+            (false, false) => false,
+        }
+    }
+
     fn overlaps(&self, from: Tick, to: Tick) -> bool {
         from < self.end() && to > self.start
     }
 }
 
+/// A beat of a foreign file that sits in a tuplet: `enters` notes in the time
+/// of `times`, written as `written` ticks but lasting `ticks`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TupletBeat {
+    pub start: Tick,
+    pub ticks: Tick,
+    pub written: Tick,
+    pub enters: u8,
+    pub times: u8,
+}
+
+fn gcd(a: Tick, b: Tick) -> Tick {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// The spans the tuplet beats of one track form. Consecutive beats of the
+/// same tuplet make a group once their written lengths add up to `enters`
+/// parts, a part being the largest value that divides every beat's length
+/// (a quarter and an eighth of a triplet are three eighth parts). Tuplets
+/// the project cannot hold, like 5 in the time of 6, are left out; their
+/// notes keep their real lengths.
+pub fn spans_from_beats(beats: &[TupletBeat]) -> Vec<TupletSpan> {
+    let mut beats = beats.to_vec();
+    beats.sort_by_key(|beat| beat.start);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < beats.len() {
+        let first = beats[at];
+        let holdable = (MIN_PARTS..=MAX_PARTS).contains(&first.enters)
+            && !first.enters.is_power_of_two()
+            && first.times == 1 << first.enters.ilog2();
+        if !holdable {
+            at += 1;
+            continue;
+        }
+        let (mut unit, mut sum, mut end) = (0, 0, first.start);
+        let mut next = at;
+        let mut whole = false;
+        while let Some(beat) = beats.get(next) {
+            if (beat.enters, beat.times) != (first.enters, first.times) || (beat.start - end).abs() > 2 {
+                break;
+            }
+            let (grown_unit, grown_sum) = (gcd(unit, beat.written), sum + beat.written);
+            if grown_unit == 0 || grown_sum / grown_unit > Tick::from(first.enters) {
+                break;
+            }
+            (unit, sum, end) = (grown_unit, grown_sum, beat.start + beat.ticks);
+            next += 1;
+            if sum / unit == Tick::from(first.enters) {
+                whole = true;
+                break;
+            }
+        }
+        if whole && is_note_value(unit) {
+            spans.push(TupletSpan {
+                start: first.start,
+                length: Tick::from(first.times) * unit,
+                parts: first.enters,
+            });
+        }
+        at = next.max(at + 1);
+    }
+    spans
+}
+
 impl InstrumentTrack {
+    /// Adds the spans of a file and puts the notes inside them onto the part
+    /// boundaries (a file rounds the lengths of a tuplet; the span does not).
+    /// A span that does not fit, or whose notes do not suit it, is left out.
+    pub fn adopt_tuplets(&mut self, spans: &[TupletSpan]) {
+        for span in spans {
+            if !self.add_tuplet(*span) {
+                continue;
+            }
+            for note in self.notes.iter_mut() {
+                let (start, end) = (note.abs_tick, note.end_tick());
+                if start < span.start - 2 || end > span.end() + 2 || note.duration_ticks >= span.length {
+                    continue;
+                }
+                let start = span.snap(start.max(span.start));
+                let end = span.snap(end.min(span.end()));
+                if end <= start {
+                    // Shorter than a part: not a note of the span, which then
+                    // goes with `prune_tuplets`.
+                    continue;
+                }
+                note.abs_tick = start;
+                note.duration_ticks = end - start;
+            }
+        }
+        self.sort_notes();
+        self.prune_tuplets();
+    }
+
     /// The span `tick` falls in, if any.
     pub fn tuplet_at(&self, tick: Tick) -> Option<&TupletSpan> {
         self.tuplets.iter().find(|span| (span.start..span.end()).contains(&tick))
@@ -122,10 +244,11 @@ impl InstrumentTrack {
         self.tuplets.retain(|span| {
             let mut holds_one = false;
             for note in notes.iter().filter(|note| span.overlaps(note.abs_tick, note.end_tick())) {
-                if !span.holds(note) {
+                if span.holds(note) {
+                    holds_one = true;
+                } else if !span.continues(note) {
                     return false;
                 }
-                holds_one = true;
             }
             holds_one
         });
@@ -144,6 +267,69 @@ impl InstrumentTrack {
     /// Removes the spans that start in `from..to`.
     pub fn drop_tuplets_in(&mut self, from: Tick, to: Tick) {
         self.tuplets.retain(|span| span.start < from || span.start >= to);
+    }
+
+    /// The tuplets the notes of `from..to` form without a span: groups of
+    /// notes (and the rests between them) that tile a note value cut into
+    /// 3, 5, 6, 7, ... equal parts, and fit no plain grid. They are what an
+    /// edit leaves when it drops a span (a note landing on one) or a file
+    /// without tuplets holds; formats write them as tuplets. The smallest
+    /// window and the fewest parts that hold the notes win.
+    pub fn loose_tuplets(&self, from: Tick, to: Tick) -> Vec<TupletSpan> {
+        let grid = TICKS_PER_QUARTER / 16;
+        let free = |note: &&TabNote| {
+            note.abs_tick < to && note.end_tick() > from && !self.tuplets.iter().any(|span| span.overlaps(note.abs_tick, note.end_tick()))
+        };
+        let mut found: Vec<TupletSpan> = Vec::new();
+        for note in self.notes.iter().filter(free) {
+            let off_grid = |tick: Tick| (tick - from).rem_euclid(grid) != 0;
+            if !(off_grid(note.abs_tick) || off_grid(note.end_tick())) || found.iter().any(|span| span.overlaps(note.abs_tick, note.end_tick())) {
+                continue;
+            }
+            if let Some(span) = self.loose_span_around(note, from, to, &found) {
+                found.push(span);
+            }
+        }
+        found.sort_by_key(|span| span.start);
+        found
+    }
+
+    fn loose_span_around(&self, note: &TabNote, from: Tick, to: Tick, found: &[TupletSpan]) -> Option<TupletSpan> {
+        const PARTS: [u8; 12] = [3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17];
+        for length in [TICKS_PER_QUARTER / 2, TICKS_PER_QUARTER, TICKS_PER_QUARTER * 2, TICKS_PER_QUARTER * 4] {
+            for align in [length, length / 2] {
+                let first = from + (note.abs_tick - from).div_euclid(align) * align;
+                for start in [first, first - align] {
+                    if start < from || start + length > to || !(start..start + length).contains(&note.abs_tick) {
+                        continue;
+                    }
+                    for parts in PARTS {
+                        let span = TupletSpan { start, length, parts };
+                        if self.loose_span_fits(&span, found) {
+                            return Some(span);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether `span` can be written as a tuplet: its parts are whole ticks
+    /// and a note value, and every note touching it is one of its own.
+    fn loose_span_fits(&self, span: &TupletSpan, found: &[TupletSpan]) -> bool {
+        let normal = Tick::from(span.normal_notes());
+        let unit = span.length / normal;
+        if !span.is_tuplet() || unit * normal != span.length || !is_note_value(unit) || span.length / Tick::from(span.parts) < MIN_PART_TICKS {
+            return false;
+        }
+        if found.iter().any(|other| other.overlaps(span.start, span.end())) || self.tuplets.iter().any(|other| other.overlaps(span.start, span.end())) {
+            return false;
+        }
+        self.notes
+            .iter()
+            .filter(|note| note.abs_tick < span.end() && note.end_tick() > span.start)
+            .all(|note| span.holds(note))
     }
 
     /// Adds a span unless it would cross a barline, overlap another span, or
@@ -277,6 +463,126 @@ mod tests {
             .map(|&(start, length, string)| project.insert_note(id, start, length, string, 3).unwrap())
             .collect();
         (project, id, ids)
+    }
+
+    fn beat(start: Tick, ticks: Tick, written: Tick, enters: u8, times: u8) -> TupletBeat {
+        TupletBeat { start, ticks, written, enters, times }
+    }
+
+    #[test]
+    fn beats_of_a_file_make_spans_whatever_their_values() {
+        let triplet = [beat(0, 160, 240, 3, 2), beat(160, 160, 240, 3, 2), beat(320, 160, 240, 3, 2)];
+        assert_eq!(spans_from_beats(&triplet), [TupletSpan { start: 0, length: 480, parts: 3 }]);
+        // A quarter and an eighth of a triplet are three eighth parts.
+        let mixed = [beat(960, 640, 960, 3, 2), beat(1600, 320, 480, 3, 2)];
+        assert_eq!(spans_from_beats(&mixed), [TupletSpan { start: 960, length: 960, parts: 3 }]);
+        // Six equal beats of a sextuplet are one group, not two of three.
+        let sextuplet: Vec<_> = (0..6).map(|i| beat(i * 160, 160, 240, 6, 4)).collect();
+        assert_eq!(spans_from_beats(&sextuplet), [TupletSpan { start: 0, length: 960, parts: 6 }]);
+        // Two triplets in a row stay two.
+        let two: Vec<_> = (0..6).map(|i| beat(i * 160, 160, 240, 3, 2)).collect();
+        assert_eq!(spans_from_beats(&two).len(), 2);
+    }
+
+    #[test]
+    fn a_group_that_is_cut_short_or_cannot_be_held_makes_no_span() {
+        let short = [beat(0, 160, 240, 3, 2), beat(160, 160, 240, 3, 2)];
+        assert!(spans_from_beats(&short).is_empty());
+        // Five in the time of six has no normal-notes count the project keeps.
+        let odd: Vec<_> = (0..5).map(|i| beat(i * 200, 200, 240, 5, 6)).collect();
+        assert!(spans_from_beats(&odd).is_empty());
+        let gap = [beat(0, 160, 240, 3, 2), beat(500, 160, 240, 3, 2), beat(660, 160, 240, 3, 2)];
+        assert!(spans_from_beats(&gap).is_empty());
+    }
+
+    #[test]
+    fn a_note_stretched_into_a_part_leaves_the_span_standing() {
+        // A triplet in the last beat of the bar with its first note emptied,
+        // then the note before it stretched into that part.
+        let (mut project, id, _) = project_with_notes(&[(5760, 960, 5), (7040, 320, 5), (7360, 320, 5)]);
+        let span = TupletSpan { start: 6720, length: 960, parts: 3 };
+        let track = project.track_mut(id).unwrap();
+        assert!(track.add_tuplet(span));
+        track.notes[0].duration_ticks = 1280;
+        assert!(!track.prune_tuplets());
+        assert_eq!(track.tuplets, [span]);
+        // The same from the other side: a note leaving the span.
+        track.notes[0].abs_tick = 7360;
+        track.notes[0].duration_ticks = 640;
+        assert!(track.notes[0].end_tick() > span.end());
+        assert!(!track.prune_tuplets());
+    }
+
+    #[test]
+    fn a_span_goes_when_the_note_off_its_parts_or_no_note_of_it_is_left() {
+        let (mut project, id, _) = project_with_notes(&[(5760, 960, 5), (7040, 320, 5), (7360, 320, 5)]);
+        let span = TupletSpan { start: 6720, length: 960, parts: 3 };
+        let track = project.track_mut(id).unwrap();
+        assert!(track.add_tuplet(span));
+        // Ends in the middle of a part: no continuation.
+        track.notes[0].duration_ticks = 1100;
+        assert!(track.prune_tuplets());
+        assert!(track.tuplets.is_empty());
+        // Only continuations left: nothing of the tuplet remains.
+        let (mut project, id, _) = project_with_notes(&[(5760, 1280, 5)]);
+        let track = project.track_mut(id).unwrap();
+        assert!(track.add_tuplet(span));
+        assert!(track.prune_tuplets());
+    }
+
+    #[test]
+    fn a_files_rounded_triplet_lands_on_the_parts_of_its_span() {
+        let (mut project, id, _) = project_with_notes(&[(960, 319, 5), (1281, 320, 5), (1601, 319, 5)]);
+        let span = TupletSpan { start: 960, length: 960, parts: 3 };
+        project.track_mut(id).unwrap().adopt_tuplets(&[span]);
+        let track = &project.tracks[0];
+        assert_eq!(track.tuplets, [span]);
+        let places: Vec<_> = track.notes.iter().map(|note| (note.abs_tick, note.duration_ticks)).collect();
+        assert_eq!(places, [(960, 320), (1280, 320), (1600, 320)]);
+    }
+
+    #[test]
+    fn a_span_of_a_file_whose_notes_do_not_suit_it_is_dropped() {
+        let (mut project, id, _) = project_with_notes(&[(960, 640, 5), (1600, 320, 5), (1800, 100, 4)]);
+        project.track_mut(id).unwrap().adopt_tuplets(&[TupletSpan { start: 960, length: 960, parts: 3 }]);
+        assert!(project.tracks[0].tuplets.is_empty());
+    }
+
+    #[test]
+    fn plain_notes_that_tile_a_tuplet_are_found_without_a_span() {
+        // Three thirds of a quarter, then a note of four parts and two of one
+        // part in a half note (a sextuplet), each group in its own bar slot.
+        let (project, _, _) = project_with_notes(&[
+            (960, 320, 5),
+            (1280, 320, 5),
+            (1600, 320, 5),
+            (5760, 1280, 5),
+            (7040, 320, 5),
+            (7360, 320, 5),
+        ]);
+        let track = &project.tracks[0];
+        let found = track.loose_tuplets(0, 7680);
+        assert_eq!(
+            found,
+            [
+                TupletSpan { start: 960, length: 960, parts: 3 },
+                TupletSpan { start: 5760, length: 1920, parts: 6 },
+            ]
+        );
+        assert!(found.iter().all(|span| track.notes.iter().filter(|note| span.overlaps(note.abs_tick, note.end_tick())).all(|note| span.holds(note))));
+    }
+
+    #[test]
+    fn notes_on_the_plain_grid_and_stray_lengths_are_no_loose_tuplet() {
+        let (project, _, _) = project_with_notes(&[(0, 960, 5), (960, 480, 5), (1441, 333, 5), (3000, 77, 4)]);
+        assert!(project.tracks[0].loose_tuplets(0, 3840).is_empty());
+    }
+
+    #[test]
+    fn a_span_of_its_own_is_not_found_twice() {
+        let (mut project, id, _) = project_with_notes(&[]);
+        assert!(!project.write_tuplet(id, 0, 960, 3, 5, 0, 100).is_empty());
+        assert!(project.tracks[0].loose_tuplets(0, 3840).is_empty());
     }
 
     #[test]
