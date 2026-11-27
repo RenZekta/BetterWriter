@@ -423,6 +423,7 @@ impl BwxProject {
         track.shift_bar_marks(bar_start, width);
         track.shift_tuplets(bar_start, width);
         track.shift_annotations(bar_start, width);
+        track.shift_dives(bar_start, width);
         track.bar_count = track.bar_count.saturating_add(1);
         track.sort_notes();
         true
@@ -457,6 +458,7 @@ impl BwxProject {
         track.shift_bar_marks(bar_end, width);
         track.shift_tuplets(bar_end, width);
         track.shift_annotations(bar_end, width);
+        track.shift_dives(bar_end, width);
         track.bar_count = track.bar_count.saturating_add(1);
         track.sort_notes();
         true
@@ -504,6 +506,8 @@ impl BwxProject {
         track.shift_tuplets(bar_end, -width);
         track.drop_annotations_in(bar_start, bar_end);
         track.shift_annotations(bar_end, -width);
+        track.drop_dives_in(bar_start, bar_end);
+        track.shift_dives(bar_end, -width);
         if track
             .time_signature_changes
             .first()

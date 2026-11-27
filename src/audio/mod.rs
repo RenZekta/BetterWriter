@@ -42,6 +42,11 @@ enum Action {
     Pan(u8),
     /// Another preset for the notes that follow on this channel.
     Sound { bank: u16, program: u8 },
+    /// Pitch wheel offset from its centre.
+    Bend(i16),
+    /// Turns this spare channel into a copy of channel `from` (sound, volume
+    /// and pan) for the bent note about to sound on it.
+    Borrow { from: u8 },
 }
 
 /// An event with the moment it sounds, in seconds from the start of the
@@ -56,12 +61,15 @@ struct Scheduled {
 
 impl Scheduled {
     /// Controller changes land before the notes that share their moment, and
-    /// note ends before note starts.
+    /// note ends before note starts. A spare channel is set up, then bent,
+    /// before its note starts.
     fn rank(&self) -> u8 {
         match self.action {
             Action::Volume(_) | Action::Pan(_) | Action::Sound { .. } => 0,
-            Action::NoteOff { .. } => 1,
-            Action::NoteOn { .. } => 2,
+            Action::Borrow { .. } => 1,
+            Action::Bend(_) => 2,
+            Action::NoteOff { .. } => 3,
+            Action::NoteOn { .. } => 4,
         }
     }
 }
@@ -93,17 +101,21 @@ fn build_schedule(
     };
 
     let start_seconds = seconds_of(start_track, start_tick, &mut maps);
+    let pitch = PitchPlan::new(project, notes, start_seconds, |track_id, tick| {
+        seconds_of(track_id, tick, &mut maps)
+    });
     let mut events: Vec<Scheduled> = notes
         .iter()
+        .filter(|event| event.kind != MidiEventKind::PitchBend)
         .map(|event| Scheduled {
             seconds: seconds_of(event.track_id, event.tick, &mut maps),
-            channel: event.channel,
+            channel: pitch.channel_of(event),
             action: match event.kind {
                 MidiEventKind::NoteOn => Action::NoteOn {
                     key: event.key,
                     velocity: event.velocity,
                 },
-                MidiEventKind::NoteOff => Action::NoteOff { key: event.key },
+                _ => Action::NoteOff { key: event.key },
             },
         })
         .collect();
@@ -201,6 +213,7 @@ fn build_schedule(
         ..event
     }));
     events.extend(later);
+    events.extend(pitch.events);
     events.sort_by(|a, b| {
         a.seconds
             .total_cmp(&b.seconds)
@@ -212,6 +225,184 @@ fn build_schedule(
         events,
         start_seconds,
         end_seconds: song_end.max(last_note),
+    }
+}
+
+/// The channel a bent note sounds on once it is done with.
+const SPARE_TAIL_SECONDS: f64 = 1.0;
+
+/// MIDI channel 9 is the General MIDI drum channel and never a spare.
+const DRUM_CHANNEL: u8 = 9;
+
+/// Where the pitch wheel moves go. A pitch wheel message bends every note of
+/// its channel, so a bent note sounds on a spare channel of its own (one no
+/// track uses) for as long as it rings, set up as a copy of its track's
+/// channel. The tremolo bar moves the whole track, so it goes to the track's
+/// channel and, added to the bend, to the spare channels of its bent notes.
+/// A bent note with no spare channel left bends its track's channel instead.
+struct PitchPlan {
+    spare: std::collections::HashMap<(u64, u64), u8>,
+    /// The `Borrow` and `Bend` events, ready to schedule.
+    events: Vec<Scheduled>,
+}
+
+/// The value of a list of `(seconds, wheel)` steps at `seconds`.
+fn wheel_at(steps: &[(f64, i16)], seconds: f64) -> i32 {
+    steps
+        .iter()
+        .rev()
+        .find(|step| step.0 <= seconds + 1e-9)
+        .map_or(0, |step| i32::from(step.1))
+}
+
+fn wheel_event(seconds: f64, channel: u8, wheel: i32) -> Scheduled {
+    Scheduled {
+        seconds,
+        channel,
+        action: Action::Bend(wheel.clamp(-8192, 8191) as i16),
+    }
+}
+
+impl PitchPlan {
+    fn new(
+        project: &BwxProject,
+        notes: &[MidiPlaybackEvent],
+        start_seconds: f64,
+        mut seconds_of: impl FnMut(u64, Tick) -> f64,
+    ) -> Self {
+        use std::collections::HashMap;
+
+        struct Chain {
+            parent: u8,
+            on: f64,
+            off: f64,
+        }
+        let mut chains: HashMap<(u64, u64), Chain> = HashMap::new();
+        let mut dives: HashMap<u64, Vec<(f64, i16)>> = HashMap::new();
+        let mut bends: HashMap<(u64, u64), Vec<(f64, i16)>> = HashMap::new();
+        for event in notes {
+            let seconds = seconds_of(event.track_id, event.tick);
+            match (event.kind, event.chain) {
+                (MidiEventKind::PitchBend, 0) => {
+                    dives.entry(event.track_id).or_default().push((seconds, event.bend));
+                }
+                (MidiEventKind::PitchBend, chain) => {
+                    bends.entry((event.track_id, chain)).or_default().push((seconds, event.bend));
+                }
+                (_, 0) => {}
+                (kind, chain) => {
+                    let entry = chains.entry((event.track_id, chain)).or_insert(Chain {
+                        parent: event.channel,
+                        on: f64::MAX,
+                        off: 0.0,
+                    });
+                    match kind {
+                        MidiEventKind::NoteOn => entry.on = entry.on.min(seconds),
+                        _ => entry.off = entry.off.max(seconds),
+                    }
+                }
+            }
+        }
+        for steps in dives.values_mut().chain(bends.values_mut()) {
+            steps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
+        // A chain already sounding at the start has no note to bend.
+        chains.retain(|_, chain| chain.on < f64::MAX && chain.on >= start_seconds);
+
+        let used: std::collections::HashSet<u8> =
+            project.tracks.iter().map(|track| track.channel.min(15)).collect();
+        let mut free_at: Vec<(u8, f64)> = (0..16_u8)
+            .filter(|channel| *channel != DRUM_CHANNEL && !used.contains(channel))
+            .map(|channel| (channel, f64::MIN))
+            .collect();
+        let mut order: Vec<(&(u64, u64), &Chain)> = chains.iter().collect();
+        order.sort_by(|a, b| a.1.on.total_cmp(&b.1.on));
+        let mut spare: HashMap<(u64, u64), u8> = HashMap::new();
+        for (key, chain) in order {
+            let slot = free_at
+                .iter_mut()
+                .filter(|slot| slot.1 <= chain.on)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some(slot) = slot {
+                spare.insert(*key, slot.0);
+                slot.1 = chain.off + SPARE_TAIL_SECONDS;
+            }
+        }
+
+        let mut events: Vec<Scheduled> = Vec::new();
+        let no_steps: Vec<(f64, i16)> = Vec::new();
+        for (key, chain) in &chains {
+            let Some(&channel) = spare.get(key) else {
+                continue;
+            };
+            events.push(Scheduled {
+                seconds: chain.on,
+                channel,
+                action: Action::Borrow { from: chain.parent },
+            });
+            let own = bends.get(key).unwrap_or(&no_steps);
+            let tremolo = dives.get(&key.0).unwrap_or(&no_steps);
+            let mut times: Vec<f64> = own.iter().map(|step| step.0).collect();
+            times.extend(tremolo.iter().map(|step| step.0).filter(|&at| at > chain.on && at < chain.off));
+            times.push(chain.on);
+            times.sort_by(f64::total_cmp);
+            times.dedup();
+            let mut last = None;
+            for at in times.into_iter().filter(|&at| at >= chain.on && at < chain.off.max(chain.on + 1e-6)) {
+                let wheel = wheel_at(own, at) + wheel_at(tremolo, at);
+                if last != Some(wheel) {
+                    events.push(wheel_event(at, channel, wheel));
+                    last = Some(wheel);
+                }
+            }
+        }
+
+        for track in &project.tracks {
+            let channel = track.channel.min(15);
+            let tremolo = dives.get(&track.id).unwrap_or(&no_steps);
+            let fallbacks: Vec<(&Chain, &Vec<(f64, i16)>)> = chains
+                .iter()
+                .filter(|(key, _)| key.0 == track.id && !spare.contains_key(*key))
+                .map(|(key, chain)| (chain, bends.get(key).unwrap_or(&no_steps)))
+                .collect();
+            if tremolo.is_empty() && fallbacks.is_empty() {
+                continue;
+            }
+            let mut times: Vec<f64> = tremolo.iter().map(|step| step.0).collect();
+            for (chain, steps) in &fallbacks {
+                times.extend(steps.iter().map(|step| step.0));
+                times.push(chain.off);
+            }
+            times.push(start_seconds);
+            times.sort_by(f64::total_cmp);
+            times.dedup();
+            let mut last = None;
+            for at in times.into_iter().filter(|&at| at >= start_seconds) {
+                let mut wheel = wheel_at(tremolo, at);
+                for (chain, steps) in &fallbacks {
+                    if chain.on <= at && at < chain.off {
+                        wheel += wheel_at(steps, at);
+                    }
+                }
+                if last.is_none() && wheel == 0 {
+                    last = Some(0);
+                    continue;
+                }
+                if last != Some(wheel) {
+                    events.push(wheel_event(at, channel, wheel));
+                    last = Some(wheel);
+                }
+            }
+        }
+        Self { spare, events }
+    }
+
+    /// The channel a note event goes to: its spare channel when it has one.
+    fn channel_of(&self, event: &MidiPlaybackEvent) -> u8 {
+        if event.chain == 0 {
+            return event.channel;
+        }
+        self.spare.get(&(event.track_id, event.chain)).copied().unwrap_or(event.channel)
     }
 }
 
@@ -742,6 +933,9 @@ impl AudioRuntime {
 /// reverb and chorus return.
 const SYNTH_GROUPS: u8 = 17;
 
+/// Value of the synth's pitch wheel at rest.
+const WHEEL_CENTER: u16 = 8192;
+
 /// The synth renders, and plug-ins run, in blocks of this many frames.
 const BLOCK: usize = 64;
 
@@ -895,6 +1089,14 @@ struct CallbackState {
     /// Instrument notes that were started and not yet ended, so a stop can
     /// end them.
     sounding: Vec<(u8, u8)>,
+    /// Bank and program each channel was last given.
+    channel_sound: [(u16, u8); 16],
+    /// For a spare channel playing a bent note: the track channel it was set
+    /// up from, whose chain its audio goes through.
+    spare_parent: [Option<u8>; 16],
+    /// A spare channel taken from an instrument plug-in's channel: its notes
+    /// go to that plug-in, which does not bend.
+    redirect: [Option<u8>; 16],
     block_left: [f32; BLOCK],
     block_right: [f32; BLOCK],
     block_pos: usize,
@@ -922,6 +1124,9 @@ impl CallbackState {
             channel_mix: [(100, 64); 16],
             notes: std::array::from_fn(|_| Vec::with_capacity(64)),
             sounding: Vec::with_capacity(256),
+            channel_sound: [(0, 0); 16],
+            spare_parent: [None; 16],
+            redirect: [None; 16],
             block_left: [0.0; BLOCK],
             block_right: [0.0; BLOCK],
             block_pos: BLOCK,
@@ -950,10 +1155,14 @@ impl CallbackState {
         }
     }
 
+    /// Ends every note and brings every pitch wheel back to its centre, set
+    /// to the range bends are written in.
     fn all_notes_off(&mut self) {
         if let Some(synth) = self.synth.as_mut() {
             for channel in 0..16 {
                 let _ = synth.send_event(MidiEvent::AllNotesOff { channel });
+                let _ = synth.set_pitch_wheel_sensitivity(channel, crate::core::pitch::WHEEL_RANGE_SEMITONES);
+                let _ = synth.send_event(MidiEvent::PitchBend { channel, value: WHEEL_CENTER });
             }
         }
     }
@@ -967,7 +1176,9 @@ impl CallbackState {
             }
         }
         for setup in setups {
-            self.channel_mix[usize::from(setup.channel.min(15))] = (setup.volume, setup.pan);
+            let channel = usize::from(setup.channel.min(15));
+            self.channel_mix[channel] = (setup.volume, setup.pan);
+            self.channel_sound[channel] = (setup.bank, setup.program);
         }
     }
 
@@ -999,6 +1210,8 @@ impl CallbackState {
                 } => {
                     self.all_notes_off();
                     self.end_instrument_notes();
+                    self.spare_parent = [None; 16];
+                    self.redirect = [None; 16];
                     self.apply_channels(&channels);
                     self.events = events;
                     self.next_event_index = 0;
@@ -1061,7 +1274,11 @@ impl CallbackState {
     }
 
     fn dispatch(&mut self, event: Scheduled, offset: u32) {
-        let channel = usize::from(event.channel.min(15));
+        let own = event.channel.min(15);
+        // A spare channel borrowed from an instrument plug-in's channel
+        // plays through that plug-in.
+        let target = self.redirect[usize::from(own)].unwrap_or(own);
+        let channel = usize::from(target);
         let instrument = self.instrument_channels[channel];
         match event.action {
             Action::NoteOn { key, velocity } => {
@@ -1079,7 +1296,7 @@ impl CallbackState {
                     }
                 } else if let Some(synth) = self.synth.as_mut() {
                     let _ = synth.send_event(MidiEvent::NoteOn {
-                        channel: event.channel,
+                        channel: target,
                         key,
                         vel: velocity,
                     });
@@ -1098,7 +1315,7 @@ impl CallbackState {
                     self.sounding.retain(|note| *note != held);
                 } else if let Some(synth) = self.synth.as_mut() {
                     let _ = synth.send_event(MidiEvent::NoteOff {
-                        channel: event.channel,
+                        channel: target,
                         key,
                     });
                 }
@@ -1106,17 +1323,63 @@ impl CallbackState {
             Action::Volume(value) => {
                 self.channel_mix[channel].0 = value;
                 self.send_controller(event.channel, 7, value);
+                self.send_to_spares(event.channel, 7, value);
             }
             Action::Pan(value) => {
                 self.channel_mix[channel].1 = value;
                 self.send_controller(event.channel, 10, value);
+                self.send_to_spares(event.channel, 10, value);
             }
             Action::Sound { bank, program } => {
+                self.channel_sound[channel] = (bank, program);
                 if let Some(synth) = self.synth.as_mut() {
                     for event in sound_events(event.channel, bank, program) {
                         let _ = synth.send_event(event);
                     }
                 }
+            }
+            Action::Bend(offset) => {
+                if self.redirect[usize::from(own)].is_none() {
+                    if let Some(synth) = self.synth.as_mut() {
+                        let _ = synth.send_event(MidiEvent::PitchBend {
+                            channel: own,
+                            value: (i32::from(WHEEL_CENTER) + i32::from(offset)) as u16,
+                        });
+                    }
+                }
+            }
+            Action::Borrow { from } => self.borrow_channel(own, from.min(15)),
+        }
+    }
+
+    /// Sets spare channel `spare` up as a copy of channel `from`.
+    fn borrow_channel(&mut self, spare: u8, from: u8) {
+        let index = usize::from(spare);
+        if self.instrument_channels[usize::from(from)] {
+            self.redirect[index] = Some(from);
+            return;
+        }
+        self.redirect[index] = None;
+        self.spare_parent[index] = Some(from);
+        let (bank, program) = self.channel_sound[usize::from(from)];
+        let (volume, pan) = self.channel_mix[usize::from(from)];
+        if let Some(synth) = self.synth.as_mut() {
+            for event in sound_events(spare, bank, program) {
+                let _ = synth.send_event(event);
+            }
+            for (ctrl, value) in [(7, volume), (10, pan)] {
+                let _ = synth.send_event(MidiEvent::ControlChange { channel: spare, ctrl, value });
+            }
+            let _ = synth.send_event(MidiEvent::PitchBend { channel: spare, value: WHEEL_CENTER });
+        }
+    }
+
+    /// Passes a volume or pan change of `parent` on to the spare channels
+    /// playing its bent notes.
+    fn send_to_spares(&mut self, parent: u8, ctrl: u8, value: u8) {
+        for spare in 0..16_u8 {
+            if self.spare_parent[usize::from(spare)] == Some(parent) {
+                self.send_controller(spare, ctrl, value);
             }
         }
     }
@@ -1147,12 +1410,26 @@ impl CallbackState {
                 synth.render_groups();
                 for channel in 0..16 {
                     let chain = &graph.channels[channel];
+                    // A spare channel's audio joins its track's channel below.
+                    if self.spare_parent[channel].is_some() {
+                        continue;
+                    }
                     let (mut dry_left, mut dry_right) = if self.instrument_channels[channel] {
                         // The soundfont stays out; the plug-in is the sound.
                         ([0.0_f32; BLOCK], [0.0_f32; BLOCK])
                     } else {
                         let (source_left, source_right) = synth.group_block(channel);
-                        (*source_left, *source_right)
+                        let (mut dry_left, mut dry_right) = (*source_left, *source_right);
+                        for spare in 0..16 {
+                            if self.spare_parent[spare] == Some(channel as u8) {
+                                let (spare_left, spare_right) = synth.group_block(spare);
+                                for index in 0..BLOCK {
+                                    dry_left[index] += spare_left[index];
+                                    dry_right[index] += spare_right[index];
+                                }
+                            }
+                        }
+                        (dry_left, dry_right)
                     };
                     run_chain(
                         chain,
@@ -1425,6 +1702,8 @@ mod tests {
             key: 60,
             velocity: 100,
             sound: None,
+            bend: 0,
+            chain: 0,
         }
     }
 
@@ -1527,6 +1806,8 @@ mod tests {
             key: 60,
             velocity: 100,
             sound,
+            bend: 0,
+            chain: 0,
         };
         let q = TICKS_PER_QUARTER;
         let notes = [
@@ -1633,6 +1914,176 @@ mod tests {
         };
         assert!(!volume_on(project.tracks[0].channel));
         assert!(volume_on(project.tracks[1].channel), "the shared curve still reaches the other track");
+    }
+
+    fn bent_note_project() -> (BwxProject, u64, u64) {
+        use crate::core::pitch::PitchEnvelope;
+        let mut project = BwxProject::demo();
+        project.tracks.truncate(1);
+        project.tracks[0].channel = 0;
+        let id = project.tracks[0].id;
+        project.tracks[0].notes.clear();
+        let note = project.insert_note(id, 0, TICKS_PER_QUARTER * 2, 0, 7).unwrap();
+        let track = project.track_mut(id).unwrap();
+        assert!(track.set_bend(note, Some(PitchEnvelope::bend(TICKS_PER_QUARTER * 2, 4))));
+        (project, id, note)
+    }
+
+    fn schedule_of(project: &BwxProject, track: u64) -> Schedule {
+        let events = crate::core::ShadowTimeline::compile_from_project(project);
+        build_schedule(project, &events, 0, track)
+    }
+
+    #[test]
+    fn a_bent_note_sounds_on_a_spare_channel_set_up_before_it_starts() {
+        let (project, id, _) = bent_note_project();
+        let schedule = schedule_of(&project, id);
+        let on = schedule
+            .events
+            .iter()
+            .find(|event| matches!(event.action, Action::NoteOn { .. }))
+            .unwrap();
+        assert_ne!(on.channel, 0);
+        assert_ne!(on.channel, DRUM_CHANNEL);
+        let borrow = schedule
+            .events
+            .iter()
+            .position(|event| event.channel == on.channel && event.action == Action::Borrow { from: 0 })
+            .expect("the spare is set up from the track's channel");
+        let note_on = schedule.events.iter().position(|event| event == on).unwrap();
+        assert!(borrow < note_on);
+        assert!(!schedule.events.iter().any(|event| event.channel == 0 && matches!(event.action, Action::NoteOff { .. })));
+        let bends: Vec<i16> = schedule
+            .events
+            .iter()
+            .filter(|event| event.channel == on.channel)
+            .filter_map(|event| match event.action {
+                Action::Bend(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bends.first(), Some(&0));
+        assert_eq!(bends.last(), Some(&crate::core::pitch::wheel_offset(4.0)));
+        assert!(
+            !schedule.events.iter().any(|event| event.channel == 0 && matches!(event.action, Action::Bend(_))),
+            "the track's own channel stays straight"
+        );
+    }
+
+    #[test]
+    fn a_flat_bend_needs_no_spare_channel() {
+        let (mut project, id, note) = bent_note_project();
+        let flat = crate::core::pitch::PitchEnvelope::new(vec![crate::core::pitch::PitchPoint::new(0, 0)]);
+        project.track_mut(id).unwrap().set_bend(note, Some(flat));
+        let schedule = schedule_of(&project, id);
+        assert!(schedule.events.iter().all(|event| event.channel == 0));
+    }
+
+    #[test]
+    fn the_tremolo_bar_moves_the_track_channel_and_adds_to_a_bend() {
+        use crate::core::pitch::{PitchEnvelope, wheel_offset};
+        let (mut project, id, _) = bent_note_project();
+        let dive_start = TICKS_PER_QUARTER * 4;
+        project.track_mut(id).unwrap().add_dive(dive_start, &PitchEnvelope::dive(TICKS_PER_QUARTER, 4)).unwrap();
+        let schedule = schedule_of(&project, id);
+        let on_track: Vec<i16> = schedule
+            .events
+            .iter()
+            .filter(|event| event.channel == 0)
+            .filter_map(|event| match event.action {
+                Action::Bend(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(on_track.iter().copied().min(), Some(wheel_offset(-4.0)));
+        assert_eq!(on_track.last(), Some(&0));
+
+        // A dive that plays under the bent note moves its spare channel too.
+        let (mut project, id, _) = bent_note_project();
+        project.track_mut(id).unwrap().add_dive(0, &PitchEnvelope::dive(TICKS_PER_QUARTER * 2, 2)).unwrap();
+        let schedule = schedule_of(&project, id);
+        let spare = schedule
+            .events
+            .iter()
+            .find_map(|event| matches!(event.action, Action::Borrow { .. }).then_some(event.channel))
+            .unwrap();
+        let on_spare: Vec<i16> = schedule
+            .events
+            .iter()
+            .filter(|event| event.channel == spare)
+            .filter_map(|event| match event.action {
+                Action::Bend(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert!(on_spare.iter().any(|&value| value != 0));
+        assert!(on_spare.len() > 3, "the dive adds its own moves: {on_spare:?}");
+    }
+
+    #[test]
+    fn with_no_spare_channel_left_the_track_channel_bends_and_is_reset() {
+        let (mut project, id, _) = bent_note_project();
+        // Every channel but the drum channel belongs to a track.
+        let template = project.tracks[0].clone();
+        for channel in 1..16_u8 {
+            let mut track = template.clone();
+            track.id = 100 + u64::from(channel);
+            track.channel = channel;
+            track.notes.clear();
+            project.tracks.push(track);
+        }
+        let schedule = schedule_of(&project, id);
+        assert!(schedule.events.iter().all(|event| !matches!(event.action, Action::Borrow { .. })));
+        let bends: Vec<(f64, i16)> = schedule
+            .events
+            .iter()
+            .filter(|event| event.channel == 0)
+            .filter_map(|event| match event.action {
+                Action::Bend(value) => Some((event.seconds, value)),
+                _ => None,
+            })
+            .collect();
+        assert!(bends.iter().any(|&(_, value)| value != 0));
+        assert_eq!(bends.last().map(|bend| bend.1), Some(0), "released with the note");
+    }
+
+    #[test]
+    fn two_bent_notes_at_once_get_different_spare_channels() {
+        let (mut project, id, _) = bent_note_project();
+        let second = project.insert_note(id, 0, TICKS_PER_QUARTER * 2, 1, 7).unwrap();
+        project
+            .track_mut(id)
+            .unwrap()
+            .set_bend(second, Some(crate::core::pitch::PitchEnvelope::pre_bend(TICKS_PER_QUARTER * 2, 2)));
+        let schedule = schedule_of(&project, id);
+        let mut spares: Vec<u8> = schedule
+            .events
+            .iter()
+            .filter(|event| matches!(event.action, Action::Borrow { .. }))
+            .map(|event| event.channel)
+            .collect();
+        spares.sort_unstable();
+        spares.dedup();
+        assert_eq!(spares.len(), 2);
+    }
+
+    #[test]
+    fn a_spare_channel_is_reused_once_its_note_has_rung_out() {
+        let (mut project, id, _) = bent_note_project();
+        let later = TICKS_PER_QUARTER * 16;
+        let second = project.insert_note(id, later, TICKS_PER_QUARTER, 1, 7).unwrap();
+        project
+            .track_mut(id)
+            .unwrap()
+            .set_bend(second, Some(crate::core::pitch::PitchEnvelope::bend(TICKS_PER_QUARTER, 4)));
+        let schedule = schedule_of(&project, id);
+        let borrows: Vec<(f64, u8)> = schedule
+            .events
+            .iter()
+            .filter(|event| matches!(event.action, Action::Borrow { .. }))
+            .map(|event| (event.seconds, event.channel))
+            .collect();
+        assert_eq!(borrows.len(), 2);
     }
 
     fn two_track_project() -> BwxProject {

@@ -94,6 +94,9 @@ pub struct ImportedTrack {
     /// The beats of the first voice that sit in a tuplet; the project's
     /// tuplet spans are made from them.
     pub tuplet_beats: Vec<TupletBeat>,
+    /// Tremolo bar movements the file keeps per note or beat, each as
+    /// (start, envelope counted from it).
+    pub dives: Vec<(Tick, crate::core::pitch::PitchEnvelope)>,
 }
 
 impl ImportedTrack {
@@ -113,6 +116,7 @@ impl ImportedTrack {
             notes: Vec::new(),
             texts: Vec::new(),
             tuplet_beats: Vec::new(),
+            dives: Vec::new(),
         }
     }
 }
@@ -218,6 +222,7 @@ impl ImportedSong {
                 pan_points: Vec::new(),
                 tuplets: Vec::new(),
                 annotations: Vec::new(),
+                tremolo_bar: Vec::new(),
             };
             for (bar, &start) in self.bars.iter().zip(&starts) {
                 if bar.repeat_open {
@@ -245,6 +250,8 @@ impl ImportedSong {
             }
             track.sort_notes();
             track.adopt_tuplets(&spans_from_beats(&imported.tuplet_beats));
+            track.gather_chain_bends();
+            track.adopt_dives(imported.dives.clone());
             for (tick, text) in &imported.texts {
                 if (0..end).contains(tick) {
                     track.set_annotation(*tick, text);

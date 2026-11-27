@@ -12,6 +12,8 @@ mod import_midi;
 mod import_musescore;
 pub mod midi;
 pub mod musescore;
+#[cfg(test)]
+mod pitch_tests;
 pub mod score;
 pub mod tuxguitar;
 pub mod xml;

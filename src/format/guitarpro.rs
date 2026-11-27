@@ -7,7 +7,7 @@ use std::io::{Cursor, Write};
 
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::core::{BwxProject, sounds::midi_pan};
+use crate::core::{BwxProject, pitch::PitchEnvelope, sounds::midi_pan};
 
 use super::{
     FormatError,
@@ -469,8 +469,12 @@ impl Ids {
                     }
                     let slap = beat.notes.iter().any(|note| note.effects.slapping);
                     let pop = beat.notes.iter().any(|note| note.effects.popping);
-                    if slap || pop {
+                    let whammy = beat.notes.iter().find_map(|note| note.tremolo.as_ref());
+                    if slap || pop || whammy.is_some() {
                         beats.open("Properties");
+                        if let Some(whammy) = whammy {
+                            write_pitch_properties(&mut beats, "WhammyBar", "WhammyBar", whammy);
+                        }
                         if slap {
                             beats.property("Slapped", "Enable", None);
                         }
@@ -512,6 +516,27 @@ impl Ids {
             rhythms: rhythm_xml.out,
         }
     }
+}
+
+/// Guitar Pro counts a bend in hundredths of a whole tone: 25 to a quarter tone.
+pub(super) const GP_QUARTER_TONE: f32 = 25.0;
+
+/// Writes a bend (`prefix` Bend, `enable` Bended) or the beat's whammy bar
+/// (`prefix` WhammyBar, `enable` WhammyBar) the way Guitar Pro keeps either:
+/// an origin, a destination and one pitch held in between.
+fn write_pitch_properties(xml: &mut Xml, prefix: &str, enable: &str, envelope: &PitchEnvelope) {
+    let shape = envelope.plateau(envelope.length());
+    let float = |value: f32| Some(format!("{value}"));
+    xml.property(enable, "Enable", None);
+    xml.property(&format!("{prefix}OriginValue"), "Float", float(f32::from(shape.origin) * GP_QUARTER_TONE));
+    xml.property(&format!("{prefix}OriginOffset"), "Float", float(0.0));
+    if let Some((value, from, to)) = shape.middle {
+        xml.property(&format!("{prefix}MiddleValue"), "Float", float(f32::from(value) * GP_QUARTER_TONE));
+        xml.property(&format!("{prefix}MiddleOffset1"), "Float", float(from as f32));
+        xml.property(&format!("{prefix}MiddleOffset2"), "Float", float(to as f32));
+    }
+    xml.property(&format!("{prefix}DestinationValue"), "Float", float(f32::from(shape.destination) * GP_QUARTER_TONE));
+    xml.property(&format!("{prefix}DestinationOffset"), "Float", float(100.0));
 }
 
 fn on_string(beat: Option<&ExportBeat>, string_index: usize) -> Option<&ExportNote> {
@@ -569,6 +594,9 @@ fn write_note(
     }
     if effects.slide {
         xml.property("Slide", "Flags", Some("1".to_owned()));
+    }
+    if let Some(bend) = &effects.bend {
+        write_pitch_properties(xml, "Bend", "Bended", bend);
     }
     xml.close("Properties");
     if effects.ghost {

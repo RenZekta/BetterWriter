@@ -7,6 +7,7 @@ pub mod ghost;
 pub mod instruments;
 pub mod keyboard_entry;
 pub mod length;
+pub mod pitch;
 pub mod project;
 pub mod shadow;
 pub mod smf;

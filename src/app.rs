@@ -34,6 +34,7 @@ use crate::{
 
 mod floating;
 mod fx_chain;
+mod pitch_editor;
 mod sound_picker;
 mod system_clipboard;
 mod timeline;
@@ -762,6 +763,8 @@ pub struct BetterWriterApp {
     recent_projects: Vec<PathBuf>,
     new_project_dialog: Option<NewProjectDraft>,
     automation_editor: Option<AutomationEditorState>,
+    /// The window editing one bend or one dive of the tremolo bar.
+    pitch_editor: Option<pitch_editor::PitchEditor>,
     /// Live text in the Start Menu's "Search" box; re-sorts (doesn't filter)
     /// the recent-projects list while non-empty.
     start_menu_search: String,
@@ -868,6 +871,7 @@ impl BetterWriterApp {
             recent_projects: load_recent_projects(),
             new_project_dialog: None,
             automation_editor: None,
+            pitch_editor: None,
             start_menu_search: String::new(),
         }
     }
@@ -2152,6 +2156,9 @@ impl BetterWriterApp {
                 ) {
                     self.status.push_str(" (this format does not keep the automatic sound or plug-ins)");
                 }
+                if let Some(note) = pitch_envelope_note(path, &self.project) {
+                    self.status.push_str(note);
+                }
                 self.remember_recent_project(path);
             }
             Err(err) => self.status = format!("Save failed: {err}"),
@@ -2184,7 +2191,7 @@ impl BetterWriterApp {
             return;
         };
         self.status = match format::export_project(&path, &self.project) {
-            Ok(()) => format!("Exported {}", path.display()),
+            Ok(()) => format!("Exported {}{}", path.display(), pitch_envelope_note(&path, &self.project).unwrap_or("")),
             Err(err) => format!("Export failed: {err}"),
         };
     }
@@ -3446,6 +3453,14 @@ impl BetterWriterApp {
                 self.toggle_tie_on_selection();
                 changed = true;
             }
+            if i.key_pressed(egui::Key::B) && !i.modifiers.command && !i.modifiers.shift && !i.modifiers.alt {
+                self.open_bend_editor();
+                changed = true;
+            }
+            if i.key_pressed(egui::Key::W) && i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt {
+                self.open_tremolo_editor();
+                changed = true;
+            }
 
             // Clear pending fret
             if i.key_pressed(egui::Key::Escape) {
@@ -3594,6 +3609,7 @@ impl eframe::App for BetterWriterApp {
         self.show_import_report(root.ctx());
         self.show_annotation_editor(root.ctx());
         self.show_tuplet_dialog(root.ctx());
+        self.show_pitch_editor(root.ctx());
         self.wake_windows_after_input(root.ctx());
     }
 }
@@ -5167,14 +5183,46 @@ impl BetterWriterApp {
                     });
                 }
                 palette_row(ui, |ui| {
-                    for (icon, name) in [
-                        (PaletteIcon::Bend, "Bend"),
-                        (PaletteIcon::Harmonic, "Harmonic"),
-                        (PaletteIcon::Trill, "Trill"),
-                        (PaletteIcon::Grace, "Grace note"),
-                        (PaletteIcon::TremoloBar, "Tremolo bar"),
-                    ] {
-                        planned_palette_button(ui, &theme, icon, name);
+                    let bent = self
+                        .selected_note_ids()
+                        .first()
+                        .and_then(|id| {
+                            let track = self.project.track(self.selected_track_id)?;
+                            let note = track.notes.iter().find(|note| note.id == *id)?;
+                            Some(track.chain_head(note).effects.bend.is_some())
+                        })
+                        .unwrap_or(false);
+                    let bend = palette_button(
+                        ui,
+                        &theme,
+                        PaletteIcon::Bend,
+                        bent,
+                        true,
+                        "Bend: click for a full bend on the selected notes, right-click for the bend window (B)",
+                    );
+                    if bend.secondary_clicked() {
+                        self.open_bend_editor();
+                    } else if bend.clicked() {
+                        self.toggle_default_bend();
+                    }
+                    planned_palette_button(ui, &theme, PaletteIcon::Harmonic, "Harmonic");
+                    planned_palette_button(ui, &theme, PaletteIcon::Trill, "Trill");
+                    planned_palette_button(ui, &theme, PaletteIcon::Grace, "Grace note");
+                    let dived = self
+                        .project
+                        .track(self.selected_track_id)
+                        .is_some_and(|track| track.dive_at(self.cursor.tick.max(0)).is_some());
+                    if palette_button(
+                        ui,
+                        &theme,
+                        PaletteIcon::TremoloBar,
+                        dived,
+                        true,
+                        "Tremolo bar: the dive at the cursor, or a new one (Shift+W)",
+                    )
+                    .clicked()
+                    {
+                        self.open_tremolo_editor();
                     }
                 });
                 palette_separator(ui, &theme);
@@ -6760,9 +6808,15 @@ impl BetterWriterApp {
                 planned_menu_item(ui, "Palm Mute on Beat  (Shift+P)");
                 planned_menu_item(ui, "Pick Scrape Out Downwards");
                 planned_menu_item(ui, "Pick Scrape Out Upwards");
-                planned_menu_item(ui, "Bend...  (B)");
+                if ui.button("Bend...  (B)").clicked() {
+                    self.open_bend_editor();
+                    ui.close();
+                }
                 self.effect_checkbox(ui, EffectKind::Slide, "Slide");
-                planned_menu_item(ui, "Tremolo Bar...  (Shift+W)");
+                if ui.button("Tremolo Bar...  (Shift+W)").clicked() {
+                    self.open_tremolo_editor();
+                    ui.close();
+                }
                 self.effect_checkbox(ui, EffectKind::Vibrato, "Vibrato");
                 planned_menu_item(ui, "Vibrato w/ Trem. Bar");
                 planned_menu_item(ui, "Natural Harmonic  (Y)");
@@ -7484,6 +7538,7 @@ impl BetterWriterApp {
             self.paint_tempo_labels(painter, left, label_baseline, system, track.id);
             self.paint_annotations(painter, left, label_baseline - 25.0, system, track);
             self.paint_tuplet_brackets(painter, left, tab_y - 5.0, system, track);
+            self.paint_pitch_envelopes(painter, left, tab_y - 8.0, system, track);
             if stacked {
                 painter.text(
                     Pos2::new(left + 2.0, top + 2.0),
@@ -10164,6 +10219,21 @@ fn wheel_notches(input: &egui::InputState, carry: &mut f32) -> i32 {
 
 /// Lets the mouse wheel step a number box the pointer is over, one step per
 /// notch.
+/// What a file format does to the project's bends and tremolo bar dives, as a
+/// note for the status line; `None` when the project has none or the format
+/// keeps them whole.
+fn pitch_envelope_note(path: &Path, project: &BwxProject) -> Option<&'static str> {
+    if !project.tracks.iter().any(InstrumentTrack::has_pitch_envelopes) {
+        return None;
+    }
+    match path.extension().and_then(|ext| ext.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("tg") => Some(" (bends and the tremolo bar are kept as straight lines on a 12-step grid; a bend cannot go below the note)"),
+        Some("gp") => Some(" (a bend or dive keeps its start, one held pitch and its end; other points and curves are dropped)"),
+        Some("mid") => Some(" (the pitch wheel moves every note of the track at once)"),
+        _ => None,
+    }
+}
+
 fn wheel_step(ui: &egui::Ui, response: &egui::Response, value: &mut i32, min: i32, max: i32) {
     if !response.hovered() || response.dragged() {
         return;

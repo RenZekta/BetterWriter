@@ -1927,7 +1927,7 @@ right-click submenus and the move / stretch drag previews.
       see below).
       Not tried with a real plug-in; the logic is not covered by a test.
 
-### 9. Bends and tremolo bar (designed, not built)
+### 9. Bends and tremolo bar (built 26.11.2026, gaps listed there)
 - [ ] One shared pitch envelope: points `{time, semitones in quarter-tone
       steps, curve -1..1 for the segment leading into the point}`, snapped
       to the grid, edited in brick view (double-click adds a point, scroll
@@ -2038,7 +2038,8 @@ right-click submenus and the move / stretch drag previews.
       triplet eighths. Not done: the file formats did not write or read
       tuplets yet (done 23.11.2026, item 2), and there is no "remove tuplet"
       command beyond overwriting its notes with ordinary ones.
-- [ ] Bends and tremolo bar: not started (see 21.11.2026 section 9).
+- [x] Bends and tremolo bar: built 26.11.2026 (item 1), without editing on the
+      drawn curve.
 
 ### 2b. Later the same day
 - [x] The fretboard follows the loops: while playing it showed the notes
@@ -2269,6 +2270,74 @@ right-click submenus and the move / stretch drag previews.
 
 ---
 
+## 26.11.2026 ✅ Implemented / Fixed this pass
+
+### 1. Bends and the tremolo bar (21.11.2026, item 9)
+- [x] One pitch envelope (`core/pitch.rs`): points `{time, quarter tones,
+      curve -100..100 for the segment leading into the point}`, integers
+      only so `NoteEffects` stays `Eq`. Presets (bend, bend-release,
+      pre-bend, pre-bend-release, dive), cutting to a length, windows and
+      the 13-position grid the file formats use are tested.
+- [x] Bend: `NoteEffects::bend` on the first note of a tied chain, times
+      counted from its start and cut to the chain (`set_bend`,
+      `sounding_end`, `chain_head`). Tab view cutting the note at a barline
+      and brick view merging it back keep the envelope. Palette button:
+      left-click writes a full bend on the selected notes (or removes it
+      when all have one), right-click opens the window; also Effects >
+      Bend... and `B`. A curve with its size ("full", "1/2") is drawn above
+      the tab line for each bent note.
+- [x] Tremolo bar: `InstrumentTrack::tremolo_bar`, dives that do not
+      overlap, each starting and ending at 0. They follow bar insert,
+      delete and move, and play again on repeats. Palette button, Effects >
+      Tremolo Bar... and `Shift+W` open the window on the dive at the
+      cursor or on a new one there; drawn as a curve hanging above the tab.
+- [x] Pitch window (`app/pitch_editor.rs`): presets with a size, a graph
+      with draggable points on a sixteenth grid, double-click to add, right
+      click or Delete to remove, scroll over a point to curve the segment
+      before it, fields for the selected point's time, pitch and curve, the
+      start and length of a dive. Apply writes it as one undo step.
+- [x] Playback: a bent note sounds on a spare channel (not a track's, not
+      the drum channel) set up as a copy of its track's channel (sound,
+      volume, pan, and later volume and pan changes), and its audio joins the
+      track's plug-in chain. The tremolo bar moves the track's channel and
+      is added to the bend on the spare channels. With no channel free the
+      track's own channel bends instead. The synth's wheel range is 12
+      semitones. On an instrument plug-in channel the note plays unbent.
+- [x] Formats. TuxGuitar: bends and tremolo bar points are read and
+      written (positions 0 to 12 across the note, bends in quarter tones,
+      tremolo bar in semitones); a tied chain is written per beat and read
+      back onto its first note; the tremolo bar goes on the first note of
+      each beat it passes through. Guitar Pro (`.gp`): the `Bended`, `Bend*`
+      and `WhammyBar*` properties, which keep an origin, a destination and
+      one held pitch in between, so other points and curves are dropped.
+      MIDI: pitch wheel messages on the track's channel after a range
+      setting (the wheel moves every note of the track). `.mscz` keeps both
+      exactly in its extras. The status line says what a format flattens.
+- [ ] Not done: editing in the score itself (double-click, scroll and drag
+      on the drawn curve, creating a dive by dragging a range on its own
+      row, a pitch strip above bricks); only the window and the default
+      full bend exist. Bends are not read from MIDI or MuseScore files, a
+      bend cannot go below the note in TuxGuitar (clamped), and the
+      "Vibrato w/ Trem. Bar" menu entry is still planned. A bend or dive
+      is not audible in a plug-in instrument.
+- [x] Checked in a running app (virtual display): the full bend appears with
+      its "full" label, the bend window opens from the palette with the
+      right title, a preset and a double-click added point show in the
+      graph and the point fields, the tremolo window opens at the cursor,
+      and an applied dive is drawn with "-full". Not tried: mouse dragging of
+      points and scrolling to curve (an automated drag did not register),
+      any sound (no audio device), opening the written `.tg`, `.gp` and
+      `.mid` in the real programs. The TuxGuitar byte layout and units were
+      read from its source and the Guitar Pro property names from alphaTab's
+      reader; the round trips are tested against our own reader only.
+
+### 2. Build and tests
+- [x] `cargo test`: 500 passed, 3 ignored. `cargo check --all-targets`: only
+      the 3 warnings that were already there (and the unused `wmidi`
+      dependency). `Cargo.toml` and `Cargo.lock` did not change.
+
+---
+
 ## 🚧 Not yet done / future work
 
 ### Current issues:
@@ -2282,6 +2351,8 @@ right-click submenus and the move / stretch drag previews.
       equivalent for *stretching* a note's edges across strings (stretching
       only ever changes duration/start on the note's current string) — not
       requested, just noting the asymmetry. Dev note: that's called BENDING.
+      Bends exist since 26.11.2026 but are set in a window, not by stretching
+      a brick across strings.
 - [ ] Playback tempo ramps (`Progressive` transition) are approximated by a
       flat average-bpm segment for audio scheduling (tempo, per track or
       shared); the automation graph

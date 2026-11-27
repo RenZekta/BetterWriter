@@ -2,12 +2,14 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use super::project::{BwxProject, InstrumentTrack, TabNote, Tick};
+use super::project::{BwxProject, InstrumentFamily, InstrumentTrack, TabNote, Tick};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MidiEventKind {
     NoteOn,
     NoteOff,
+    /// Moves the pitch wheel to `bend`.
+    PitchBend,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,6 +22,13 @@ pub struct MidiPlaybackEvent {
     pub velocity: u8,
     /// Preset the note sounds with when it is not the track's usual one.
     pub sound: Option<(u16, u8)>,
+    /// Offset from the pitch wheel's centre; only `PitchBend` events use it.
+    pub bend: i16,
+    /// Id of the bent note a note event or a pitch bend belongs to, so the
+    /// note can sound on a channel of its own while the bend moves it; 0 for
+    /// notes that do not bend and for the tremolo bar, which moves the whole
+    /// track.
+    pub chain: u64,
 }
 
 #[derive(Clone, Default)]
@@ -47,8 +56,16 @@ fn compile_track(written: &InstrumentTrack, events: &mut Vec<MidiPlaybackEvent>)
     };
     let is_continuation = |note: &TabNote| continuations.iter().any(|c| c.id == note.id);
 
+    let bends = track.instrument_family != InstrumentFamily::Drums;
     for note in &track.notes {
         let key = track.midi_key_for(note);
+        let head = track.chain_head(note);
+        let bend = head
+            .effects
+            .bend
+            .as_ref()
+            .filter(|envelope| bends && !envelope.is_flat());
+        let chain = bend.map_or(0, |_| head.id);
         if !is_continuation(note) {
             events.push(MidiPlaybackEvent {
                 tick: note.abs_tick,
@@ -58,7 +75,17 @@ fn compile_track(written: &InstrumentTrack, events: &mut Vec<MidiPlaybackEvent>)
                 key,
                 velocity: note.velocity,
                 sound: track.note_sound(note),
+                bend: 0,
+                chain,
             });
+            if let Some(envelope) = bend {
+                let end = track.sounding_end(note);
+                for (offset, wheel) in envelope.wheel_steps(0, end - note.abs_tick) {
+                    if note.abs_tick + offset < end {
+                        events.push(pitch_bend(track, note.abs_tick + offset, wheel, chain));
+                    }
+                }
+            }
         }
         if !is_continued(note) {
             events.push(MidiPlaybackEvent {
@@ -69,16 +96,41 @@ fn compile_track(written: &InstrumentTrack, events: &mut Vec<MidiPlaybackEvent>)
                 key,
                 velocity: 0,
                 sound: None,
+                bend: 0,
+                chain,
             });
         }
+    }
+
+    for dive in &track.tremolo_bar {
+        for (offset, wheel) in dive.envelope.wheel_steps(0, dive.envelope.length()) {
+            events.push(pitch_bend(track, dive.start + offset, wheel, 0));
+        }
+    }
+}
+
+fn pitch_bend(track: &InstrumentTrack, tick: Tick, bend: i16, chain: u64) -> MidiPlaybackEvent {
+    MidiPlaybackEvent {
+        tick,
+        kind: MidiEventKind::PitchBend,
+        track_id: track.id,
+        channel: track.channel,
+        key: 0,
+        velocity: 0,
+        sound: None,
+        bend,
+        chain,
     }
 }
 
 fn sort_events(events: &mut [MidiPlaybackEvent]) {
     events.sort_by_key(|event| {
+        // A bend lands before the note it belongs to, so a pre-bent note is
+        // struck already bent.
         let off_first = match event.kind {
             MidiEventKind::NoteOff => 0,
-            MidiEventKind::NoteOn => 1,
+            MidiEventKind::PitchBend => 1,
+            MidiEventKind::NoteOn => 2,
         };
         (event.tick, off_first, event.channel, event.key)
     });

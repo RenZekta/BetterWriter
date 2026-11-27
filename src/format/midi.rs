@@ -161,9 +161,63 @@ fn instrument_events(track: &InstrumentTrack) -> Vec<Event> {
     events.push(channel_message(0, 0, 0xc0 | channel, program.min(127), None));
 
     let played = track.unrolled_for_playback();
-    for (start, stop, key, velocity) in sounding_notes(played.as_ref().unwrap_or(track)) {
+    let played = played.as_ref().unwrap_or(track);
+    for (start, stop, key, velocity) in sounding_notes(played) {
         events.push(channel_message(start, 2, 0x90 | channel, key, Some(velocity)));
         events.push(channel_message(stop, 1, 0x80 | channel, key, Some(0)));
+    }
+    events.extend(pitch_bend_events(played, channel));
+    events
+}
+
+/// A pitch wheel message: `offset` from the wheel's centre.
+fn pitch_wheel(tick: Tick, order: u8, channel: u8, offset: i16) -> Event {
+    let value = (8192 + i32::from(offset)).clamp(0, 16383) as u16;
+    channel_message(tick, order, 0xe0 | channel, (value & 0x7f) as u8, Some((value >> 7) as u8))
+}
+
+/// The bends of a track's notes and the dives of its tremolo bar as pitch
+/// wheel messages, after a registered parameter message that sets the wheel's
+/// range. The wheel bends every note of the channel, so notes that sound
+/// together move together; that is all a MIDI file can say.
+fn pitch_bend_events(track: &InstrumentTrack, channel: u8) -> Vec<Event> {
+    let mut events = Vec::new();
+    let bent: Vec<_> = track
+        .notes
+        .iter()
+        .filter(|note| !track.is_tied_continuation(note))
+        .filter_map(|note| {
+            let bend = note.effects.bend.as_ref().filter(|bend| !bend.is_flat())?;
+            Some((note, bend))
+        })
+        .collect();
+    if bent.is_empty() && track.tremolo_bar.is_empty() {
+        return events;
+    }
+    for (controller, value) in [
+        (101, 0),
+        (100, 0),
+        (6, crate::core::pitch::WHEEL_RANGE_SEMITONES),
+        (38, 0),
+        (101, 127),
+        (100, 127),
+    ] {
+        events.push(channel_message(0, 0, 0xb0 | channel, controller, Some(value)));
+    }
+    for (note, bend) in bent {
+        let end = track.sounding_end(note);
+        for (offset, wheel) in bend.wheel_steps(0, end - note.abs_tick) {
+            if note.abs_tick + offset < end {
+                events.push(pitch_wheel(note.abs_tick + offset, 0, channel, wheel));
+            }
+        }
+        let resting = crate::core::pitch::wheel_offset(track.tremolo_at(end));
+        events.push(pitch_wheel(end, 1, channel, resting));
+    }
+    for dive in &track.tremolo_bar {
+        for (offset, wheel) in dive.envelope.wheel_steps(0, dive.envelope.length()) {
+            events.push(pitch_wheel(dive.start + offset, 0, channel, wheel));
+        }
     }
     events
 }

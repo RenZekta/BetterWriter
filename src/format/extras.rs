@@ -7,8 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::{
-    BwxProject,
+    BwxProject, Tick,
     instruments,
+    pitch::{PitchEnvelope, TremoloDive},
     project::SoundChainSlot,
     sounds::variant_for_instrument,
 };
@@ -21,6 +22,13 @@ struct TrackExtras {
     sound_auto: bool,
     sound_chain: Vec<SoundChainSlot>,
     fx_bypassed: bool,
+    /// Bends, by the start and string of the note that carries them: the
+    /// file has no bend that holds a smooth curve.
+    #[serde(default)]
+    bends: Vec<(Tick, usize, PitchEnvelope)>,
+    /// The tremolo bar's dives.
+    #[serde(default)]
+    dives: Vec<TremoloDive>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -77,6 +85,12 @@ pub(super) fn encode(project: &BwxProject) -> Result<String, FormatError> {
                 sound_auto: track.sound_auto,
                 sound_chain: track.sound_chain.clone(),
                 fx_bypassed: track.fx_bypassed,
+                bends: track
+                    .notes
+                    .iter()
+                    .filter_map(|note| Some((note.abs_tick, note.string_index, note.effects.bend.clone()?)))
+                    .collect(),
+                dives: track.tremolo_bar.clone(),
             })
             .collect(),
         master_chain: project.master_chain.clone(),
@@ -102,6 +116,15 @@ pub(super) fn apply(project: &mut BwxProject, text: &str) {
         }
         track.sound_chain = saved.sound_chain.clone();
         track.fx_bypassed = saved.fx_bypassed;
+        for (tick, string, envelope) in &saved.bends {
+            let note = track.notes.iter().find(|note| note.abs_tick == *tick && note.string_index == *string);
+            if let Some(id) = note.map(|note| note.id) {
+                track.set_bend(id, Some(envelope.clone()));
+            }
+        }
+        for dive in &saved.dives {
+            track.add_dive(dive.start, &dive.envelope);
+        }
     }
     project.master_chain = extras.master_chain;
     project.master_fx_bypassed = extras.master_fx_bypassed;
@@ -121,6 +144,29 @@ mod tests {
         }
         assert_eq!(base64_encode(b"Man"), "TWFu");
         assert_eq!(base64_encode(b"Ma"), "TWE=");
+    }
+
+    #[test]
+    fn bends_and_dives_come_back_onto_the_tracks() {
+        use crate::core::{TICKS_PER_QUARTER as Q, pitch::PitchEnvelope};
+        let mut project = score::aligned_demo();
+        let id = project.tracks[0].id;
+        project.tracks[0].notes.clear();
+        project.tracks[0].tremolo_bar.clear();
+        let note = project.insert_note(id, Q, Q * 2, 1, 5).unwrap();
+        let track = project.track_mut(id).unwrap();
+        track.set_bend(note, Some(PitchEnvelope::bend_release(Q * 2, 4)));
+        track.add_dive(Q * 4, &PitchEnvelope::dive(Q, 6)).unwrap();
+        let text = encode(&project).unwrap();
+
+        let mut other = score::aligned_demo();
+        other.tracks[0].notes.clear();
+        other.tracks[0].tremolo_bar.clear();
+        let id = other.tracks[0].id;
+        other.insert_note(id, Q, Q * 2, 1, 5).unwrap();
+        apply(&mut other, &text);
+        assert_eq!(other.tracks[0].notes[0].effects.bend, project.tracks[0].notes[0].effects.bend);
+        assert_eq!(other.tracks[0].tremolo_bar, project.tracks[0].tremolo_bar);
     }
 
     #[test]

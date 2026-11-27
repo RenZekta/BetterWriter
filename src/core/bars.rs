@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::annotations::TextAnnotation;
+use super::pitch::TremoloDive;
 use super::tuplets::TupletSpan;
 use super::project::{
     BarMark, BwxProject, InstrumentTrack, TabNote, TimeSignature, TimeSignatureChange, Tick,
@@ -285,6 +286,15 @@ impl InstrumentTrack {
         }
         let mut track = self.clone();
         track.notes = notes;
+        track.tremolo_bar = bars
+            .iter()
+            .flat_map(|(bar, span)| {
+                self.tremolo_bar
+                    .iter()
+                    .filter(|dive| dive.start >= span.start && dive.start < span.end)
+                    .map(|dive| TremoloDive { start: bar.start + (dive.start - span.start), ..dive.clone() })
+            })
+            .collect();
         track.sort_notes();
         Some(Unrolled { track, origins, bars })
     }
@@ -460,6 +470,7 @@ struct BarContent {
     /// Tuplet spans and texts of the bar, relative to its start.
     tuplets: Vec<TupletSpan>,
     texts: Vec<TextAnnotation>,
+    dives: Vec<TremoloDive>,
     mark: BarMark,
     origin: BarRef,
     old_previous: Option<BarRef>,
@@ -507,6 +518,12 @@ fn lift_bars(track: &InstrumentTrack) -> Vec<BarContent> {
                 .filter(|text| text.tick >= span.start && text.tick < span.end)
                 .map(|text| TextAnnotation { tick: text.tick - span.start, ..text.clone() })
                 .collect(),
+            dives: track
+                .tremolo_bar
+                .iter()
+                .filter(|dive| dive.start >= span.start && dive.start < span.end)
+                .map(|dive| TremoloDive { start: dive.start - span.start, ..dive.clone() })
+                .collect(),
             mark: track.bar_mark_at(span.start),
             origin: BarRef {
                 track_id: track.id,
@@ -540,6 +557,7 @@ fn rebuild_track(track: &mut InstrumentTrack, bars: Vec<BarContent>) {
     let mut notes = Vec::new();
     let mut tuplets = Vec::new();
     let mut texts = Vec::new();
+    let mut dives: Vec<TremoloDive> = Vec::new();
     let mut changes: Vec<TimeSignatureChange> = Vec::new();
     let mut marks = Vec::new();
     let mut previous: Option<(TimeSignature, bool)> = None;
@@ -562,6 +580,12 @@ fn rebuild_track(track: &mut InstrumentTrack, bars: Vec<BarContent>) {
         }
         tuplets.extend(bar.tuplets.iter().map(|tuplet| TupletSpan { start: tuplet.start + start, ..*tuplet }));
         texts.extend(bar.texts.iter().map(|text| TextAnnotation { tick: text.tick + start, ..text.clone() }));
+        for dive in &bar.dives {
+            // A dive that would run into the one before it is dropped.
+            if dives.last().is_none_or(|last| last.end() <= dive.start + start) {
+                dives.push(TremoloDive { start: dive.start + start, ..dive.clone() });
+            }
+        }
         if !bar.mark.is_empty() {
             marks.push(BarMark {
                 at_tick: start,
@@ -576,6 +600,7 @@ fn rebuild_track(track: &mut InstrumentTrack, bars: Vec<BarContent>) {
     track.bar_marks = marks;
     track.tuplets = tuplets;
     track.annotations = texts;
+    track.tremolo_bar = dives;
     track.sort_notes();
 }
 
@@ -660,6 +685,7 @@ impl BwxProject {
                     notes: Vec::new(),
                     tuplets: Vec::new(),
                     texts: Vec::new(),
+                    dives: Vec::new(),
                     mark: BarMark::default(),
                     origin: BarRef { track_id, bar: usize::MAX },
                     old_previous: None,

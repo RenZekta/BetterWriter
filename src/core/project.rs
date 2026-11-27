@@ -126,6 +126,10 @@ pub struct NoteEffects {
     pub slapping: bool,
     pub popping: bool,
     pub fade_in: bool,
+    /// Pitch envelope of the note's whole tied chain, times counted from the
+    /// note's start. Only the first note of a chain carries it.
+    #[serde(default)]
+    pub bend: Option<super::pitch::PitchEnvelope>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -465,6 +469,9 @@ pub struct InstrumentTrack {
     /// Text written above the score; see `core::annotations`.
     #[serde(default)]
     pub annotations: Vec<super::annotations::TextAnnotation>,
+    /// The tremolo bar's dives, in order and apart; see `core::pitch`.
+    #[serde(default)]
+    pub tremolo_bar: Vec<super::pitch::TremoloDive>,
 }
 
 impl InstrumentTrack {
@@ -575,6 +582,7 @@ impl InstrumentTrack {
             pan_points: Vec::new(),
             tuplets: Vec::new(),
             annotations: Vec::new(),
+            tremolo_bar: Vec::new(),
         }
     }
 
@@ -619,6 +627,7 @@ impl InstrumentTrack {
             pan_points: Vec::new(),
             tuplets: Vec::new(),
             annotations: Vec::new(),
+            tremolo_bar: Vec::new(),
         }
     }
 

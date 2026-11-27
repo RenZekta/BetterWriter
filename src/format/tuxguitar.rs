@@ -2,6 +2,7 @@ use std::io::{Cursor, Read};
 
 use crate::core::{
     BwxProject, NoteEffects, TICKS_PER_QUARTER, Tick,
+    pitch::PitchEnvelope,
     project::{InstrumentTrack, TabNote, TieOrigin, TimeSignature, TimeSignatureChange},
     length::{detect_length, dotted_ticks},
     tuplets::{TupletBeat, spans_from_beats},
@@ -17,6 +18,13 @@ use super::{
 /// TuxGuitar compares this header text exactly; its own is "1.5", not "1.5.0".
 const TG_VERSION: &str = "TuxGuitar File Format - 1.5";
 const TG_START_OFFSET: Tick = TICKS_PER_QUARTER;
+
+/// A bend or tremolo bar point sits at one of 13 positions, 0 to 12, across
+/// its note.
+const TG_POSITIONS: i32 = 12;
+
+/// A tremolo bar value is stored with this added, so it is never negative.
+const TG_TREMOLO_BIAS: i16 = 12;
 
 const TRACK_SOLO: u8 = 0x01;
 const TRACK_MUTE: u8 = 0x02;
@@ -251,6 +259,7 @@ pub fn import_tg(bytes: &[u8]) -> Result<Import, FormatError> {
         let mut notes = Vec::new();
         let mut texts = Vec::new();
         let mut tuplet_beats = Vec::new();
+        reader.dive_pieces.clear();
 
         for header in &headers {
             reader.read_measure(header, &mut notes, &mut texts, &mut tuplet_beats, &mut next_note_id)?;
@@ -326,9 +335,12 @@ pub fn import_tg(bytes: &[u8]) -> Result<Import, FormatError> {
             pan_points: Vec::new(),
             tuplets: Vec::new(),
             annotations: Vec::new(),
+            tremolo_bar: Vec::new(),
         });
         if let Some(track) = tracks.last_mut() {
             track.adopt_tuplets(&spans_from_beats(&tuplet_beats));
+            track.gather_chain_bends();
+            track.adopt_dives(std::mem::take(&mut reader.dive_pieces));
             for (tick, text) in &texts {
                 track.set_annotation(*tick, text);
             }
@@ -502,6 +514,9 @@ fn tempo_points(headers: &[MeasureHeader]) -> Vec<crate::core::TempoPoint> {
 struct TgReader<'a> {
     cursor: Cursor<&'a [u8]>,
     report: Report,
+    /// Tremolo bar pieces of the track being read, per note, as
+    /// (start, envelope counted from it).
+    dive_pieces: Vec<(Tick, PitchEnvelope)>,
 }
 
 impl<'a> TgReader<'a> {
@@ -509,6 +524,7 @@ impl<'a> TgReader<'a> {
         Self {
             cursor: Cursor::new(bytes),
             report: Report::default(),
+            dive_pieces: Vec::new(),
         }
     }
 
@@ -558,7 +574,7 @@ impl<'a> TgReader<'a> {
                             voice.velocity = self.read_u8()?;
                         }
                         let effects = if note_header & NOTE_EFFECT != 0 {
-                            self.read_note_effects()?
+                            self.read_note_effects((beat_start - TG_START_OFFSET).max(0), voice.duration.ticks)?
                         } else {
                             NoteEffects::default()
                         };
@@ -613,15 +629,22 @@ impl<'a> TgReader<'a> {
         Ok(())
     }
 
-    fn read_note_effects(&mut self) -> Result<NoteEffects, FormatError> {
+    fn read_note_effects(&mut self, start: Tick, duration: Tick) -> Result<NoteEffects, FormatError> {
         let raw = self.read_header24()?;
+        let mut bend = None;
         if raw & EFFECT_BEND != 0 {
-            self.skip_points(false)?;
-            self.report.skip("bends");
+            // Positions run 0 to 12 across the note, values count quarter tones.
+            let points = self.read_points(false)?;
+            bend = Some(PitchEnvelope::from_positions(&points, duration, TG_POSITIONS));
         }
         if raw & EFFECT_TREMOLO_BAR != 0 {
-            self.skip_points(false)?;
-            self.report.skip("tremolo bar dives");
+            // Values count semitones, stored with 12 added.
+            let points: Vec<(i32, i16)> = self
+                .read_points(false)?
+                .into_iter()
+                .map(|(position, value)| (position, (value - TG_TREMOLO_BIAS) * 2))
+                .collect();
+            self.dive_pieces.push((start, PitchEnvelope::from_positions(&points, duration, TG_POSITIONS)));
         }
         if raw & EFFECT_HARMONIC != 0 {
             self.report.skip("harmonics");
@@ -662,20 +685,24 @@ impl<'a> TgReader<'a> {
             slapping: raw & EFFECT_SLAPPING != 0,
             popping: raw & EFFECT_POPPING != 0,
             fade_in: raw & EFFECT_FADE_IN != 0,
+            bend,
         })
     }
 
-    fn skip_points(&mut self, signed_value: bool) -> Result<(), FormatError> {
+    /// The `(position, value)` points of a bend or tremolo bar.
+    fn read_points(&mut self, signed_value: bool) -> Result<Vec<(i32, i16)>, FormatError> {
         let count = self.read_u8()? as usize;
+        let mut points = Vec::with_capacity(count);
         for _ in 0..count {
-            let _position = self.read_u8()?;
-            let _value = if signed_value {
-                self.read_i8()? as i16
+            let position = i32::from(self.read_u8()?);
+            let value = if signed_value {
+                i16::from(self.read_i8()?)
             } else {
-                self.read_u8()? as i16
+                i16::from(self.read_u8()?)
             };
+            points.push((position, value));
         }
-        Ok(())
+        Ok(points)
     }
 
     fn read_marker(&mut self) -> Result<(), FormatError> {
@@ -822,7 +849,7 @@ impl TgWriter {
                 if note_index + 1 < beat.notes.len() {
                     note_flags |= NOTE_HAS_NEXT;
                 }
-                if has_effects(&note.effects) {
+                if has_effects(&note.effects) || note.tremolo.is_some() {
                     note_flags |= NOTE_EFFECT;
                 }
                 if note.tied {
@@ -833,7 +860,7 @@ impl TgWriter {
                 self.write_u8((note.string_index + 1).min(255) as u8);
                 self.write_u8(note.velocity.min(127));
                 if note_flags & NOTE_EFFECT != 0 {
-                    self.write_note_effects(&note.effects);
+                    self.write_note_effects(&note.effects, note.tremolo.as_ref());
                 }
             }
             if !texts.is_empty() {
@@ -879,8 +906,14 @@ impl TgWriter {
         }
     }
 
-    fn write_note_effects(&mut self, effects: &NoteEffects) {
+    fn write_note_effects(&mut self, effects: &NoteEffects, tremolo: Option<&PitchEnvelope>) {
         let mut raw = 0;
+        if effects.bend.is_some() {
+            raw |= EFFECT_BEND;
+        }
+        if tremolo.is_some() {
+            raw |= EFFECT_TREMOLO_BAR;
+        }
         if effects.vibrato {
             raw |= EFFECT_VIBRATO;
         }
@@ -926,6 +959,32 @@ impl TgWriter {
         self.bytes.push(((raw >> 16) & 0xff) as u8);
         self.bytes.push(((raw >> 8) & 0xff) as u8);
         self.bytes.push((raw & 0xff) as u8);
+        // The points follow the flags: the bend, then the tremolo bar.
+        if let Some(bend) = &effects.bend {
+            // A file holds bends upward only, up to twelve quarter tones.
+            let points: Vec<(i32, i16)> = bend
+                .positions(bend.length(), TG_POSITIONS)
+                .into_iter()
+                .map(|(position, value)| (position, value.clamp(0, 12)))
+                .collect();
+            self.write_points(&points, 0);
+        }
+        if let Some(tremolo) = tremolo {
+            let points: Vec<(i32, i16)> = tremolo
+                .positions(tremolo.length(), TG_POSITIONS)
+                .into_iter()
+                .map(|(position, value)| (position, (f32::from(value) / 2.0).round() as i16))
+                .collect();
+            self.write_points(&points, TG_TREMOLO_BIAS);
+        }
+    }
+
+    fn write_points(&mut self, points: &[(i32, i16)], bias: i16) {
+        self.write_u8(points.len().min(usize::from(u8::MAX)) as u8);
+        for &(position, value) in points.iter().take(usize::from(u8::MAX)) {
+            self.write_u8(position.clamp(0, TG_POSITIONS) as u8);
+            self.write_u8((value + bias).clamp(0, 255) as u8);
+        }
     }
 
     fn write_u8(&mut self, value: u8) {
@@ -996,7 +1055,8 @@ fn duration_from_ticks(ticks: Tick) -> TgDuration {
 }
 
 fn has_effects(effects: &NoteEffects) -> bool {
-    effects.dead
+    effects.bend.is_some()
+        || effects.dead
         || effects.palm_mute
         || effects.let_ring
         || effects.vibrato

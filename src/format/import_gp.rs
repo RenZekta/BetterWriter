@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
-use crate::core::{NoteEffects, TICKS_PER_QUARTER, Tick, project::TimeSignature, tuplets::TupletBeat};
+use crate::core::{NoteEffects, TICKS_PER_QUARTER, Tick, pitch::PitchEnvelope, project::TimeSignature, tuplets::TupletBeat};
+
+use super::guitarpro::GP_QUARTER_TONE;
 
 use super::{
     FormatError,
@@ -30,8 +32,7 @@ const DYNAMICS: [(&str, u8); 8] = [
 ];
 
 /// Note properties the project has no place for, with how the report names them.
-const UNSUPPORTED_NOTE: [(&str, &str); 10] = [
-    ("Bended", "bends"),
+const UNSUPPORTED_NOTE: [(&str, &str); 9] = [
     ("HarmonicType", "harmonics"),
     ("HarmonicFret", "harmonics"),
     ("Trill", "trills"),
@@ -88,6 +89,40 @@ fn property<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
     node.child("Properties")?
         .all("Property")
         .find(|property| property.attribute("name") == Some(name))
+}
+
+/// The number in a `<Property name="..."><Float>` of a note or beat.
+fn float_property(node: &Node, name: &str) -> Option<f32> {
+    property(node, name)?.children.first()?.text.trim().parse().ok()
+}
+
+/// The bend of a note (`prefix` Bend, `enable` Bended) or the whammy bar of
+/// a beat (`prefix` WhammyBar, `enable` WhammyBar) lasting `duration`: an
+/// origin, a destination and a pitch held between them.
+fn pitch_envelope(node: &Node, prefix: &str, enable: &str, duration: Tick) -> Option<PitchEnvelope> {
+    if !flag(node, enable) {
+        return None;
+    }
+    let value = |name: &str| float_property(node, &format!("{prefix}{name}"));
+    let quarter = |gp: f32| (gp / GP_QUARTER_TONE).round() as i16;
+    let origin = (value("OriginOffset").unwrap_or(0.0), quarter(value("OriginValue").unwrap_or(0.0)));
+    let destination = (
+        value("DestinationOffset").unwrap_or(100.0),
+        quarter(value("DestinationValue").unwrap_or(0.0)),
+    );
+    let (first, second) = (value("MiddleOffset1").unwrap_or(0.0), value("MiddleOffset2").unwrap_or(0.0));
+    let middle = value("MiddleValue").map(quarter).filter(|held| *held != 0).map(|held| {
+        if first == 0.0 && second == 0.0 {
+            (held, 50.0, 50.0)
+        } else if first == 0.0 {
+            (held, second, second)
+        } else if second == 0.0 {
+            (held, first, first)
+        } else {
+            (held, first, second)
+        }
+    });
+    Some(PitchEnvelope::from_plateau(duration, origin, middle, destination))
 }
 
 fn flag(node: &Node, name: &str) -> bool {
@@ -272,6 +307,11 @@ fn import_gpif(text: &str) -> Result<Import, FormatError> {
                             && let Some(text) = beat.text_of("FreeText").map(str::trim).filter(|text| !text.is_empty())
                         {
                             track.texts.push((cursor, text.to_owned()));
+                        }
+                        if voice_index == 0
+                            && let Some(whammy) = pitch_envelope(beat, "WhammyBar", "WhammyBar", length)
+                        {
+                            track.dives.push((cursor, whammy));
                         }
                         for (name, what) in UNSUPPORTED_BEAT {
                             if beat.child(name).is_some() {
@@ -460,6 +500,7 @@ fn note_of(
         slapping: flag(beat, "Slapped"),
         popping: flag(beat, "Popped"),
         fade_in: beat.text_of("Fadding") == Some("FadeIn"),
+        bend: pitch_envelope(note, "Bend", "Bended", duration),
     };
     Some(ImportedNote {
         start,
@@ -584,7 +625,7 @@ mod tests {
 <Voices><Voice id="0"><Beats>0 1</Beats></Voice></Voices>
 <Beats><Beat id="0"><Rhythm ref="0"/><Notes>0</Notes><FreeText>x</FreeText></Beat>
 <Beat id="1"><Rhythm ref="1"/><Notes>1</Notes></Beat></Beats>
-<Notes><Note id="0"><Properties><Property name="String"><String>5</String></Property><Property name="Fret"><Fret>7</Fret></Property><Property name="Bended"><Enable/></Property></Properties></Note>
+<Notes><Note id="0"><Properties><Property name="String"><String>5</String></Property><Property name="Fret"><Fret>7</Fret></Property><Property name="HarmonicType"><HType>Natural</HType></Property></Properties></Note>
 <Note id="1"><Properties><Property name="String"><String>0</String></Property><Property name="Fret"><Fret>2</Fret></Property></Properties></Note></Notes>
 <Rhythms><Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>
 <Rhythm id="1"><NoteValue>Eighth</NoteValue><PrimaryTuplet num="3" den="2"/></Rhythm></Rhythms></GPIF>"#;
@@ -602,7 +643,7 @@ mod tests {
         assert!(project.tracks[1].name.contains("percussion"));
         assert_eq!(project.tempo_points[0].bpm, 180.0);
         let report = import.report.join("; ");
-        assert!(report.contains("bends") && !report.contains("text"));
+        assert!(report.contains("harmonics") && !report.contains("text"));
         assert_eq!(guitar.annotations.len(), 1);
         assert_eq!(guitar.annotations[0].text, "x");
         assert!(report.contains("percussion"));

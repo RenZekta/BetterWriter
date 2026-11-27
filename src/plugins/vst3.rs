@@ -373,7 +373,7 @@ impl IComponentHandlerTrait for ComponentHandler {
 
     unsafe fn endEdit(&self, _id: ParamID) -> tresult {
         use std::sync::atomic::Ordering::Relaxed;
-        let _ = self.gestures.open.fetch_update(Relaxed, Relaxed, |open| Some((open - 1).max(0)));
+        let _ = self.gestures.open.try_update(Relaxed, Relaxed, |open| Some((open - 1).max(0)));
         kResultOk
     }
 

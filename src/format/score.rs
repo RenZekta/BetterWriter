@@ -5,6 +5,7 @@
 
 use crate::core::{
     BwxProject, CompatibilityReport, NoteEffects, TICKS_PER_QUARTER, Tick,
+    pitch::PitchEnvelope,
     project::{InstrumentTrack, TempoTransition, TimeSignature},
     tuplets::TupletSpan,
 };
@@ -51,7 +52,12 @@ pub struct ExportNote {
     pub string_index: usize,
     pub fret: u8,
     pub velocity: u8,
+    /// `effects.bend` holds the part of the note's bend that falls in this
+    /// beat, with times counted from the beat's start.
     pub effects: NoteEffects,
+    /// Where the tremolo bar goes during this beat, times counted from the
+    /// beat's start. Only the first note of a beat carries it.
+    pub tremolo: Option<PitchEnvelope>,
     /// Sounds on from the previous beat's note of the same string.
     pub tied: bool,
 }
@@ -234,6 +240,9 @@ struct Segment {
     fret: u8,
     velocity: u8,
     effects: NoteEffects,
+    /// The bend of the note's whole chain with times counted from the start
+    /// of the bar's track (absolute ticks), shifted with the segment.
+    bend: Option<PitchEnvelope>,
     start: Tick,
     end: Tick,
     /// The note sounded on before this segment began.
@@ -339,13 +348,22 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
             continue;
         }
         let tied_in = note.abs_tick < bar.start || track.is_tied_continuation(note);
+        // The bend belongs to the first note of the chain; a later note of
+        // it carries the part of the bend that falls on it.
+        let head = track.chain_head(note);
+        let bend = head.effects.bend.as_ref().map(|envelope| PitchEnvelope {
+            points: envelope.points.iter().map(|point| crate::core::pitch::PitchPoint { at: point.at + head.abs_tick, ..*point }).collect(),
+        });
+        let mut effects = note.effects.clone();
+        effects.bend = None;
         let mut push = |start: Tick, end: Tick, tied_in: bool| {
             if start < end {
                 segments.push(Segment {
                     string_index: note.string_index,
                     fret: note.fret,
                     velocity: note.velocity,
-                    effects: note.effects.clone(),
+                    effects: effects.clone(),
+                    bend: bend.clone(),
                     start,
                     end,
                     tied_in,
@@ -411,14 +429,22 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
             .iter()
             .filter(|segment| segment.start <= from && segment.end >= to)
             .collect();
-        let notes_of = |index: usize| -> Vec<ExportNote> {
+        let notes_of = |index: usize, from: Tick, to: Tick| -> Vec<ExportNote> {
             active
                 .iter()
                 .map(|segment| ExportNote {
                     string_index: segment.string_index,
                     fret: segment.fret,
                     velocity: segment.velocity,
-                    effects: segment.effects.clone(),
+                    effects: NoteEffects {
+                        bend: segment
+                            .bend
+                            .as_ref()
+                            .map(|envelope| envelope.window(from, to))
+                            .filter(|window| !window.is_flat()),
+                        ..segment.effects.clone()
+                    },
+                    tremolo: None,
                     tied: if index == 0 {
                         segment.start < from || segment.tied_in
                     } else {
@@ -444,7 +470,7 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
                         duration: (next - at).max(1),
                         written: length,
                         tuplet: Some(group.tuplet(index == 0 && from == group.start, index + 1 == lengths.len() && to == group.end)),
-                        notes: notes_of(index),
+                        notes: notes_of(index, at, next),
                     });
                     at = next;
                 }
@@ -459,13 +485,23 @@ fn bar_beats(track: &InstrumentTrack, bar: &GridBar) -> ExportBar {
                 duration: length,
                 written: length,
                 tuplet: None,
-                notes: notes_of(index),
+                notes: notes_of(index, at, at + length),
             });
             at += length;
         }
     }
     for beat in &mut beats {
         beat.notes.sort_by_key(|note| note.string_index);
+        // The tremolo bar moves the whole track, so one note carries it.
+        let end = beat.start + beat.duration;
+        for dive in track.tremolo_bar.iter().filter(|dive| dive.start < end && dive.end() > beat.start) {
+            let window = dive.envelope.window(beat.start - dive.start, end - dive.start);
+            if let Some(first) = beat.notes.first_mut()
+                && !window.is_flat()
+            {
+                first.tremolo = Some(window);
+            }
+        }
     }
     ExportBar {
         empty: kept.is_empty(),
